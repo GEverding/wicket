@@ -1,0 +1,62 @@
+[package]
+name = "wicket-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# TLS
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# Hot reload
+arc-swap = { workspace = true }
+
+# Metrics
+foundations = { workspace = true }
+
+# File watching
+notify = "6"
+
+# Async
+tokio = { workspace = true, features = ["sync", "time", "fs"] }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# ACME storage
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
+
+# HTTP client for Cloudflare API
+reqwest = { workspace = true }
+
+# ACME client
+instant-acme = "0.7"
+
+# CSR generation
+rcgen = "0.13"
+
+# Base64 encoding
+base64 = "0.22"
+
+# Temp files
+tempfile = "3"
+
+[dev-dependencies]
+toml = "0.8"
+
+[features]
+default = ["aws-lc-rs"]
+aws-lc-rs = ["rustls/aws_lc_rs"]
+ring = ["rustls/ring"]

@@ -4,6 +4,7 @@ members = [
     "crates/wicket",
     "crates/wicket-config",
     "crates/wicket-core",
+    "crates/wicket-tls",
 ]
 
 [workspace.package]
@@ -53,6 +54,9 @@ arc-swap = "1"
 http = "1"
 bytes = "1"
 regex = "1"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
 
 [profile.release]
 lto = true

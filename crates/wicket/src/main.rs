@@ -14,9 +14,13 @@ use pingora_core::prelude::*;
 use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::http_proxy_service;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 use wicket_config::Config;
-use wicket_core::WicketProxy;
+use wicket_core::{
+    wicket_tls::{CertManager, FileWatcher, TlsMode},
+    WicketProxy,
+};
 
 /// Wicket - Fast, observable reverse proxy built on Pingora
 #[derive(Parser, Debug)]
@@ -113,6 +117,57 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         "Starting Wicket proxy"
     );
 
+    // Initialize TLS if configured
+    let cert_manager: Option<Arc<CertManager>> = if let Some(ref tls_config) = config.tls {
+        let manager = Arc::new(CertManager::new());
+
+        match tls_config.mode {
+            TlsMode::File => {
+                if let Some(ref file_config) = tls_config.file {
+                    let watcher = FileWatcher::new(file_config.clone(), manager.clone());
+                    watcher
+                        .load_all()
+                        .context("Failed to load file-based certificates")?;
+
+                    if file_config.watch {
+                        watcher.start();
+                        info!("File watcher started for certificate updates");
+                    }
+                }
+            }
+            TlsMode::Acme => {
+                // TODO: Implement ACME provider initialization
+                // For now, log that ACME mode is configured but not yet implemented
+                info!("ACME TLS mode configured but not yet implemented");
+            }
+            TlsMode::Mixed => {
+                // Load file certs first
+                if let Some(ref file_config) = tls_config.file {
+                    let watcher = FileWatcher::new(file_config.clone(), manager.clone());
+                    watcher
+                        .load_all()
+                        .context("Failed to load file-based certificates")?;
+                    if file_config.watch {
+                        watcher.start();
+                        info!("File watcher started for certificate updates");
+                    }
+                }
+                // TODO: Then ACME certs
+                info!("Mixed TLS mode: file certs loaded, ACME not yet implemented");
+            }
+        }
+
+        info!(
+            mode = ?tls_config.mode,
+            certificates = manager.store().len(),
+            "TLS initialized"
+        );
+
+        Some(manager)
+    } else {
+        None
+    };
+
     // Create Pingora server configuration from our config
     let mut pingora_conf = ServerConf::default();
 
@@ -139,7 +194,13 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     server.bootstrap();
 
     // Create the proxy service
-    let wicket_proxy = WicketProxy::new(&config).context("Failed to create proxy service")?;
+    let mut wicket_proxy = WicketProxy::new(&config).context("Failed to create proxy service")?;
+
+    // Wire up TLS if enabled
+    if let Some(ref cm) = cert_manager {
+        wicket_proxy = wicket_proxy.with_cert_manager(cm.clone());
+        info!("TLS certificate manager wired to proxy");
+    }
 
     // Create HTTP proxy service
     let mut proxy_service = http_proxy_service(&server.configuration, wicket_proxy);
@@ -151,6 +212,11 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         address = %config.server.listen,
         "Proxy listening"
     );
+
+    // TODO: Add HTTPS listener if TLS is enabled
+    // This requires understanding Pingora's TLS listener API
+    // The CertManager implements rustls::server::ResolvesServerCert
+    // and can be passed to rustls ServerConfig for HTTPS support
 
     // Add service to server
     server.add_service(proxy_service);
