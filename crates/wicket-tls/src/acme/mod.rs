@@ -185,7 +185,7 @@ impl AcmeProvider {
         let account = self.get_or_create_account().await?;
 
         // Create DNS client for challenges
-        let dns_client = CloudflareClient::new(cert_config.dns.api_token.clone());
+        let dns_client = CloudflareClient::new(cert_config.dns.api_token.clone())?;
 
         // Get zone ID
         let zone_id = match &cert_config.dns.zone_id {
