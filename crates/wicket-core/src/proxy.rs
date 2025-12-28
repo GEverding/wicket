@@ -19,15 +19,28 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use wicket_config::{Config, LoadBalanceStrategy, UpstreamConfig};
 
-/// Context carried through the request lifecycle.
+/// Per-request context for the Wicket proxy.
+///
+/// This struct carries request-specific information through the entire request lifecycle,
+/// from initial routing to final logging. It is created fresh for each request and
+/// populated during the `request_filter` phase.
 pub struct WicketCtx {
-    /// The matched route information
+    /// The matched route information, populated after routing succeeds.
+    ///
+    /// Contains the upstream name and optional route name that matched this request.
+    /// `None` if no route matched the request.
     pub route_match: Option<RouteMatch>,
 
-    /// Start time for request duration tracking
+    /// Start time for request duration tracking.
+    ///
+    /// Captured at the beginning of request processing and used to calculate
+    /// the total request duration for logging.
     pub start_time: std::time::Instant,
 
-    /// Request ID for tracing
+    /// Unique identifier for this request, used in logging and tracing.
+    ///
+    /// Generated as a hex-encoded nanosecond timestamp, ensuring uniqueness
+    /// across requests for correlation in logs and distributed tracing.
     pub request_id: String,
 }
 
@@ -40,22 +53,37 @@ pub struct WicketProxy {
     upstreams: ArcSwap<HashMap<String, Arc<UpstreamCluster>>>,
 }
 
-/// Wrapper around a load balancer for an upstream.
+/// An upstream cluster with load balancing and health checking.
+///
+/// Wraps one or more backend servers and provides peer selection based on the
+/// configured load balancing strategy. Only one load balancer is active at a time,
+/// determined by the `strategy` field.
 pub struct UpstreamCluster {
-    /// The load balancer instance (using round-robin)
+    /// Round-robin load balancer for backend selection.
+    ///
+    /// Active when `strategy` is `LoadBalanceStrategy::RoundRobin`.
+    /// Distributes requests evenly across healthy backends in rotation.
+    /// `None` if using a different strategy.
     lb_round_robin: Option<Arc<LoadBalancer<RoundRobin>>>,
 
-    /// The load balancer instance (using consistent hashing)
+    /// Consistent hashing (Ketama) load balancer for backend selection.
+    ///
+    /// Active when `strategy` is `LoadBalanceStrategy::ConsistentHash`.
+    /// Routes requests to the same backend based on a hash key (typically the request path).
+    /// `None` if using a different strategy.
     lb_ketama: Option<Arc<LoadBalancer<KetamaHashing>>>,
 
-    /// Strategy being used
+    /// Load balancing strategy being used by this cluster.
+    ///
+    /// Determines which load balancer (`lb_round_robin` or `lb_ketama`) is active
+    /// and how peer selection is performed.
     strategy: LoadBalanceStrategy,
 }
 
 impl WicketProxy {
     /// Create a new WicketProxy from configuration.
     pub fn new(config: &Config) -> Result<Self> {
-        let router = Router::build(&config.routes);
+        let router = Router::build(&config.routes)?;
         let upstreams = Self::build_upstreams(&config.upstreams)?;
 
         Ok(WicketProxy {
@@ -86,7 +114,7 @@ impl WicketProxy {
 
     /// Reload configuration at runtime.
     pub fn reload(&self, config: &Config) -> Result<()> {
-        let router = Router::build(&config.routes);
+        let router = Router::build(&config.routes)?;
         let upstreams = Self::build_upstreams(&config.upstreams)?;
 
         self.router.store(Arc::new(router));
@@ -192,27 +220,29 @@ impl ProxyHttp for WicketProxy {
         let req_header = session.req_header();
 
         // Extract request properties
-        let host = req_header
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok());
+        let host = req_header.headers.get("host").and_then(|v| v.to_str().ok());
 
         let path = req_header.uri.path();
         let method = req_header.method.as_str();
 
-        // Build headers map for matching
-        let headers: HashMap<String, String> = req_header
-            .headers
-            .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|v| (k.as_str().to_lowercase(), v.to_string()))
-            })
-            .collect();
-
         // Match route
         let router = self.router.load();
+
+        // Lazily build headers map only if any route requires header matching
+        let headers = if router.has_header_matchers() {
+            req_header
+                .headers
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.to_str()
+                        .ok()
+                        .map(|v| (k.as_str().to_lowercase(), v.to_string()))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         let route_match = router.match_request(host, path, method, &headers);
 
         if let Some(ref rm) = route_match {
@@ -246,10 +276,14 @@ impl ProxyHttp for WicketProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<Box<HttpPeer>> {
-        let route_match = ctx
-            .route_match
-            .as_ref()
-            .ok_or_else(|| Error::new(ErrorType::HTTPStatus(404)))?;
+        let route_match = ctx.route_match.as_ref().ok_or_else(|| {
+            warn!(
+                request_id = %ctx.request_id,
+                path = %session.req_header().uri.path(),
+                "No matching route found"
+            );
+            Error::new(ErrorType::HTTPStatus(404))
+        })?;
 
         // Use request URI as hash key for consistent hashing
         let key = session.req_header().uri.path().as_bytes();
@@ -323,8 +357,8 @@ fn generate_request_id() -> String {
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
 
     format!("{:x}", timestamp)
 }

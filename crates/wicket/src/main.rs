@@ -11,6 +11,7 @@ use foundations::telemetry::settings::{
 use foundations::telemetry::{self};
 use foundations::{service_info, BootstrapResult};
 use pingora_core::prelude::*;
+use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::http_proxy_service;
 use std::path::PathBuf;
 use tracing::info;
@@ -107,17 +108,33 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         listen = %config.server.listen,
         upstreams = config.upstreams.len(),
         routes = config.routes.len(),
+        workers = ?config.server.workers,
+        shutdown_timeout = config.server.shutdown_timeout,
         "Starting Wicket proxy"
     );
 
-    // Create the Pingora server
-    let mut server = Server::new(Some(Opt {
-        upgrade: false,
-        daemon: false,
-        nocapture: false,
-        test: false,
-        conf: None,
-    }))?;
+    // Create Pingora server configuration from our config
+    let mut pingora_conf = ServerConf::default();
+
+    // Wire up worker threads if specified
+    if let Some(workers) = config.server.workers {
+        pingora_conf.threads = workers;
+    }
+
+    // Wire up graceful shutdown timeout
+    pingora_conf.graceful_shutdown_timeout_seconds = Some(config.server.shutdown_timeout);
+
+    // Create the Pingora server with our configuration
+    let mut server = Server::new_with_opt_and_conf(
+        Some(Opt {
+            upgrade: false,
+            daemon: false,
+            nocapture: false,
+            test: false,
+            conf: None,
+        }),
+        pingora_conf,
+    );
 
     server.bootstrap();
 

@@ -9,4 +9,3 @@ description = "Configuration parsing for Wicket proxy"
 serde = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
