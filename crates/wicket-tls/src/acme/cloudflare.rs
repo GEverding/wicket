@@ -19,21 +19,26 @@ pub enum CloudflareError {
 
     #[error("unexpected response format")]
     UnexpectedResponse,
+
+    #[error("invalid API token format")]
+    InvalidApiToken,
 }
 
 /// Cloudflare DNS API client.
 pub struct CloudflareClient {
     client: reqwest::Client,
-    api_token: String,
+    auth_header: HeaderValue,
 }
 
 impl CloudflareClient {
     /// Create a new Cloudflare client with the given API token.
-    pub fn new(api_token: String) -> Self {
-        Self {
+    pub fn new(api_token: String) -> Result<Self, CloudflareError> {
+        let auth_header = HeaderValue::from_str(&format!("Bearer {}", api_token))
+            .map_err(|_| CloudflareError::InvalidApiToken)?;
+        Ok(Self {
             client: reqwest::Client::new(),
-            api_token,
-        }
+            auth_header,
+        })
     }
 
     /// Get the zone ID for a domain.
@@ -95,10 +100,7 @@ impl CloudflareClient {
 
     fn headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.api_token)).unwrap(),
-        );
+        headers.insert(AUTHORIZATION, self.auth_header.clone());
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers
     }
@@ -221,8 +223,8 @@ mod tests {
 
     #[test]
     fn test_client_creation() {
-        let client = CloudflareClient::new("test_token".to_string());
-        assert!(!client.api_token.is_empty());
+        let client = CloudflareClient::new("test_token".to_string()).unwrap();
+        assert!(client.auth_header.len() > 0);
     }
 
     // Integration tests would require mocking or actual CF credentials
@@ -232,7 +234,7 @@ mod tests {
     #[ignore]
     async fn test_get_zone_id() {
         let token = std::env::var("CF_API_TOKEN").expect("CF_API_TOKEN required");
-        let client = CloudflareClient::new(token);
+        let client = CloudflareClient::new(token).expect("Failed to create client");
 
         let zone_id = client.get_zone_id("example.com").await.unwrap();
         println!("Zone ID: {}", zone_id);

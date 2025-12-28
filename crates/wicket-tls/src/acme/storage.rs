@@ -165,10 +165,11 @@ impl AcmeStorage {
     /// Atomic write: write to temp file, then rename.
     fn atomic_write(&self, path: &Path, data: &[u8], mode: u32) -> Result<(), StorageError> {
         let parent = path.parent().unwrap_or(Path::new("."));
-        let temp_path = parent.join(format!(
-            ".{}.tmp",
-            path.file_name().unwrap().to_string_lossy()
-        ));
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed("temp"));
+        let temp_path = parent.join(format!(".{}.tmp", file_name));
 
         {
             let file = File::create(&temp_path)?;
