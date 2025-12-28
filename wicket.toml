@@ -72,3 +72,67 @@ path_prefix = "/"
 # [routes.match]
 # host = "*.myapp.com"
 # path_prefix = "/api"
+
+# ============================================================================
+# TLS Configuration (optional)
+# ============================================================================
+#
+# Wicket supports three TLS modes:
+# - "file": Static certificates loaded from disk with optional file watching
+# - "acme": Automatic certificate provisioning via Let's Encrypt with DNS-01
+# - "mixed": Both file-based and ACME certificates
+#
+# Example: File-based certificates (for Kubernetes cert-manager)
+# [tls]
+# mode = "file"
+#
+# [tls.file]
+# watch = true
+# poll_interval_secs = 30
+#
+# [[tls.file.certs]]
+# name = "default"
+# cert = "/etc/wicket/tls/tls.crt"
+# key = "/etc/wicket/tls/tls.key"
+# domains = ["example.com", "*.example.com"]
+#
+# Example: ACME certificates (for automatic Let's Encrypt)
+# [tls]
+# mode = "acme"
+#
+# [tls.acme]
+# email = "admin@example.com"
+# staging = true  # Use staging for testing (no rate limits)
+# storage = "/var/lib/wicket/acme"
+# renew_before_days = 30
+#
+# [[tls.acme.certs]]
+# domains = ["example.com", "*.example.com"]
+#
+# [tls.acme.certs.dns]
+# provider = "cloudflare"
+# api_token = "${CF_API_TOKEN}"
+# zone_id = "zone123"  # Optional, auto-detected if not specified
+#
+# Example: Mixed mode (both file and ACME)
+# [tls]
+# mode = "mixed"
+#
+# [tls.file]
+# watch = true
+#
+# [[tls.file.certs]]
+# name = "fallback"
+# cert = "/etc/wicket/tls/fallback.crt"
+# key = "/etc/wicket/tls/fallback.key"
+# domains = ["example.com"]
+#
+# [tls.acme]
+# email = "admin@example.com"
+#
+# [[tls.acme.certs]]
+# domains = ["api.example.com"]
+#
+# [tls.acme.certs.dns]
+# provider = "cloudflare"
+# api_token = "${CF_API_TOKEN}"
