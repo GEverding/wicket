@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn test_client_creation() {
         let client = CloudflareClient::new("test_token".to_string()).unwrap();
-        assert!(client.auth_header.len() > 0);
+        assert!(!client.auth_header.is_empty());
     }
 
     // Integration tests would require mocking or actual CF credentials
