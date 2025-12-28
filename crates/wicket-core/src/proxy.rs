@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use wicket_config::{Config, LoadBalanceStrategy, UpstreamConfig};
+use wicket_tls::CertManager;
 
 /// Per-request context for the Wicket proxy.
 ///
@@ -51,6 +52,9 @@ pub struct WicketProxy {
 
     /// Map of upstream name to load balancer
     upstreams: ArcSwap<HashMap<String, Arc<UpstreamCluster>>>,
+
+    /// TLS certificate manager (if TLS is enabled)
+    cert_manager: Option<Arc<CertManager>>,
 }
 
 /// An upstream cluster with load balancing and health checking.
@@ -89,7 +93,19 @@ impl WicketProxy {
         Ok(WicketProxy {
             router: ArcSwap::new(Arc::new(router)),
             upstreams: ArcSwap::new(Arc::new(upstreams)),
+            cert_manager: None,
         })
+    }
+
+    /// Set the TLS certificate manager.
+    pub fn with_cert_manager(mut self, manager: Arc<CertManager>) -> Self {
+        self.cert_manager = Some(manager);
+        self
+    }
+
+    /// Get the certificate manager if TLS is enabled.
+    pub fn cert_manager(&self) -> Option<&Arc<CertManager>> {
+        self.cert_manager.as_ref()
     }
 
     /// Build upstream load balancers from configuration.

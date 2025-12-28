@@ -7,3 +7,4 @@ pub mod routing;
 
 pub use proxy::{WicketCtx, WicketProxy};
 pub use routing::{RouteMatch as MatchedRoute, Router};
+pub use wicket_tls;

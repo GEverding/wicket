@@ -7,6 +7,7 @@ description = "Core proxy and routing logic for Wicket"
 
 [dependencies]
 wicket-config = { workspace = true }
+wicket-tls = { path = "../wicket-tls" }
 
 # Pingora framework
 pingora = { workspace = true }
