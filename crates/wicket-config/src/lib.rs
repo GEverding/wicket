@@ -1,13 +1,15 @@
 //! Configuration parsing for Wicket proxy.
 //!
 //! This crate handles loading and parsing TOML configuration files that define
-//! upstreams, routes, and server settings.
+//! upstreams, routes, server settings, and TLS configuration.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+
+pub use wicket_tls::TlsConfig;
 
 /// Root configuration structure for Wicket.
 #[derive(Debug, Clone, Deserialize)]
@@ -22,6 +24,10 @@ pub struct Config {
     /// Route definitions
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+
+    /// TLS configuration (optional)
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 /// Server-level configuration.
@@ -204,6 +210,49 @@ impl Config {
             }
         }
 
+        // Validate TLS config if present
+        if let Some(ref tls) = self.tls {
+            self.validate_tls(tls)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_tls(&self, tls: &TlsConfig) -> Result<()> {
+        use wicket_tls::TlsMode;
+
+        // Validate ACME config if mode is Acme or Mixed
+        if matches!(tls.mode, TlsMode::Acme | TlsMode::Mixed) {
+            if let Some(ref acme) = tls.acme {
+                if acme.certs.is_empty() {
+                    anyhow::bail!("TLS ACME mode requires at least one cert config");
+                }
+                for cert in &acme.certs {
+                    if cert.domains.is_empty() {
+                        anyhow::bail!("ACME cert config requires at least one domain");
+                    }
+                }
+            } else if matches!(tls.mode, TlsMode::Acme) {
+                anyhow::bail!("TLS mode 'acme' requires [tls.acme] section");
+            }
+        }
+
+        // Validate File config if mode is File or Mixed
+        if matches!(tls.mode, TlsMode::File | TlsMode::Mixed) {
+            if let Some(ref file) = tls.file {
+                if file.certs.is_empty() && matches!(tls.mode, TlsMode::File) {
+                    anyhow::bail!("TLS file mode requires at least one cert config");
+                }
+                for cert in &file.certs {
+                    if cert.domains.is_empty() {
+                        anyhow::bail!("File cert config requires at least one domain");
+                    }
+                }
+            } else if matches!(tls.mode, TlsMode::File) {
+                anyhow::bail!("TLS mode 'file' requires [tls.file] section");
+            }
+        }
+
         Ok(())
     }
 }
@@ -319,5 +368,184 @@ path_prefix = "/"
         let result = Config::parse(config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no backends"));
+    }
+
+    #[test]
+    fn test_parse_config_with_tls_file() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[tls]
+mode = "file"
+
+[tls.file]
+watch = true
+
+[[tls.file.certs]]
+name = "default"
+cert = "/certs/tls.crt"
+key = "/certs/tls.key"
+domains = ["example.com"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(toml).unwrap();
+        assert!(config.tls.is_some());
+        let tls = config.tls.unwrap();
+        assert!(tls.file.is_some());
+        assert_eq!(tls.file.unwrap().certs.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_config_with_tls_acme() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[tls]
+mode = "acme"
+
+[tls.acme]
+email = "admin@example.com"
+staging = true
+
+[[tls.acme.certs]]
+domains = ["example.com", "*.example.com"]
+
+[tls.acme.certs.dns]
+provider = "cloudflare"
+api_token = "test-token"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(toml).unwrap();
+        assert!(config.tls.is_some());
+        let tls = config.tls.unwrap();
+        assert!(tls.acme.is_some());
+        assert_eq!(tls.acme.unwrap().certs.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_config_without_tls() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(toml).unwrap();
+        assert!(config.tls.is_none());
+    }
+
+    #[test]
+    fn test_tls_acme_missing_certs() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[tls]
+mode = "acme"
+
+[tls.acme]
+email = "admin@example.com"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(toml);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires at least one cert config"));
+    }
+
+    #[test]
+    fn test_tls_file_missing_section() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[tls]
+mode = "file"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(toml);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires [tls.file] section"));
+    }
+
+    #[test]
+    fn test_tls_cert_missing_domains() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[tls]
+mode = "file"
+
+[tls.file]
+watch = true
+
+[[tls.file.certs]]
+name = "default"
+cert = "/certs/tls.crt"
+key = "/certs/tls.key"
+domains = []
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(toml);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires at least one domain"));
     }
 }
