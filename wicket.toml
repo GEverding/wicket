@@ -1,0 +1,74 @@
+# Wicket Proxy Configuration
+#
+# This is the main configuration file for Wicket, a reverse proxy built on Pingora.
+# See the documentation for full configuration options.
+
+[server]
+# Address and port to listen on
+listen = "127.0.0.1:8080"
+
+# Number of worker threads (defaults to number of CPUs)
+# workers = 4
+
+# Enable structured JSON logging (recommended for production)
+json_logs = false
+
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+
+# Graceful shutdown timeout in seconds
+shutdown_timeout = 30
+
+# ============================================================================
+# Upstreams - Define your backend servers
+# ============================================================================
+
+[upstreams.backend]
+# List of backend server addresses
+backends = ["127.0.0.1:3000"]
+# Load balancing strategy: round_robin or consistent_hash
+strategy = "round_robin"
+
+# Example with multiple backends and health checks:
+# [upstreams.api]
+# backends = ["127.0.0.1:3001", "127.0.0.1:3002", "127.0.0.1:3003"]
+# strategy = "round_robin"
+# [upstreams.api.health_check]
+# path = "/health"
+# interval = 10
+# unhealthy_threshold = 3
+
+# ============================================================================
+# Routes - Define how requests are matched and routed
+# ============================================================================
+
+# Default route - matches all requests
+[[routes]]
+name = "default"
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+
+# Example: API route with host and method matching
+# [[routes]]
+# name = "api-v1"
+# upstream = "api"
+# [routes.match]
+# host = "api.example.com"
+# path_prefix = "/v1"
+# methods = ["GET", "POST", "PUT", "DELETE"]
+
+# Example: Static files route
+# [[routes]]
+# name = "static"
+# upstream = "static-server"
+# [routes.match]
+# path_prefix = "/static"
+
+# Example: Wildcard host matching
+# [[routes]]
+# name = "tenant-api"
+# upstream = "multi-tenant"
+# [routes.match]
+# host = "*.myapp.com"
+# path_prefix = "/api"
