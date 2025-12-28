@@ -6,7 +6,7 @@ A Kubernetes Gateway API implementation and general-purpose reverse proxy built 
 
 - **Fast**: Built on Pingora, the framework powering Cloudflare's edge
 - **Config-driven**: Simple TOML configuration for routes and upstreams
-- **Observable**: Structured JSON logging with request tracing
+- **Observable**: Production-grade telemetry via [Cloudflare Foundations](https://github.com/cloudflare/foundations)
 - **Gateway API native**: Kubernetes Gateway API support (coming soon)
 - **Single binary**: No runtime dependencies
 
@@ -105,13 +105,32 @@ Options:
 ## Project Structure
 
 ```
-src/
-├── main.rs      # Entry point and CLI handling
-├── config.rs    # TOML configuration parsing
-├── routing.rs   # Request routing and matching
-├── proxy.rs     # Pingora proxy service implementation
-└── logging.rs   # Structured logging setup
+crates/
+├── wicket/           # Main binary with CLI and telemetry
+│   └── src/
+│       └── main.rs   # Entry point with foundations integration
+├── wicket-config/    # Configuration parsing crate
+│   └── src/
+│       └── lib.rs    # TOML config types and validation
+└── wicket-core/      # Core proxy logic crate
+    └── src/
+        ├── lib.rs
+        ├── proxy.rs  # Pingora ProxyHttp implementation
+        └── routing.rs # Request routing and matching
 ```
+
+## Workspace Crates
+
+| Crate | Description |
+|-------|-------------|
+| `wicket` | Main binary with CLI, telemetry, and server bootstrap |
+| `wicket-config` | Configuration parsing and validation |
+| `wicket-core` | Pingora proxy service and request routing |
+
+## Dependencies
+
+- **[Pingora](https://github.com/cloudflare/pingora)** - High-performance proxy framework
+- **[Foundations](https://github.com/cloudflare/foundations)** - Production telemetry, logging, and settings
 
 ## Roadmap
 
@@ -121,6 +140,8 @@ src/
 - [x] Round-robin and consistent-hash load balancing
 - [x] Structured JSON logging
 - [x] Request tracing with IDs
+- [x] Workspace structure with modular crates
+- [x] Foundations integration for telemetry
 
 ### Phase 2
 - [ ] TLS termination

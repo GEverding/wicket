@@ -3,19 +3,19 @@
 //! Wicket is designed to be the "Caddy of Gateway API" - simple to configure,
 //! observable by default, and fast enough to replace nginx/HAProxy.
 
-mod config;
-mod logging;
-mod proxy;
-mod routing;
-
 use anyhow::{Context, Result};
 use clap::Parser;
-use config::Config;
+use foundations::telemetry::settings::{
+    Level, LogFormat, LogVerbosity, LoggingSettings, TelemetrySettings,
+};
+use foundations::telemetry::{self};
+use foundations::{service_info, BootstrapResult};
 use pingora_core::prelude::*;
 use pingora_proxy::http_proxy_service;
-use proxy::WicketProxy;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::info;
+use wicket_config::Config;
+use wicket_core::WicketProxy;
 
 /// Wicket - Fast, observable reverse proxy built on Pingora
 #[derive(Parser, Debug)]
@@ -44,27 +44,46 @@ struct Args {
 }
 
 fn main() {
-    if let Err(e) = run() {
-        error!("Fatal error: {:#}", e);
+    // Bootstrap with foundations for telemetry
+    if let Err(e) = bootstrap() {
+        eprintln!("Fatal error: {:#}", e);
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
+fn bootstrap() -> BootstrapResult<()> {
     let args = Args::parse();
 
-    // Load configuration
+    // Load configuration first to get log settings
     let config = Config::load(&args.config)
         .with_context(|| format!("Failed to load config from {}", args.config.display()))?;
 
-    // Initialize logging (use CLI overrides if provided)
+    // Initialize foundations telemetry
     let log_level = args
         .log_level
         .as_deref()
         .unwrap_or(&config.server.log_level);
     let json_logs = args.json_logs || config.server.json_logs;
 
-    logging::init(json_logs, log_level)?;
+    // Set up telemetry with foundations
+    let telemetry_settings = TelemetrySettings {
+        logging: LoggingSettings {
+            verbosity: parse_verbosity(log_level),
+            format: if json_logs {
+                LogFormat::Json
+            } else {
+                LogFormat::Text
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // Create service info using the macro
+    let service_info = service_info!();
+
+    // Initialize telemetry
+    telemetry::init(&service_info, &telemetry_settings)?;
 
     // Handle --dump-config
     if args.dump_config {
@@ -79,6 +98,10 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    run_server(config, &args)
+}
+
+fn run_server(config: Config, args: &Args) -> Result<()> {
     info!(
         config_path = %args.config.display(),
         listen = %config.server.listen,
@@ -99,8 +122,7 @@ fn run() -> Result<()> {
     server.bootstrap();
 
     // Create the proxy service
-    let wicket_proxy =
-        WicketProxy::new(&config).context("Failed to create proxy service")?;
+    let wicket_proxy = WicketProxy::new(&config).context("Failed to create proxy service")?;
 
     // Create HTTP proxy service
     let mut proxy_service = http_proxy_service(&server.configuration, wicket_proxy);
@@ -118,4 +140,17 @@ fn run() -> Result<()> {
 
     // Run the server
     server.run_forever();
+}
+
+/// Parse log level string to foundations LogVerbosity
+fn parse_verbosity(level: &str) -> LogVerbosity {
+    let level = match level.to_lowercase().as_str() {
+        "trace" => Level::Trace,
+        "debug" => Level::Debug,
+        "info" => Level::Info,
+        "warn" | "warning" => Level::Warning,
+        "error" => Level::Error,
+        _ => Level::Info,
+    };
+    LogVerbosity(level)
 }
