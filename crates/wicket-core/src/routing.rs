@@ -2,19 +2,20 @@
 //!
 //! This module provides fast route matching based on host, path, method, and headers.
 
+use anyhow::Result;
 use regex::Regex;
 use std::collections::HashMap;
 use tracing::debug;
 use wicket_config::RouteConfig;
 
 /// A compiled router that matches requests to upstream names.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Router {
     routes: Vec<CompiledRoute>,
 }
 
 /// A route with pre-compiled matchers for fast matching.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CompiledRoute {
     /// Original route name for debugging
     name: Option<String>,
@@ -36,14 +37,14 @@ struct CompiledRoute {
 }
 
 /// Host matching with wildcard support.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum HostMatcher {
     Exact(String),
     Wildcard(Regex),
 }
 
 /// Path matching strategies.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PathMatcher {
     Exact(String),
     Prefix(String),
@@ -61,12 +62,19 @@ pub struct RouteMatch {
 
 impl Router {
     /// Build a router from route configurations.
-    pub fn build(routes: &[RouteConfig]) -> Self {
-        let compiled: Vec<CompiledRoute> =
-            routes.iter().map(|r| CompiledRoute::compile(r)).collect();
+    pub fn build(routes: &[RouteConfig]) -> Result<Self> {
+        let mut compiled = Vec::new();
+        for route in routes {
+            compiled.push(CompiledRoute::compile(route)?);
+        }
 
         debug!("Built router with {} routes", compiled.len());
-        Router { routes: compiled }
+        Ok(Router { routes: compiled })
+    }
+
+    /// Check if any route requires header matching.
+    pub fn has_header_matchers(&self) -> bool {
+        self.routes.iter().any(|r| !r.headers.is_empty())
     }
 
     /// Find a matching route for the given request properties.
@@ -98,12 +106,12 @@ impl Router {
 
 impl CompiledRoute {
     /// Compile a route configuration into an optimized matcher.
-    fn compile(config: &RouteConfig) -> Self {
-        let host_matcher = config
-            .match_rules
-            .host
-            .as_ref()
-            .map(|h| HostMatcher::compile(h));
+    fn compile(config: &RouteConfig) -> Result<Self> {
+        let host_matcher = if let Some(ref h) = config.match_rules.host {
+            Some(HostMatcher::compile(h)?)
+        } else {
+            None
+        };
 
         let path_matcher = if let Some(ref exact) = config.match_rules.path {
             Some(PathMatcher::Exact(exact.clone()))
@@ -122,14 +130,14 @@ impl CompiledRoute {
             .map(|m| m.to_uppercase())
             .collect();
 
-        CompiledRoute {
+        Ok(CompiledRoute {
             name: config.name.clone(),
             upstream: config.upstream.clone(),
             host_matcher,
             path_matcher,
             methods,
             headers: config.match_rules.headers.clone(),
-        }
+        })
     }
 
     /// Check if this route matches the given request properties.
@@ -180,19 +188,21 @@ impl HostMatcher {
     /// Compile a host pattern into a matcher.
     ///
     /// Supports wildcards like "*.example.com".
-    fn compile(pattern: &str) -> Self {
-        if pattern.starts_with("*.") {
+    fn compile(pattern: &str) -> Result<Self> {
+        if let Some(suffix) = pattern.strip_prefix("*.") {
             // Convert wildcard pattern to regex
-            let suffix = &pattern[2..];
             let regex_pattern = format!(r"^[^.]+\.{}$", regex::escape(suffix));
-            HostMatcher::Wildcard(Regex::new(&regex_pattern).expect("Invalid host pattern"))
+            let regex = Regex::new(&regex_pattern)
+                .map_err(|e| anyhow::anyhow!("Invalid host pattern '{}': {}", pattern, e))?;
+            Ok(HostMatcher::Wildcard(regex))
         } else if pattern.contains('*') {
             // General wildcard pattern
-            let regex_pattern =
-                format!("^{}$", pattern.replace('.', r"\.").replace('*', "[^.]+"));
-            HostMatcher::Wildcard(Regex::new(&regex_pattern).expect("Invalid host pattern"))
+            let regex_pattern = format!("^{}$", pattern.replace('.', r"\.").replace('*', "[^.]+"));
+            let regex = Regex::new(&regex_pattern)
+                .map_err(|e| anyhow::anyhow!("Invalid host pattern '{}': {}", pattern, e))?;
+            Ok(HostMatcher::Wildcard(regex))
         } else {
-            HostMatcher::Exact(pattern.to_lowercase())
+            Ok(HostMatcher::Exact(pattern.to_lowercase()))
         }
     }
 
@@ -257,7 +267,7 @@ mod tests {
             vec![],
         )];
 
-        let router = Router::build(&routes);
+        let router = Router::build(&routes).unwrap();
         let headers = HashMap::new();
 
         assert!(router
@@ -282,7 +292,7 @@ mod tests {
             vec![],
         )];
 
-        let router = Router::build(&routes);
+        let router = Router::build(&routes).unwrap();
         let headers = HashMap::new();
 
         assert!(router
@@ -310,7 +320,7 @@ mod tests {
             vec![],
         )];
 
-        let router = Router::build(&routes);
+        let router = Router::build(&routes).unwrap();
         let headers = HashMap::new();
 
         assert!(router
@@ -338,7 +348,7 @@ mod tests {
             vec![],
         )];
 
-        let router = Router::build(&routes);
+        let router = Router::build(&routes).unwrap();
         let headers = HashMap::new();
 
         assert!(router
@@ -363,7 +373,7 @@ mod tests {
             vec!["POST", "PUT"],
         )];
 
-        let router = Router::build(&routes);
+        let router = Router::build(&routes).unwrap();
         let headers = HashMap::new();
 
         assert!(router
@@ -387,7 +397,7 @@ mod tests {
             make_route(Some("general"), "legacy", None, Some("/api"), None, vec![]),
         ];
 
-        let router = Router::build(&routes);
+        let router = Router::build(&routes).unwrap();
         let headers = HashMap::new();
 
         // More specific route should match first
@@ -414,7 +424,7 @@ mod tests {
             vec![],
         )];
 
-        let router = Router::build(&routes);
+        let router = Router::build(&routes).unwrap();
         let headers = HashMap::new();
 
         assert!(router
