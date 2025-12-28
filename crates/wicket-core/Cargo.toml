@@ -1,0 +1,25 @@
+[package]
+name = "wicket-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core proxy and routing logic for Wicket"
+
+[dependencies]
+wicket-config = { workspace = true }
+
+# Pingora framework
+pingora = { workspace = true }
+pingora-core = { workspace = true }
+pingora-proxy = { workspace = true }
+pingora-load-balancing = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Utilities
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }

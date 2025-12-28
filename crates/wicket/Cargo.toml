@@ -1,0 +1,35 @@
+[package]
+name = "wicket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A Kubernetes Gateway API implementation and reverse proxy built on Pingora"
+default-run = "wicket"
+
+[[bin]]
+name = "wicket"
+path = "src/main.rs"
+
+[dependencies]
+wicket-config = { workspace = true }
+wicket-core = { workspace = true }
+
+# Pingora framework
+pingora = { workspace = true }
+pingora-core = { workspace = true }
+pingora-proxy = { workspace = true }
+
+# Cloudflare foundations for production telemetry
+foundations = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Logging / Telemetry
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }

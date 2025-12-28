@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wicket",
+    "crates/wicket-config",
+    "crates/wicket-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/GEverding/wicket"
+
+[workspace.dependencies]
+# Internal crates
+wicket-config = { path = "crates/wicket-config" }
+wicket-core = { path = "crates/wicket-core" }
+
+# Pingora framework
+pingora = { version = "0.6", features = ["lb"] }
+pingora-core = "0.6"
+pingora-proxy = "0.6"
+pingora-load-balancing = "0.6"
+
+# Cloudflare foundations - production-grade service infrastructure
+foundations = { version = "3", features = [
+    "telemetry",
+    "settings",
+    "cli",
+    "logging",
+    "metrics",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Config parsing
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Logging / Telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Utilities
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+once_cell = "1"
+arc-swap = "1"
+http = "1"
+bytes = "1"
+regex = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
