@@ -274,4 +274,130 @@ mod tests {
         assert!(manager.resolve("missing.example.com").is_none());
         assert!(manager.resolve("valid.example.com").is_some());
     }
+
+    #[tokio::test]
+    async fn test_reload_on_file_change() {
+        let temp = TempDir::new().unwrap();
+        let (cert_path, key_path) = create_test_cert(temp.path(), "v1");
+
+        let config = FileConfig {
+            watch: true,
+            poll_interval_secs: 30,
+            certs: vec![FileCertConfig {
+                name: "test".to_string(),
+                cert: cert_path.clone(),
+                key: key_path.clone(),
+                domains: vec!["test.example.com".to_string()],
+            }],
+        };
+
+        let manager = Arc::new(CertManager::new());
+        let watcher = FileWatcher::new(config, manager.clone());
+
+        watcher.load_all().unwrap();
+        assert!(manager.resolve("test.example.com").is_some());
+
+        // Start the watcher
+        let _handle = watcher.start();
+
+        // Overwrite cert file with new cert (same domain in config, different cert content)
+        let (new_cert_path, new_key_path) = create_test_cert(temp.path(), "v2");
+        std::fs::copy(&new_cert_path, &cert_path).unwrap();
+        std::fs::copy(&new_key_path, &key_path).unwrap();
+
+        // Wait for debounce (500ms) + margin
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        // Verify cert still resolves after reload
+        assert!(manager.resolve("test.example.com").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_debounce_multiple_changes() {
+        let temp = TempDir::new().unwrap();
+        let (cert_path, key_path) = create_test_cert(temp.path(), "test");
+
+        let config = FileConfig {
+            watch: true,
+            poll_interval_secs: 30,
+            certs: vec![FileCertConfig {
+                name: "test".to_string(),
+                cert: cert_path.clone(),
+                key: key_path.clone(),
+                domains: vec!["test.example.com".to_string()],
+            }],
+        };
+
+        let manager = Arc::new(CertManager::new());
+        let watcher = FileWatcher::new(config, manager.clone());
+
+        watcher.load_all().unwrap();
+        assert!(manager.resolve("test.example.com").is_some());
+
+        // Start the watcher
+        let _handle = watcher.start();
+
+        // Make multiple rapid changes (10ms apart)
+        for i in 0..5 {
+            let (new_cert_path, new_key_path) =
+                create_test_cert(temp.path(), &format!("rapid{}", i));
+            std::fs::copy(&new_cert_path, &cert_path).unwrap();
+            std::fs::copy(&new_key_path, &key_path).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Wait for debounce (500ms) + margin
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        // Verify cert still resolves (watcher didn't crash)
+        assert!(manager.resolve("test.example.com").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_wildcard_after_reload() {
+        let temp = TempDir::new().unwrap();
+
+        // Create cert with wildcard domain
+        let subject_alt_names = vec!["*.example.com".to_string()];
+        let RcgenKey { cert, key_pair } = generate_simple_self_signed(subject_alt_names).unwrap();
+
+        let cert_path = temp.path().join("wildcard.crt");
+        let key_path = temp.path().join("wildcard.key");
+
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+
+        let config = FileConfig {
+            watch: true,
+            poll_interval_secs: 30,
+            certs: vec![FileCertConfig {
+                name: "wildcard".to_string(),
+                cert: cert_path.clone(),
+                key: key_path.clone(),
+                domains: vec!["*.example.com".to_string()],
+            }],
+        };
+
+        let manager = Arc::new(CertManager::new());
+        let watcher = FileWatcher::new(config, manager.clone());
+
+        watcher.load_all().unwrap();
+
+        // Verify wildcard resolves for subdomain
+        assert!(manager.resolve("api.example.com").is_some());
+
+        // Start the watcher
+        let _handle = watcher.start();
+
+        // Modify cert file
+        let (new_cert_path, new_key_path) = create_test_cert(temp.path(), "modified");
+        std::fs::copy(&new_cert_path, &cert_path).unwrap();
+        std::fs::copy(&new_key_path, &key_path).unwrap();
+
+        // Wait for reload
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        // Verify wildcard still resolves after reload
+        assert!(manager.resolve("api.example.com").is_some());
+    }
 }
