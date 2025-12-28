@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::config::FileConfig;
+use crate::metrics::{tls_metrics, CertReloadStatus};
 use crate::pem::load_certified_key;
 use crate::{CertManager, CertStore};
 
@@ -179,9 +180,11 @@ impl FileWatcher {
         match self.build_store() {
             Ok(store) => {
                 self.manager.reload(store);
+                tls_metrics::cert_reload_total(CertReloadStatus::Success).inc();
                 info!("certificates reloaded successfully");
             }
             Err(e) => {
+                tls_metrics::cert_reload_total(CertReloadStatus::Failure).inc();
                 error!(error = %e, "failed to reload certificates, keeping old");
             }
         }

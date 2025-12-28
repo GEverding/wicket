@@ -87,6 +87,7 @@ mod cert_manager;
 mod cert_store;
 mod config;
 mod file_watcher;
+pub mod metrics;
 pub mod pem;
 
 pub mod acme;
