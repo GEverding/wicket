@@ -1,19 +1,36 @@
-[package]
-name = "wicket"
+[workspace]
+resolver = "2"
+members = [
+    "crates/wicket",
+    "crates/wicket-config",
+    "crates/wicket-core",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "A Kubernetes Gateway API implementation and reverse proxy built on Pingora"
 license = "Apache-2.0"
 repository = "https://github.com/GEverding/wicket"
-keywords = ["proxy", "gateway", "kubernetes", "pingora", "reverse-proxy"]
-categories = ["network-programming", "web-programming"]
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates
+wicket-config = { path = "crates/wicket-config" }
+wicket-core = { path = "crates/wicket-core" }
+
 # Pingora framework
 pingora = { version = "0.6", features = ["lb"] }
 pingora-core = "0.6"
 pingora-proxy = "0.6"
 pingora-load-balancing = "0.6"
+
+# Cloudflare foundations - production-grade service infrastructure
+foundations = { version = "3", features = [
+    "telemetry",
+    "settings",
+    "cli",
+    "logging",
+    "metrics",
+] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -23,7 +40,7 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
-# Logging
+# Logging / Telemetry
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 

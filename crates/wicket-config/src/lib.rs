@@ -1,6 +1,6 @@
 //! Configuration parsing for Wicket proxy.
 //!
-//! This module handles loading and parsing TOML configuration files that define
+//! This crate handles loading and parsing TOML configuration files that define
 //! upstreams, routes, and server settings.
 
 use anyhow::{Context, Result};
@@ -26,7 +26,6 @@ pub struct Config {
 
 /// Server-level configuration.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct ServerConfig {
     /// Address to listen on (e.g., "0.0.0.0:8080")
     pub listen: SocketAddr,
@@ -64,7 +63,7 @@ pub struct UpstreamConfig {
 }
 
 /// Load balancing strategy.
-#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalanceStrategy {
     #[default]
@@ -74,7 +73,6 @@ pub enum LoadBalanceStrategy {
 
 /// Health check configuration for upstreams.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct HealthCheckConfig {
     /// Path to check (e.g., "/health")
     #[serde(default = "default_health_path")]
@@ -104,7 +102,7 @@ pub struct RouteConfig {
 }
 
 /// Matching rules for a route.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct RouteMatch {
     /// Host header to match (supports wildcards like "*.example.com")
     pub host: Option<String>,
@@ -173,7 +171,7 @@ impl Config {
     }
 
     /// Validate the configuration for consistency.
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         // Check that all routes reference defined upstreams
         for route in &self.routes {
             if !self.upstreams.contains_key(&route.upstream) {
@@ -297,7 +295,10 @@ path_prefix = "/"
 
         let result = Config::parse(config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("undefined upstream"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("undefined upstream"));
     }
 
     #[test]

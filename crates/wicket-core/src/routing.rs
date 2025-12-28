@@ -2,10 +2,10 @@
 //!
 //! This module provides fast route matching based on host, path, method, and headers.
 
-use crate::config::RouteConfig;
 use regex::Regex;
 use std::collections::HashMap;
 use tracing::debug;
+use wicket_config::RouteConfig;
 
 /// A compiled router that matches requests to upstream names.
 #[derive(Debug)]
@@ -51,7 +51,7 @@ enum PathMatcher {
 
 /// Information about a matched route.
 #[derive(Debug, Clone)]
-pub struct RouteMatch2 {
+pub struct RouteMatch {
     /// Name of the matched route
     pub route_name: Option<String>,
 
@@ -62,10 +62,8 @@ pub struct RouteMatch2 {
 impl Router {
     /// Build a router from route configurations.
     pub fn build(routes: &[RouteConfig]) -> Self {
-        let compiled: Vec<CompiledRoute> = routes
-            .iter()
-            .map(|r| CompiledRoute::compile(r))
-            .collect();
+        let compiled: Vec<CompiledRoute> =
+            routes.iter().map(|r| CompiledRoute::compile(r)).collect();
 
         debug!("Built router with {} routes", compiled.len());
         Router { routes: compiled }
@@ -80,7 +78,7 @@ impl Router {
         path: &str,
         method: &str,
         headers: &HashMap<String, String>,
-    ) -> Option<RouteMatch2> {
+    ) -> Option<RouteMatch> {
         for route in &self.routes {
             if route.matches(host, path, method, headers) {
                 debug!(
@@ -88,7 +86,7 @@ impl Router {
                     upstream = %route.upstream,
                     "Matched route"
                 );
-                return Some(RouteMatch2 {
+                return Some(RouteMatch {
                     route_name: route.name.clone(),
                     upstream: route.upstream.clone(),
                 });
@@ -190,7 +188,8 @@ impl HostMatcher {
             HostMatcher::Wildcard(Regex::new(&regex_pattern).expect("Invalid host pattern"))
         } else if pattern.contains('*') {
             // General wildcard pattern
-            let regex_pattern = format!("^{}$", pattern.replace('.', r"\.").replace('*', "[^.]+"));
+            let regex_pattern =
+                format!("^{}$", pattern.replace('.', r"\.").replace('*', "[^.]+"));
             HostMatcher::Wildcard(Regex::new(&regex_pattern).expect("Invalid host pattern"))
         } else {
             HostMatcher::Exact(pattern.to_lowercase())
@@ -224,7 +223,7 @@ impl PathMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RouteMatch as ConfigRouteMatch;
+    use wicket_config::RouteMatch as ConfigRouteMatch;
 
     fn make_route(
         name: Option<&str>,

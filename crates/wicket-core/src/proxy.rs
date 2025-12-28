@@ -2,8 +2,7 @@
 //!
 //! This module implements the core proxy functionality using Pingora's HttpProxy trait.
 
-use crate::config::{Config, LoadBalanceStrategy, UpstreamConfig};
-use crate::routing::{RouteMatch2, Router};
+use crate::routing::{RouteMatch, Router};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -18,11 +17,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+use wicket_config::{Config, LoadBalanceStrategy, UpstreamConfig};
 
 /// Context carried through the request lifecycle.
 pub struct WicketCtx {
     /// The matched route information
-    pub route_match: Option<RouteMatch2>,
+    pub route_match: Option<RouteMatch>,
 
     /// Start time for request duration tracking
     pub start_time: std::time::Instant,
@@ -85,7 +85,6 @@ impl WicketProxy {
     }
 
     /// Reload configuration at runtime.
-    #[allow(dead_code)]
     pub fn reload(&self, config: &Config) -> Result<()> {
         let router = Router::build(&config.routes);
         let upstreams = Self::build_upstreams(&config.upstreams)?;
@@ -132,8 +131,7 @@ impl UpstreamCluster {
                 if let Some(ref hc_config) = config.health_check {
                     let hc = TcpHealthCheck::new();
                     lb.set_health_check(hc);
-                    lb.health_check_frequency =
-                        Some(Duration::from_secs(hc_config.interval));
+                    lb.health_check_frequency = Some(Duration::from_secs(hc_config.interval));
                 }
 
                 Ok(UpstreamCluster {
@@ -143,8 +141,7 @@ impl UpstreamCluster {
                 })
             }
             LoadBalanceStrategy::ConsistentHash => {
-                let lb =
-                    LoadBalancer::<KetamaHashing>::try_from_iter(backend_refs)?;
+                let lb = LoadBalancer::<KetamaHashing>::try_from_iter(backend_refs)?;
 
                 Ok(UpstreamCluster {
                     lb_round_robin: None,
@@ -249,22 +246,21 @@ impl ProxyHttp for WicketProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<Box<HttpPeer>> {
-        let route_match = ctx.route_match.as_ref().ok_or_else(|| {
-            Error::new(ErrorType::HTTPStatus(404))
-        })?;
+        let route_match = ctx
+            .route_match
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorType::HTTPStatus(404)))?;
 
         // Use request URI as hash key for consistent hashing
         let key = session.req_header().uri.path().as_bytes();
 
-        let peer = self
-            .get_peer(&route_match.upstream, key)
-            .ok_or_else(|| {
-                error!(
-                    upstream = %route_match.upstream,
-                    "No healthy backends available"
-                );
-                Error::new(ErrorType::HTTPStatus(503))
-            })?;
+        let peer = self.get_peer(&route_match.upstream, key).ok_or_else(|| {
+            error!(
+                upstream = %route_match.upstream,
+                "No healthy backends available"
+            );
+            Error::new(ErrorType::HTTPStatus(503))
+        })?;
 
         debug!(
             request_id = %ctx.request_id,
@@ -275,12 +271,8 @@ impl ProxyHttp for WicketProxy {
         Ok(Box::new(peer))
     }
 
-    async fn logging(
-        &self,
-        session: &mut Session,
-        _e: Option<&Error>,
-        ctx: &mut Self::CTX,
-    ) where
+    async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX)
+    where
         Self::CTX: Send + Sync,
     {
         let duration = ctx.start_time.elapsed();
@@ -340,7 +332,6 @@ fn generate_request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
 
     #[test]
     fn test_request_id_generation() {
