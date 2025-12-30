@@ -4051,6 +4051,7 @@ dependencies = [
  "tracing-subscriber",
  "wicket-config",
  "wicket-core",
+ "wicket-stream",
 ]
 
 [[package]]
@@ -4079,6 +4080,20 @@ dependencies = [
  "tracing",
  "wicket-config",
  "wicket-tls",
+]
+
+[[package]]
+name = "wicket-stream"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "libc",
+ "rand 0.8.5",
+ "socket2 0.5.10",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wicket-config",
 ]
 
 [[package]]

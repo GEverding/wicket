@@ -136,3 +136,37 @@ path_prefix = "/"
 # [tls.acme.certs.dns]
 # provider = "cloudflare"
 # api_token = "${CF_API_TOKEN}"
+
+# ============================================================================
+# Stream (L4) Proxy Configuration (optional)
+# ============================================================================
+#
+# Wicket supports L4 TCP stream proxying with SNI-based routing for TLS
+# passthrough scenarios. This is useful for high-connection-count workloads
+# (400k+ concurrent connections) where you need to preserve the original
+# TLS connection to the backend.
+#
+# Example: Stream proxy with SNI routing
+# [stream]
+# listen = "0.0.0.0:8443"
+# backlog = 8000
+# reuseport = true
+# proxy_protocol = "v2"
+# source_ips = ["127.0.0.2", "127.0.0.3"]
+# default_upstream = "echo-backend"
+#
+# [stream.sni_routes]
+# "api.example.com" = "api-backend"
+# "*.internal.com" = "internal-backend"
+#
+# [[stream.upstreams]]
+# name = "echo-backend"
+# servers = ["127.0.0.1:3001"]
+#
+# [[stream.upstreams]]
+# name = "api-backend"
+# servers = ["127.0.0.1:5443"]
+#
+# [[stream.upstreams]]
+# name = "internal-backend"
+# servers = ["127.0.0.1:6443"]

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 wicket-config = { workspace = true }
 wicket-core = { workspace = true }
+wicket-stream = { path = "../wicket-stream" }
 
 # Pingora framework
 pingora = { workspace = true }

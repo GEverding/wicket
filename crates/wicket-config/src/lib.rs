@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 pub use wicket_tls::TlsConfig;
@@ -28,6 +28,10 @@ pub struct Config {
     /// TLS configuration (optional)
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+
+    /// Stream (L4) proxy configuration (optional)
+    #[serde(default)]
+    pub stream: Option<StreamConfig>,
 }
 
 /// Server-level configuration.
@@ -128,6 +132,63 @@ pub struct RouteMatch {
     pub headers: HashMap<String, String>,
 }
 
+/// Stream (L4) proxy configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamConfig {
+    /// Address to listen on (e.g., "0.0.0.0:443")
+    pub listen: String,
+
+    /// TCP backlog size
+    #[serde(default = "default_backlog")]
+    pub backlog: u32,
+
+    /// Enable SO_REUSEPORT for multi-process load balancing
+    #[serde(default = "default_true")]
+    pub reuseport: bool,
+
+    /// PROXY protocol configuration
+    #[serde(default)]
+    pub proxy_protocol: ProxyProtocolConfig,
+
+    /// Source IP addresses for ephemeral port multiplication
+    #[serde(default)]
+    pub source_ips: Vec<IpAddr>,
+
+    /// Default upstream when no SNI route matches
+    pub default_upstream: Option<String>,
+
+    /// SNI-based routing map (hostname -> upstream name)
+    #[serde(default)]
+    pub sni_routes: HashMap<String, String>,
+
+    /// Stream upstream definitions
+    #[serde(default)]
+    pub upstreams: Vec<StreamUpstreamConfig>,
+}
+
+/// Configuration for a stream upstream.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamUpstreamConfig {
+    /// Upstream name
+    pub name: String,
+
+    /// Backend server addresses
+    pub servers: Vec<String>,
+}
+
+/// PROXY protocol configuration.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyProtocolConfig {
+    /// No PROXY protocol
+    #[default]
+    None,
+    /// PROXY protocol v1 (text)
+    V1,
+    /// PROXY protocol v2 (binary)
+    V2,
+}
+
 // Default value functions
 fn default_true() -> bool {
     true
@@ -155,6 +216,10 @@ fn default_health_interval() -> u64 {
 
 fn default_health_threshold() -> u32 {
     3
+}
+
+fn default_backlog() -> u32 {
+    8000
 }
 
 impl Config {
@@ -215,6 +280,11 @@ impl Config {
             self.validate_tls(tls)?;
         }
 
+        // Validate stream config if present
+        if let Some(ref stream) = self.stream {
+            self.validate_stream(stream)?;
+        }
+
         Ok(())
     }
 
@@ -250,6 +320,56 @@ impl Config {
                 }
             } else if matches!(tls.mode, TlsMode::File) {
                 anyhow::bail!("TLS mode 'file' requires [tls.file] section");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_stream(&self, stream: &StreamConfig) -> Result<()> {
+        // Validate listen address is parseable
+        stream
+            .listen
+            .parse::<SocketAddr>()
+            .with_context(|| format!("Invalid stream listen address: {}", stream.listen))?;
+
+        // Build upstream name set
+        let upstream_names: HashMap<&str, ()> = stream
+            .upstreams
+            .iter()
+            .map(|u| (u.name.as_str(), ()))
+            .collect();
+
+        // Validate default_upstream exists if specified
+        if let Some(ref default) = stream.default_upstream {
+            if !upstream_names.contains_key(default.as_str()) {
+                anyhow::bail!(
+                    "Stream default_upstream '{}' references undefined upstream",
+                    default
+                );
+            }
+        }
+
+        // Validate sni_routes reference defined upstreams
+        for (sni, upstream) in &stream.sni_routes {
+            if !upstream_names.contains_key(upstream.as_str()) {
+                anyhow::bail!(
+                    "Stream SNI route '{}' references undefined upstream '{}'",
+                    sni,
+                    upstream
+                );
+            }
+        }
+
+        // Validate at least one upstream is defined
+        if stream.upstreams.is_empty() {
+            anyhow::bail!("Stream config requires at least one upstream");
+        }
+
+        // Validate each upstream has at least one server
+        for upstream in &stream.upstreams {
+            if upstream.servers.is_empty() {
+                anyhow::bail!("Stream upstream '{}' has no servers defined", upstream.name);
             }
         }
 
@@ -547,5 +667,269 @@ path_prefix = "/"
             .unwrap_err()
             .to_string()
             .contains("requires at least one domain"));
+    }
+
+    #[test]
+    fn test_parse_stream_config() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[stream]
+listen = "0.0.0.0:443"
+backlog = 8000
+reuseport = true
+proxy_protocol = "v2"
+source_ips = ["127.0.0.2", "127.0.0.3", "127.0.0.4"]
+default_upstream = "backend_3001"
+
+[stream.sni_routes]
+"api.example.com" = "backend_5443"
+"*.internal.com" = "backend_6443"
+
+[[stream.upstreams]]
+name = "backend_3001"
+servers = ["127.0.0.2:3001", "127.0.0.3:3001", "127.0.0.4:3001"]
+
+[[stream.upstreams]]
+name = "backend_5443"
+servers = ["127.0.0.2:5443", "127.0.0.3:5443", "127.0.0.4:5443"]
+
+[[stream.upstreams]]
+name = "backend_6443"
+servers = ["127.0.0.2:6443"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        assert!(config.stream.is_some());
+
+        let stream = config.stream.unwrap();
+        assert_eq!(stream.listen, "0.0.0.0:443");
+        assert_eq!(stream.backlog, 8000);
+        assert!(stream.reuseport);
+        assert_eq!(stream.proxy_protocol, ProxyProtocolConfig::V2);
+        assert_eq!(stream.source_ips.len(), 3);
+        assert_eq!(stream.default_upstream, Some("backend_3001".to_string()));
+        assert_eq!(stream.sni_routes.len(), 2);
+        assert_eq!(stream.upstreams.len(), 3);
+    }
+
+    #[test]
+    fn test_stream_config_defaults() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[stream]
+listen = "0.0.0.0:443"
+
+[[stream.upstreams]]
+name = "backend"
+servers = ["127.0.0.1:3001"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        let stream = config.stream.unwrap();
+        assert_eq!(stream.backlog, 8000);
+        assert!(stream.reuseport);
+        assert_eq!(stream.proxy_protocol, ProxyProtocolConfig::None);
+        assert!(stream.source_ips.is_empty());
+        assert!(stream.default_upstream.is_none());
+        assert!(stream.sni_routes.is_empty());
+    }
+
+    #[test]
+    fn test_stream_invalid_listen_address() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[stream]
+listen = "invalid:address"
+
+[[stream.upstreams]]
+name = "backend"
+servers = ["127.0.0.1:3001"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid stream listen address"));
+    }
+
+    #[test]
+    fn test_stream_undefined_default_upstream() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[stream]
+listen = "0.0.0.0:443"
+default_upstream = "nonexistent"
+
+[[stream.upstreams]]
+name = "backend"
+servers = ["127.0.0.1:3001"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("default_upstream"));
+    }
+
+    #[test]
+    fn test_stream_undefined_sni_route_upstream() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[stream]
+listen = "0.0.0.0:443"
+
+[stream.sni_routes]
+"api.example.com" = "nonexistent"
+
+[[stream.upstreams]]
+name = "backend"
+servers = ["127.0.0.1:3001"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("SNI route"));
+    }
+
+    #[test]
+    fn test_stream_no_upstreams() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[stream]
+listen = "0.0.0.0:443"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("at least one upstream"));
+    }
+
+    #[test]
+    fn test_stream_upstream_no_servers() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[stream]
+listen = "0.0.0.0:443"
+
+[[stream.upstreams]]
+name = "backend"
+servers = []
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no servers"));
+    }
+
+    #[test]
+    fn test_stream_proxy_protocol_variants() {
+        let configs = vec![
+            (r#"proxy_protocol = "none""#, ProxyProtocolConfig::None),
+            (r#"proxy_protocol = "v1""#, ProxyProtocolConfig::V1),
+            (r#"proxy_protocol = "v2""#, ProxyProtocolConfig::V2),
+        ];
+
+        for (proto_line, expected) in configs {
+            let config = format!(
+                r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[stream]
+listen = "0.0.0.0:443"
+{}
+
+[[stream.upstreams]]
+name = "backend"
+servers = ["127.0.0.1:3001"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#,
+                proto_line
+            );
+
+            let parsed = Config::parse(&config).unwrap();
+            assert_eq!(parsed.stream.unwrap().proxy_protocol, expected);
+        }
     }
 }

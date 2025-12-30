@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: wicket-poc
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      containers:
+      - name: echo
+        image: ealen/echo-server:latest
+        ports:
+        - containerPort: 80
+        env:
+        - name: PORT
+          value: "80"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-svc
+  namespace: wicket-poc
+spec:
+  type: ClusterIP
+  selector:
+    app: echo
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80

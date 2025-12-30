@@ -1,0 +1,25 @@
+[package]
+name = "wicket-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "L4 TCP stream proxying for Wicket"
+
+[dependencies]
+# Workspace crates
+wicket-config = { path = "../wicket-config" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Utilities
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+socket2 = { version = "0.5", features = ["all"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+rand = { workspace = true }
