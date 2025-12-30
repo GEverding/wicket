@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wicket
+  namespace: wicket-poc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wicket
+  template:
+    metadata:
+      labels:
+        app: wicket
+    spec:
+      containers:
+      - name: wicket
+        image: wicket:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: config
+          mountPath: /etc/wicket
+      volumes:
+      - name: config
+        configMap:
+          name: wicket-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wicket-svc
+  namespace: wicket-poc
+spec:
+  type: LoadBalancer
+  selector:
+    app: wicket
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8080

@@ -15,12 +15,13 @@ use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::http_proxy_service;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 use wicket_config::Config;
 use wicket_core::{
     wicket_tls::{CertManager, FileWatcher, TlsMode},
     WicketProxy,
 };
+use wicket_stream::{create_listener, into_tokio_listener, ListenerConfig, StreamProxy};
 
 /// Wicket - Fast, observable reverse proxy built on Pingora
 #[derive(Parser, Debug)]
@@ -221,7 +222,43 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     // Add service to server
     server.add_service(proxy_service);
 
-    // Run the server
+    // Optionally start stream proxy
+    if let Some(ref stream_config) = config.stream {
+        let stream_proxy = Arc::new(
+            StreamProxy::from_config(stream_config).context("Failed to build stream proxy")?,
+        );
+
+        let listener_config = ListenerConfig {
+            addr: stream_config
+                .listen
+                .parse()
+                .context("Invalid stream listen address")?,
+            backlog: stream_config.backlog,
+            reuseport: stream_config.reuseport,
+        };
+
+        let listener =
+            create_listener(&listener_config).context("Failed to create stream listener")?;
+        let listener = into_tokio_listener(listener)?;
+
+        info!(
+            listen = %stream_config.listen,
+            upstreams = stream_config.upstreams.len(),
+            routes = stream_config.sni_routes.len(),
+            proxy_protocol = ?stream_config.proxy_protocol,
+            source_ips = stream_config.source_ips.len(),
+            "Starting stream proxy"
+        );
+
+        let proxy = Arc::clone(&stream_proxy);
+        tokio::spawn(async move {
+            if let Err(e) = proxy.run(listener).await {
+                error!(error = %e, "Stream proxy error");
+            }
+        });
+    }
+
+    // Run the server (blocks until shutdown)
     server.run_forever();
 }
 

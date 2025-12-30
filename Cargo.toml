@@ -4,6 +4,7 @@ members = [
     "crates/wicket",
     "crates/wicket-config",
     "crates/wicket-core",
+    "crates/wicket-stream",
     "crates/wicket-tls",
 ]
 
@@ -54,6 +55,7 @@ arc-swap = "1"
 http = "1"
 bytes = "1"
 regex = "1"
+rand = "0.8"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"] }

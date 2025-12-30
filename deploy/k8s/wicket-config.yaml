@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wicket-config
+  namespace: wicket-poc
+data:
+  wicket.toml: |
+    [server]
+    listen = "0.0.0.0:8080"
+
+    [upstreams.echo]
+    backends = ["echo-svc.wicket-poc.svc.cluster.local:80"]
+
+    [upstreams.httpbin]
+    backends = ["httpbin-svc.wicket-poc.svc.cluster.local:80"]
+
+    [[routes]]
+    name = "echo-route"
+    upstream = "echo"
+    [routes.match]
+    path_prefix = "/echo"
+
+    [[routes]]
+    name = "api-route"
+    upstream = "httpbin"
+    [routes.match]
+    path_prefix = "/api"
+
+    [[routes]]
+    name = "default-route"
+    upstream = "echo"
+    [routes.match]
+    path_prefix = "/"

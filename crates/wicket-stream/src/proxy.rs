@@ -211,11 +211,14 @@ impl StreamProxy {
             crate::pool::configure_outbound_socket(&socket, source_ip)?;
             socket.set_nonblocking(true)?;
 
-            // Connect
+            // Connect (non-blocking)
+            // EINPROGRESS indicates connection in progress - this is expected
             #[cfg(target_os = "linux")]
-            const EINPROGRESS: i32 = libc::EINPROGRESS;
-            #[cfg(not(target_os = "linux"))]
-            const EINPROGRESS: i32 = 115; // EINPROGRESS on most Unix systems
+            const EINPROGRESS: i32 = 115;
+            #[cfg(target_os = "macos")]
+            const EINPROGRESS: i32 = 36;
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            const EINPROGRESS: i32 = 115;
 
             match socket.connect(&addr.into()) {
                 Ok(()) => {}
@@ -223,8 +226,17 @@ impl StreamProxy {
                 Err(e) => return Err(e.into()),
             }
 
+            // Convert to tokio stream and wait for connection to complete
             let std_stream: std::net::TcpStream = socket.into();
-            Ok(TcpStream::from_std(std_stream)?)
+            let stream = TcpStream::from_std(std_stream)?;
+            stream.writable().await?;
+
+            // Check for connection errors
+            if let Some(e) = stream.take_error()? {
+                return Err(e.into());
+            }
+
+            Ok(stream)
         } else {
             Ok(TcpStream::connect(addr).await?)
         }
