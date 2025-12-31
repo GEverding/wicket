@@ -447,9 +447,7 @@ impl Config {
     /// Collect domains with provider info from routes that have `tls = "auto"`.
     ///
     /// Returns AutoTlsDomain structs that include the optional provider name.
-    pub fn collect_auto_tls_domains_with_providers(
-        &self,
-    ) -> Vec<wicket_tls::AutoTlsDomain> {
+    pub fn collect_auto_tls_domains_with_providers(&self) -> Vec<wicket_tls::AutoTlsDomain> {
         self.routes
             .iter()
             .filter_map(|r| {
@@ -1209,7 +1207,9 @@ upstream = "backend"
 path_prefix = "/"
 "#;
 
-        assert!(Config::parse(config_with_auto).unwrap().has_auto_tls_routes());
+        assert!(Config::parse(config_with_auto)
+            .unwrap()
+            .has_auto_tls_routes());
         assert!(!Config::parse(config_without_auto)
             .unwrap()
             .has_auto_tls_routes());
@@ -1305,13 +1305,22 @@ path_prefix = "/"
         assert_eq!(domains.len(), 3);
 
         // Check domain names and providers
-        let app1 = domains.iter().find(|d| d.domain == "app1.example.com").unwrap();
+        let app1 = domains
+            .iter()
+            .find(|d| d.domain == "app1.example.com")
+            .unwrap();
         assert_eq!(app1.provider.as_deref(), Some("acme-corp"));
 
-        let app2 = domains.iter().find(|d| d.domain == "app2.example.com").unwrap();
+        let app2 = domains
+            .iter()
+            .find(|d| d.domain == "app2.example.com")
+            .unwrap();
         assert_eq!(app2.provider, None);
 
-        let app3 = domains.iter().find(|d| d.domain == "app3.example.com").unwrap();
+        let app3 = domains
+            .iter()
+            .find(|d| d.domain == "app3.example.com")
+            .unwrap();
         assert_eq!(app3.provider.as_deref(), Some("other-account"));
     }
 
