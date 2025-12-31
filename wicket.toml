@@ -63,11 +63,12 @@ path_prefix = "/"
 # ============================================================================
 #
 # Each route can specify its own TLS mode:
-# - tls = "auto"          : Auto-provision via ACME for this route's host
-# - tls = { cert = "name" }: Use a specific certificate by name
-# - tls = "off"           : Disable TLS for this route
+# - tls = "auto"                   : Auto-provision via ACME using default_dns
+# - tls = { auto = "provider-name" }: Use a named DNS provider (for multi-account)
+# - tls = { cert = "name" }        : Use a specific certificate by name
+# - tls = "off"                    : Disable TLS for this route
 #
-# Example: Multiple apps with auto TLS
+# Example: Multiple apps with auto TLS (single Cloudflare account)
 # [[routes]]
 # name = "app1"
 # upstream = "app1-backend"
@@ -95,6 +96,59 @@ path_prefix = "/"
 # [tls.acme.default_dns]
 # provider = "cloudflare"
 # api_token = "${CF_API_TOKEN}"
+#
+# ============================================================================
+# Multi-Provider TLS (Multiple Cloudflare Accounts)
+# ============================================================================
+#
+# For apps hosted on different DNS zones managed by different Cloudflare
+# accounts, define named DNS providers and reference them per-route:
+#
+# [[routes]]
+# name = "acme-corp-app"
+# upstream = "acme-backend"
+# tls = { auto = "acme-corp" }     # Uses acme-corp's Cloudflare account
+# [routes.match]
+# host = "app.acme-corp.com"
+# path_prefix = "/"
+#
+# [[routes]]
+# name = "other-app"
+# upstream = "other-backend"
+# tls = { auto = "other-account" } # Uses other-account's Cloudflare account
+# [routes.match]
+# host = "app.other-company.com"
+# path_prefix = "/"
+#
+# [[routes]]
+# name = "default-app"
+# upstream = "default-backend"
+# tls = "auto"                     # Falls back to default_dns
+# [routes.match]
+# host = "app.mycompany.com"
+# path_prefix = "/"
+#
+# [tls]
+# mode = "acme"
+#
+# [tls.acme]
+# email = "admin@mycompany.com"
+# staging = true
+#
+# # Default DNS provider for routes with tls = "auto"
+# [tls.acme.default_dns]
+# provider = "cloudflare"
+# api_token = "${CF_API_TOKEN_DEFAULT}"
+#
+# # Named providers for multi-account support
+# [tls.acme.dns_providers.acme-corp]
+# provider = "cloudflare"
+# api_token = "${CF_API_TOKEN_ACME_CORP}"
+# zone_id = "zone-acme-corp"  # Optional, auto-detected if not specified
+#
+# [tls.acme.dns_providers.other-account]
+# provider = "cloudflare"
+# api_token = "${CF_API_TOKEN_OTHER}"
 
 # Example: Static files route
 # [[routes]]

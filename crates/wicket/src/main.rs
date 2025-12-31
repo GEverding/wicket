@@ -138,17 +138,17 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
             }
             TlsMode::Acme => {
                 if let Some(ref acme_config) = tls_config.acme {
-                    // Collect domains from routes with tls = "auto"
-                    let auto_tls_domains = config.collect_auto_tls_domains();
+                    // Collect domains from routes with tls = "auto", including provider info
+                    let auto_tls_domains = config.collect_auto_tls_domains_with_providers();
                     if !auto_tls_domains.is_empty() {
                         info!(
-                            domains = ?auto_tls_domains,
+                            domains = ?auto_tls_domains.iter().map(|d| &d.domain).collect::<Vec<_>>(),
                             "Auto-TLS domains collected from routes"
                         );
                     }
 
                     let provider = Arc::new(
-                        AcmeProvider::with_auto_tls_domains(
+                        AcmeProvider::with_auto_tls_domains_and_providers(
                             acme_config.clone(),
                             manager.clone(),
                             auto_tls_domains,
@@ -196,16 +196,16 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
 
                 // Then ACME certs
                 if let Some(ref acme_config) = tls_config.acme {
-                    let auto_tls_domains = config.collect_auto_tls_domains();
+                    let auto_tls_domains = config.collect_auto_tls_domains_with_providers();
                     if !auto_tls_domains.is_empty() {
                         info!(
-                            domains = ?auto_tls_domains,
+                            domains = ?auto_tls_domains.iter().map(|d| &d.domain).collect::<Vec<_>>(),
                             "Auto-TLS domains collected from routes"
                         );
                     }
 
                     let provider = Arc::new(
-                        AcmeProvider::with_auto_tls_domains(
+                        AcmeProvider::with_auto_tls_domains_and_providers(
                             acme_config.clone(),
                             manager.clone(),
                             auto_tls_domains,

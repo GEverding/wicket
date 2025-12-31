@@ -13,7 +13,7 @@ use instant_acme::{
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{AcmeCertConfig, AcmeConfig};
+use crate::config::{AcmeCertConfig, AcmeConfig, AutoTlsDomain};
 use crate::metrics::{tls_metrics, AcmeRenewalStatus};
 use crate::pem::load_certified_key;
 use crate::{CertManager, CertStore};
@@ -31,8 +31,8 @@ pub struct AcmeProvider {
     config: AcmeConfig,
     storage: AcmeStorage,
     manager: Arc<CertManager>,
-    /// Additional domains from routes with `tls = "auto"`
-    auto_tls_domains: Vec<String>,
+    /// Additional domains from routes with `tls = "auto"`, with optional provider overrides
+    auto_tls_domains: Vec<AutoTlsDomain>,
 }
 
 impl AcmeProvider {
@@ -41,11 +41,27 @@ impl AcmeProvider {
         Self::with_auto_tls_domains(config, manager, Vec::new())
     }
 
-    /// Create a new ACME provider with auto-TLS domains from routes.
+    /// Create a new ACME provider with auto-TLS domains from routes (simple version).
     pub fn with_auto_tls_domains(
         config: AcmeConfig,
         manager: Arc<CertManager>,
         auto_tls_domains: Vec<String>,
+    ) -> Result<Self, AcmeError> {
+        let domains = auto_tls_domains
+            .into_iter()
+            .map(|d| AutoTlsDomain {
+                domain: d,
+                provider: None,
+            })
+            .collect();
+        Self::with_auto_tls_domains_and_providers(config, manager, domains)
+    }
+
+    /// Create a new ACME provider with auto-TLS domains that may have provider overrides.
+    pub fn with_auto_tls_domains_and_providers(
+        config: AcmeConfig,
+        manager: Arc<CertManager>,
+        auto_tls_domains: Vec<AutoTlsDomain>,
     ) -> Result<Self, AcmeError> {
         let storage = AcmeStorage::new(config.storage.clone())?;
 
@@ -59,7 +75,7 @@ impl AcmeProvider {
 
     /// Get all cert configs including auto-TLS domains.
     fn all_certs(&self) -> Vec<AcmeCertConfig> {
-        self.config.all_certs(&self.auto_tls_domains)
+        self.config.all_certs_with_providers(&self.auto_tls_domains)
     }
 
     /// Initialize certificates - load existing or obtain new ones.
