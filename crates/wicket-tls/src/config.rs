@@ -6,7 +6,7 @@
 //! - `mixed`: Both ACME and file-based certificates
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::warn;
 
@@ -82,13 +82,16 @@ impl AcmeConfig {
     ) -> Vec<AcmeCertConfig> {
         let mut all_certs = self.certs.clone();
 
+        // Build set of domains already covered by explicit certs - O(m)
+        let covered: HashSet<&str> = self
+            .certs
+            .iter()
+            .flat_map(|c| c.domains.iter().map(|d| d.as_str()))
+            .collect();
+
         for auto_domain in auto_tls_domains {
-            // Skip if already covered by explicit certs
-            let already_covered = self
-                .certs
-                .iter()
-                .any(|c| c.domains.contains(&auto_domain.domain));
-            if already_covered {
+            // O(1) lookup instead of O(m)
+            if covered.contains(auto_domain.domain.as_str()) {
                 continue;
             }
 

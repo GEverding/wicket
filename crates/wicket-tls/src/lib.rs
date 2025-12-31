@@ -92,7 +92,7 @@ pub mod pem;
 
 pub mod acme;
 
-pub use acme::{AcmeError, AcmeProvider};
+pub use acme::{AcmeError, AcmeProvider, AcmeProviderBuilder};
 pub use cert_manager::CertManager;
 pub use cert_store::CertStore;
 pub use config::{AcmeConfig, AutoTlsDomain, FileCertConfig, TlsConfig, TlsMode};

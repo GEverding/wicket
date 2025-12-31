@@ -123,12 +123,10 @@ fn init_acme(
     }
 
     let provider = Arc::new(
-        AcmeProvider::with_auto_tls_domains_and_providers(
-            acme_config.clone(),
-            manager.clone(),
-            auto_tls_domains,
-        )
-        .context("Failed to create ACME provider")?,
+        AcmeProvider::builder(acme_config.clone(), manager.clone())
+            .auto_tls_domains(auto_tls_domains)
+            .build()
+            .context("Failed to create ACME provider")?,
     );
 
     // Initialize synchronously using the provided runtime
