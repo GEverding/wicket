@@ -351,7 +351,10 @@ mod tests {
         let acme = config.acme.unwrap();
 
         assert!(acme.default_dns.is_some());
-        assert_eq!(acme.default_dns.as_ref().unwrap().api_token, "default-token");
+        assert_eq!(
+            acme.default_dns.as_ref().unwrap().api_token,
+            "default-token"
+        );
 
         assert_eq!(acme.dns_providers.len(), 2);
 
@@ -435,16 +438,25 @@ mod tests {
         assert_eq!(all_certs[0].dns.api_token, "explicit-token");
 
         // app1 uses acme-corp provider
-        let app1 = all_certs.iter().find(|c| c.domains[0] == "app1.example.com").unwrap();
+        let app1 = all_certs
+            .iter()
+            .find(|c| c.domains[0] == "app1.example.com")
+            .unwrap();
         assert_eq!(app1.dns.api_token, "acme-corp-token");
         assert_eq!(app1.dns.zone_id, Some("zone-acme".to_string()));
 
         // app2 uses default_dns
-        let app2 = all_certs.iter().find(|c| c.domains[0] == "app2.example.com").unwrap();
+        let app2 = all_certs
+            .iter()
+            .find(|c| c.domains[0] == "app2.example.com")
+            .unwrap();
         assert_eq!(app2.dns.api_token, "default-token");
 
         // app3 uses other-account provider
-        let app3 = all_certs.iter().find(|c| c.domains[0] == "app3.example.com").unwrap();
+        let app3 = all_certs
+            .iter()
+            .find(|c| c.domains[0] == "app3.example.com")
+            .unwrap();
         assert_eq!(app3.dns.api_token, "other-token");
     }
 
