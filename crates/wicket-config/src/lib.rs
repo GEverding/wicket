@@ -116,15 +116,55 @@ pub struct RouteConfig {
 }
 
 /// Per-route TLS configuration.
+///
+/// Supports multiple formats:
+/// - `tls = "auto"` - Auto-provision via ACME using default_dns
+/// - `tls = { auto = "provider-name" }` - Use a named DNS provider
+/// - `tls = { cert = "cert-name" }` - Use a specific certificate
+/// - `tls = "off"` - Disable TLS
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RouteTlsConfig {
+    /// Simple string variants: "auto" or "off"
+    Simple(SimpleTlsMode),
+    /// Auto with provider: { auto = "provider-name" }
+    AutoWithProvider {
+        /// Name of the DNS provider from tls.acme.dns_providers
+        auto: String,
+    },
+    /// Cert reference: { cert = "cert-name" }
+    CertRef {
+        /// Name of the certificate from tls.file.certs
+        cert: String,
+    },
+}
+
+/// Simple TLS modes that can be specified as strings.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RouteTlsConfig {
-    /// Auto-provision certificate via ACME for this route's host
+pub enum SimpleTlsMode {
+    /// Auto-provision certificate via ACME using default_dns
     Auto,
-    /// Use a specific certificate by name (must be defined in tls.file.certs)
-    Cert(String),
     /// Disable TLS for this route (use HTTP)
     Off,
+}
+
+impl RouteTlsConfig {
+    /// Check if this is an auto TLS config (either simple or with provider).
+    pub fn is_auto(&self) -> bool {
+        matches!(
+            self,
+            RouteTlsConfig::Simple(SimpleTlsMode::Auto) | RouteTlsConfig::AutoWithProvider { .. }
+        )
+    }
+
+    /// Get the provider name if this is an auto config with a specific provider.
+    pub fn provider(&self) -> Option<&str> {
+        match self {
+            RouteTlsConfig::AutoWithProvider { auto } => Some(auto),
+            _ => None,
+        }
+    }
 }
 
 /// Matching rules for a route.
@@ -399,8 +439,30 @@ impl Config {
     pub fn collect_auto_tls_domains(&self) -> Vec<String> {
         self.routes
             .iter()
-            .filter(|r| matches!(r.tls, Some(RouteTlsConfig::Auto)))
+            .filter(|r| r.tls.as_ref().is_some_and(|t| t.is_auto()))
             .filter_map(|r| r.match_rules.host.clone())
+            .collect()
+    }
+
+    /// Collect domains with provider info from routes that have `tls = "auto"`.
+    ///
+    /// Returns AutoTlsDomain structs that include the optional provider name.
+    pub fn collect_auto_tls_domains_with_providers(
+        &self,
+    ) -> Vec<wicket_tls::AutoTlsDomain> {
+        self.routes
+            .iter()
+            .filter_map(|r| {
+                let tls = r.tls.as_ref()?;
+                if !tls.is_auto() {
+                    return None;
+                }
+                let host = r.match_rules.host.clone()?;
+                Some(wicket_tls::AutoTlsDomain {
+                    domain: host,
+                    provider: tls.provider().map(String::from),
+                })
+            })
             .collect()
     }
 
@@ -408,7 +470,7 @@ impl Config {
     pub fn has_auto_tls_routes(&self) -> bool {
         self.routes
             .iter()
-            .any(|r| matches!(r.tls, Some(RouteTlsConfig::Auto)))
+            .any(|r| r.tls.as_ref().is_some_and(|t| t.is_auto()))
     }
 }
 
@@ -999,8 +1061,14 @@ path_prefix = "/"
 
         let config = Config::parse(config).unwrap();
         assert_eq!(config.routes.len(), 2);
-        assert_eq!(config.routes[0].tls, Some(RouteTlsConfig::Auto));
-        assert_eq!(config.routes[1].tls, Some(RouteTlsConfig::Auto));
+        assert_eq!(
+            config.routes[0].tls,
+            Some(RouteTlsConfig::Simple(SimpleTlsMode::Auto))
+        );
+        assert_eq!(
+            config.routes[1].tls,
+            Some(RouteTlsConfig::Simple(SimpleTlsMode::Auto))
+        );
 
         let domains = config.collect_auto_tls_domains();
         assert_eq!(domains.len(), 2);
@@ -1029,7 +1097,9 @@ path_prefix = "/"
         let config = Config::parse(config).unwrap();
         assert_eq!(
             config.routes[0].tls,
-            Some(RouteTlsConfig::Cert("my-cert".to_string()))
+            Some(RouteTlsConfig::CertRef {
+                cert: "my-cert".to_string()
+            })
         );
     }
 
@@ -1051,7 +1121,10 @@ path_prefix = "/health"
 "#;
 
         let config = Config::parse(config).unwrap();
-        assert_eq!(config.routes[0].tls, Some(RouteTlsConfig::Off));
+        assert_eq!(
+            config.routes[0].tls,
+            Some(RouteTlsConfig::Simple(SimpleTlsMode::Off))
+        );
     }
 
     #[test]
@@ -1140,5 +1213,129 @@ path_prefix = "/"
         assert!(!Config::parse(config_without_auto)
             .unwrap()
             .has_auto_tls_routes());
+    }
+
+    #[test]
+    fn test_route_tls_auto_with_provider() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "app1"
+upstream = "backend"
+tls = { auto = "acme-corp" }
+[routes.match]
+host = "app1.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app2"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app2.example.com"
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+
+        // First route uses named provider
+        assert_eq!(
+            config.routes[0].tls,
+            Some(RouteTlsConfig::AutoWithProvider {
+                auto: "acme-corp".to_string()
+            })
+        );
+        assert!(config.routes[0].tls.as_ref().unwrap().is_auto());
+        assert_eq!(
+            config.routes[0].tls.as_ref().unwrap().provider(),
+            Some("acme-corp")
+        );
+
+        // Second route uses default provider
+        assert_eq!(
+            config.routes[1].tls,
+            Some(RouteTlsConfig::Simple(SimpleTlsMode::Auto))
+        );
+        assert!(config.routes[1].tls.as_ref().unwrap().is_auto());
+        assert_eq!(config.routes[1].tls.as_ref().unwrap().provider(), None);
+    }
+
+    #[test]
+    fn test_collect_auto_tls_domains_with_providers() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "app1"
+upstream = "backend"
+tls = { auto = "acme-corp" }
+[routes.match]
+host = "app1.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app2"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app2.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app3"
+upstream = "backend"
+tls = { auto = "other-account" }
+[routes.match]
+host = "app3.example.com"
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        let domains = config.collect_auto_tls_domains_with_providers();
+
+        assert_eq!(domains.len(), 3);
+
+        // Check domain names and providers
+        let app1 = domains.iter().find(|d| d.domain == "app1.example.com").unwrap();
+        assert_eq!(app1.provider.as_deref(), Some("acme-corp"));
+
+        let app2 = domains.iter().find(|d| d.domain == "app2.example.com").unwrap();
+        assert_eq!(app2.provider, None);
+
+        let app3 = domains.iter().find(|d| d.domain == "app3.example.com").unwrap();
+        assert_eq!(app3.provider.as_deref(), Some("other-account"));
+    }
+
+    #[test]
+    fn test_route_tls_helper_methods() {
+        // Test is_auto() and provider() for all variants
+        let auto = RouteTlsConfig::Simple(SimpleTlsMode::Auto);
+        assert!(auto.is_auto());
+        assert_eq!(auto.provider(), None);
+
+        let auto_with_provider = RouteTlsConfig::AutoWithProvider {
+            auto: "my-provider".to_string(),
+        };
+        assert!(auto_with_provider.is_auto());
+        assert_eq!(auto_with_provider.provider(), Some("my-provider"));
+
+        let cert_ref = RouteTlsConfig::CertRef {
+            cert: "my-cert".to_string(),
+        };
+        assert!(!cert_ref.is_auto());
+        assert_eq!(cert_ref.provider(), None);
+
+        let off = RouteTlsConfig::Simple(SimpleTlsMode::Off);
+        assert!(!off.is_auto());
+        assert_eq!(off.provider(), None);
     }
 }

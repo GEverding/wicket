@@ -95,6 +95,6 @@ pub mod acme;
 pub use acme::{AcmeError, AcmeProvider};
 pub use cert_manager::CertManager;
 pub use cert_store::CertStore;
-pub use config::{AcmeConfig, FileCertConfig, TlsConfig, TlsMode};
+pub use config::{AcmeConfig, AutoTlsDomain, FileCertConfig, TlsConfig, TlsMode};
 pub use file_watcher::{FileWatcher, FileWatcherError};
 pub use pem::{load_certified_key, load_certs, load_private_key, PemError};
