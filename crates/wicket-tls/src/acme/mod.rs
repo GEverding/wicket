@@ -35,42 +35,46 @@ pub struct AcmeProvider {
     auto_tls_domains: Vec<AutoTlsDomain>,
 }
 
-impl AcmeProvider {
-    /// Create a new ACME provider.
-    pub fn new(config: AcmeConfig, manager: Arc<CertManager>) -> Result<Self, AcmeError> {
-        Self::with_auto_tls_domains(config, manager, Vec::new())
+/// Builder for AcmeProvider.
+pub struct AcmeProviderBuilder {
+    config: AcmeConfig,
+    manager: Arc<CertManager>,
+    auto_tls_domains: Vec<AutoTlsDomain>,
+}
+
+impl AcmeProviderBuilder {
+    /// Set auto-TLS domains from routes.
+    pub fn auto_tls_domains(mut self, domains: Vec<AutoTlsDomain>) -> Self {
+        self.auto_tls_domains = domains;
+        self
     }
 
-    /// Create a new ACME provider with auto-TLS domains from routes (simple version).
-    pub fn with_auto_tls_domains(
-        config: AcmeConfig,
-        manager: Arc<CertManager>,
-        auto_tls_domains: Vec<String>,
-    ) -> Result<Self, AcmeError> {
-        let domains = auto_tls_domains
-            .into_iter()
-            .map(|d| AutoTlsDomain {
-                domain: d,
-                provider: None,
-            })
-            .collect();
-        Self::with_auto_tls_domains_and_providers(config, manager, domains)
-    }
+    /// Build the AcmeProvider.
+    pub fn build(self) -> Result<AcmeProvider, AcmeError> {
+        let storage = AcmeStorage::new(self.config.storage.clone())?;
 
-    /// Create a new ACME provider with auto-TLS domains that may have provider overrides.
-    pub fn with_auto_tls_domains_and_providers(
-        config: AcmeConfig,
-        manager: Arc<CertManager>,
-        auto_tls_domains: Vec<AutoTlsDomain>,
-    ) -> Result<Self, AcmeError> {
-        let storage = AcmeStorage::new(config.storage.clone())?;
-
-        Ok(Self {
-            config,
+        Ok(AcmeProvider {
+            config: self.config,
             storage,
-            manager,
-            auto_tls_domains,
+            manager: self.manager,
+            auto_tls_domains: self.auto_tls_domains,
         })
+    }
+}
+
+impl AcmeProvider {
+    /// Create a builder for AcmeProvider.
+    pub fn builder(config: AcmeConfig, manager: Arc<CertManager>) -> AcmeProviderBuilder {
+        AcmeProviderBuilder {
+            config,
+            manager,
+            auto_tls_domains: Vec::new(),
+        }
+    }
+
+    /// Create a new ACME provider (convenience method).
+    pub fn new(config: AcmeConfig, manager: Arc<CertManager>) -> Result<Self, AcmeError> {
+        Self::builder(config, manager).build()
     }
 
     /// Get all cert configs including auto-TLS domains.
