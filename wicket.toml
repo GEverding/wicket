@@ -58,6 +58,44 @@ path_prefix = "/"
 # path_prefix = "/v1"
 # methods = ["GET", "POST", "PUT", "DELETE"]
 
+# ============================================================================
+# Per-Route TLS (Multi-App with Auto TLS)
+# ============================================================================
+#
+# Each route can specify its own TLS mode:
+# - tls = "auto"          : Auto-provision via ACME for this route's host
+# - tls = { cert = "name" }: Use a specific certificate by name
+# - tls = "off"           : Disable TLS for this route
+#
+# Example: Multiple apps with auto TLS
+# [[routes]]
+# name = "app1"
+# upstream = "app1-backend"
+# tls = "auto"
+# [routes.match]
+# host = "app1.example.com"
+# path_prefix = "/"
+#
+# [[routes]]
+# name = "app2"
+# upstream = "app2-backend"
+# tls = "auto"
+# [routes.match]
+# host = "app2.example.com"
+# path_prefix = "/"
+#
+# When using per-route auto TLS, configure ACME with a default DNS provider:
+# [tls]
+# mode = "acme"
+#
+# [tls.acme]
+# email = "admin@example.com"
+# staging = true
+#
+# [tls.acme.default_dns]
+# provider = "cloudflare"
+# api_token = "${CF_API_TOKEN}"
+
 # Example: Static files route
 # [[routes]]
 # name = "static"
