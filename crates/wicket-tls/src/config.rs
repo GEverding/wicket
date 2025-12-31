@@ -51,6 +51,37 @@ pub struct AcmeConfig {
     /// Certificate configurations
     #[serde(default)]
     pub certs: Vec<AcmeCertConfig>,
+    /// Default DNS provider for per-route auto TLS (routes with `tls = "auto"`)
+    #[serde(default)]
+    pub default_dns: Option<DnsProviderConfig>,
+}
+
+impl AcmeConfig {
+    /// Get all certificate configs, including auto-generated ones from route domains.
+    ///
+    /// If `auto_tls_domains` is provided and `default_dns` is configured,
+    /// generates additional cert configs for each domain.
+    pub fn all_certs(&self, auto_tls_domains: &[String]) -> Vec<AcmeCertConfig> {
+        let mut all_certs = self.certs.clone();
+
+        // Add auto-TLS domains if we have a default DNS provider
+        if let Some(ref dns) = self.default_dns {
+            for domain in auto_tls_domains {
+                // Skip if already covered by explicit certs
+                let already_covered = self.certs.iter().any(|c| c.domains.contains(domain));
+                if already_covered {
+                    continue;
+                }
+
+                all_certs.push(AcmeCertConfig {
+                    domains: vec![domain.clone()],
+                    dns: dns.clone(),
+                });
+            }
+        }
+
+        all_certs
+    }
 }
 
 /// Individual ACME certificate configuration.

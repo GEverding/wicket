@@ -109,6 +109,22 @@ pub struct RouteConfig {
 
     /// Upstream to proxy to
     pub upstream: String,
+
+    /// Per-route TLS configuration
+    #[serde(default)]
+    pub tls: Option<RouteTlsConfig>,
+}
+
+/// Per-route TLS configuration.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteTlsConfig {
+    /// Auto-provision certificate via ACME for this route's host
+    Auto,
+    /// Use a specific certificate by name (must be defined in tls.file.certs)
+    Cert(String),
+    /// Disable TLS for this route (use HTTP)
+    Off,
 }
 
 /// Matching rules for a route.
@@ -374,6 +390,25 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Collect domains from routes that have `tls = "auto"`.
+    ///
+    /// These domains will be auto-provisioned via ACME.
+    /// Only routes with explicit host matches are included (wildcards are supported).
+    pub fn collect_auto_tls_domains(&self) -> Vec<String> {
+        self.routes
+            .iter()
+            .filter(|r| matches!(r.tls, Some(RouteTlsConfig::Auto)))
+            .filter_map(|r| r.match_rules.host.clone())
+            .collect()
+    }
+
+    /// Check if any route requires auto TLS.
+    pub fn has_auto_tls_routes(&self) -> bool {
+        self.routes
+            .iter()
+            .any(|r| matches!(r.tls, Some(RouteTlsConfig::Auto)))
     }
 }
 
@@ -931,5 +966,179 @@ path_prefix = "/"
             let parsed = Config::parse(&config).unwrap();
             assert_eq!(parsed.stream.unwrap().proxy_protocol, expected);
         }
+    }
+
+    #[test]
+    fn test_route_tls_auto() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.app1]
+backends = ["127.0.0.1:3001"]
+
+[upstreams.app2]
+backends = ["127.0.0.1:3002"]
+
+[[routes]]
+name = "app1"
+upstream = "app1"
+tls = "auto"
+[routes.match]
+host = "app1.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app2"
+upstream = "app2"
+tls = "auto"
+[routes.match]
+host = "app2.example.com"
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        assert_eq!(config.routes.len(), 2);
+        assert_eq!(config.routes[0].tls, Some(RouteTlsConfig::Auto));
+        assert_eq!(config.routes[1].tls, Some(RouteTlsConfig::Auto));
+
+        let domains = config.collect_auto_tls_domains();
+        assert_eq!(domains.len(), 2);
+        assert!(domains.contains(&"app1.example.com".to_string()));
+        assert!(domains.contains(&"app2.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_route_tls_cert_reference() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "api"
+upstream = "backend"
+tls = { cert = "my-cert" }
+[routes.match]
+host = "api.example.com"
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        assert_eq!(
+            config.routes[0].tls,
+            Some(RouteTlsConfig::Cert("my-cert".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_route_tls_off() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "health"
+upstream = "backend"
+tls = "off"
+[routes.match]
+path_prefix = "/health"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        assert_eq!(config.routes[0].tls, Some(RouteTlsConfig::Off));
+    }
+
+    #[test]
+    fn test_collect_auto_tls_domains_mixed() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "app1"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app1.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app2"
+upstream = "backend"
+tls = "off"
+[routes.match]
+host = "app2.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app3"
+upstream = "backend"
+[routes.match]
+host = "app3.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app4"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app4.example.com"
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        let domains = config.collect_auto_tls_domains();
+
+        // Only app1 and app4 have tls = "auto"
+        assert_eq!(domains.len(), 2);
+        assert!(domains.contains(&"app1.example.com".to_string()));
+        assert!(domains.contains(&"app4.example.com".to_string()));
+        assert!(!domains.contains(&"app2.example.com".to_string()));
+        assert!(!domains.contains(&"app3.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_has_auto_tls_routes() {
+        let config_with_auto = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "example.com"
+path_prefix = "/"
+"#;
+
+        let config_without_auto = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        assert!(Config::parse(config_with_auto).unwrap().has_auto_tls_routes());
+        assert!(!Config::parse(config_without_auto)
+            .unwrap()
+            .has_auto_tls_routes());
     }
 }

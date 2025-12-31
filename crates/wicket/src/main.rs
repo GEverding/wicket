@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 use wicket_config::Config;
 use wicket_core::{
-    wicket_tls::{CertManager, FileWatcher, TlsMode},
+    wicket_tls::{AcmeProvider, CertManager, FileWatcher, TlsMode},
     WicketProxy,
 };
 use wicket_stream::{create_listener, into_tokio_listener, ListenerConfig, StreamProxy};
@@ -137,9 +137,49 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
                 }
             }
             TlsMode::Acme => {
-                // TODO: Implement ACME provider initialization
-                // For now, log that ACME mode is configured but not yet implemented
-                info!("ACME TLS mode configured but not yet implemented");
+                if let Some(ref acme_config) = tls_config.acme {
+                    // Collect domains from routes with tls = "auto"
+                    let auto_tls_domains = config.collect_auto_tls_domains();
+                    if !auto_tls_domains.is_empty() {
+                        info!(
+                            domains = ?auto_tls_domains,
+                            "Auto-TLS domains collected from routes"
+                        );
+                    }
+
+                    let provider = Arc::new(
+                        AcmeProvider::with_auto_tls_domains(
+                            acme_config.clone(),
+                            manager.clone(),
+                            auto_tls_domains,
+                        )
+                        .context("Failed to create ACME provider")?,
+                    );
+
+                    // Initialize ACME certs (blocking on async)
+                    let rt = tokio::runtime::Handle::try_current()
+                        .or_else(|_| {
+                            tokio::runtime::Runtime::new().map(|rt| rt.handle().clone())
+                        })
+                        .context("Failed to get tokio runtime")?;
+
+                    rt.block_on(async {
+                        provider.initialize().await
+                    }).context("Failed to initialize ACME certificates")?;
+
+                    // Start renewal loop
+                    let provider_clone = Arc::clone(&provider);
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async move {
+                            let _ = provider_clone.start_renewal_loop().await;
+                        });
+                    });
+
+                    info!("ACME provider initialized with renewal loop");
+                } else {
+                    info!("ACME TLS mode configured but no [tls.acme] section found");
+                }
             }
             TlsMode::Mixed => {
                 // Load file certs first
@@ -153,8 +193,48 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
                         info!("File watcher started for certificate updates");
                     }
                 }
-                // TODO: Then ACME certs
-                info!("Mixed TLS mode: file certs loaded, ACME not yet implemented");
+
+                // Then ACME certs
+                if let Some(ref acme_config) = tls_config.acme {
+                    let auto_tls_domains = config.collect_auto_tls_domains();
+                    if !auto_tls_domains.is_empty() {
+                        info!(
+                            domains = ?auto_tls_domains,
+                            "Auto-TLS domains collected from routes"
+                        );
+                    }
+
+                    let provider = Arc::new(
+                        AcmeProvider::with_auto_tls_domains(
+                            acme_config.clone(),
+                            manager.clone(),
+                            auto_tls_domains,
+                        )
+                        .context("Failed to create ACME provider")?,
+                    );
+
+                    let rt = tokio::runtime::Handle::try_current()
+                        .or_else(|_| {
+                            tokio::runtime::Runtime::new().map(|rt| rt.handle().clone())
+                        })
+                        .context("Failed to get tokio runtime")?;
+
+                    rt.block_on(async {
+                        provider.initialize().await
+                    }).context("Failed to initialize ACME certificates")?;
+
+                    let provider_clone = Arc::clone(&provider);
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async move {
+                            let _ = provider_clone.start_renewal_loop().await;
+                        });
+                    });
+
+                    info!("Mixed TLS mode: file certs loaded, ACME initialized");
+                } else {
+                    info!("Mixed TLS mode: file certs loaded, no ACME config");
+                }
             }
         }
 

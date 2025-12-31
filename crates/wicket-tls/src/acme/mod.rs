@@ -31,18 +31,35 @@ pub struct AcmeProvider {
     config: AcmeConfig,
     storage: AcmeStorage,
     manager: Arc<CertManager>,
+    /// Additional domains from routes with `tls = "auto"`
+    auto_tls_domains: Vec<String>,
 }
 
 impl AcmeProvider {
     /// Create a new ACME provider.
     pub fn new(config: AcmeConfig, manager: Arc<CertManager>) -> Result<Self, AcmeError> {
+        Self::with_auto_tls_domains(config, manager, Vec::new())
+    }
+
+    /// Create a new ACME provider with auto-TLS domains from routes.
+    pub fn with_auto_tls_domains(
+        config: AcmeConfig,
+        manager: Arc<CertManager>,
+        auto_tls_domains: Vec<String>,
+    ) -> Result<Self, AcmeError> {
         let storage = AcmeStorage::new(config.storage.clone())?;
 
         Ok(Self {
             config,
             storage,
             manager,
+            auto_tls_domains,
         })
+    }
+
+    /// Get all cert configs including auto-TLS domains.
+    fn all_certs(&self) -> Vec<AcmeCertConfig> {
+        self.config.all_certs(&self.auto_tls_domains)
     }
 
     /// Initialize certificates - load existing or obtain new ones.
@@ -52,8 +69,14 @@ impl AcmeProvider {
         info!("initializing ACME certificates");
 
         let mut store = CertStore::new();
+        let all_certs = self.all_certs();
 
-        for cert_config in &self.config.certs {
+        if all_certs.is_empty() {
+            info!("no ACME certificates configured");
+            return Ok(());
+        }
+
+        for cert_config in &all_certs {
             let primary_domain = cert_config
                 .domains
                 .first()
@@ -131,8 +154,9 @@ impl AcmeProvider {
     async fn check_and_renew(&self) -> Result<(), AcmeError> {
         let mut store = CertStore::new();
         let mut any_renewed = false;
+        let all_certs = self.all_certs();
 
-        for cert_config in &self.config.certs {
+        for cert_config in &all_certs {
             let primary_domain = cert_config
                 .domains
                 .first()
