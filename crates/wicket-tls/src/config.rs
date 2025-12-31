@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use tracing::warn;
 
 /// Top-level TLS configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -103,6 +104,12 @@ impl AcmeConfig {
                     domains: vec![auto_domain.domain.clone()],
                     dns,
                 });
+            } else {
+                warn!(
+                    domain = %auto_domain.domain,
+                    provider = ?auto_domain.provider,
+                    "Skipping domain: no DNS provider configured (validation should have caught this)"
+                );
             }
         }
 
