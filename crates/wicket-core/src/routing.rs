@@ -253,6 +253,7 @@ mod tests {
                 methods: methods.into_iter().map(String::from).collect(),
                 headers: HashMap::new(),
             },
+            tls: None,
         }
     }
 
