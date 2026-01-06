@@ -13,7 +13,7 @@ use instant_acme::{
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{AcmeCertConfig, AcmeConfig};
+use crate::config::{AcmeCertConfig, AcmeConfig, AutoTlsDomain};
 use crate::metrics::{tls_metrics, AcmeRenewalStatus};
 use crate::pem::load_certified_key;
 use crate::{CertManager, CertStore};
@@ -31,18 +31,55 @@ pub struct AcmeProvider {
     config: AcmeConfig,
     storage: AcmeStorage,
     manager: Arc<CertManager>,
+    /// Additional domains from routes with `tls = "auto"`, with optional provider overrides
+    auto_tls_domains: Vec<AutoTlsDomain>,
+}
+
+/// Builder for AcmeProvider.
+pub struct AcmeProviderBuilder {
+    config: AcmeConfig,
+    manager: Arc<CertManager>,
+    auto_tls_domains: Vec<AutoTlsDomain>,
+}
+
+impl AcmeProviderBuilder {
+    /// Set auto-TLS domains from routes.
+    pub fn auto_tls_domains(mut self, domains: Vec<AutoTlsDomain>) -> Self {
+        self.auto_tls_domains = domains;
+        self
+    }
+
+    /// Build the AcmeProvider.
+    pub fn build(self) -> Result<AcmeProvider, AcmeError> {
+        let storage = AcmeStorage::new(self.config.storage.clone())?;
+
+        Ok(AcmeProvider {
+            config: self.config,
+            storage,
+            manager: self.manager,
+            auto_tls_domains: self.auto_tls_domains,
+        })
+    }
 }
 
 impl AcmeProvider {
-    /// Create a new ACME provider.
-    pub fn new(config: AcmeConfig, manager: Arc<CertManager>) -> Result<Self, AcmeError> {
-        let storage = AcmeStorage::new(config.storage.clone())?;
-
-        Ok(Self {
+    /// Create a builder for AcmeProvider.
+    pub fn builder(config: AcmeConfig, manager: Arc<CertManager>) -> AcmeProviderBuilder {
+        AcmeProviderBuilder {
             config,
-            storage,
             manager,
-        })
+            auto_tls_domains: Vec::new(),
+        }
+    }
+
+    /// Create a new ACME provider (convenience method).
+    pub fn new(config: AcmeConfig, manager: Arc<CertManager>) -> Result<Self, AcmeError> {
+        Self::builder(config, manager).build()
+    }
+
+    /// Get all cert configs including auto-TLS domains.
+    fn all_certs(&self) -> Vec<AcmeCertConfig> {
+        self.config.all_certs_with_providers(&self.auto_tls_domains)
     }
 
     /// Initialize certificates - load existing or obtain new ones.
@@ -52,8 +89,14 @@ impl AcmeProvider {
         info!("initializing ACME certificates");
 
         let mut store = CertStore::new();
+        let all_certs = self.all_certs();
 
-        for cert_config in &self.config.certs {
+        if all_certs.is_empty() {
+            info!("no ACME certificates configured");
+            return Ok(());
+        }
+
+        for cert_config in &all_certs {
             let primary_domain = cert_config
                 .domains
                 .first()
@@ -131,8 +174,9 @@ impl AcmeProvider {
     async fn check_and_renew(&self) -> Result<(), AcmeError> {
         let mut store = CertStore::new();
         let mut any_renewed = false;
+        let all_certs = self.all_certs();
 
-        for cert_config in &self.config.certs {
+        for cert_config in &all_certs {
             let primary_domain = cert_config
                 .domains
                 .first()

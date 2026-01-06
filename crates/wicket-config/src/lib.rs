@@ -109,6 +109,75 @@ pub struct RouteConfig {
 
     /// Upstream to proxy to
     pub upstream: String,
+
+    /// Per-route TLS configuration
+    #[serde(default)]
+    pub tls: Option<RouteTlsConfig>,
+}
+
+/// Per-route TLS configuration.
+///
+/// Supports multiple formats:
+/// - `tls = "auto"` - Auto-provision via ACME using default_dns
+/// - `tls = { auto = "provider-name" }` - Use a named DNS provider
+/// - `tls = { cert = "cert-name" }` - Use a specific certificate
+/// - `tls = "off"` - Disable TLS
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RouteTlsConfig {
+    /// Simple string variants: "auto" or "off"
+    Simple(SimpleTlsMode),
+    /// Auto with provider: { auto = "provider-name" }
+    AutoWithProvider {
+        /// Name of the DNS provider from tls.acme.dns_providers
+        auto: String,
+    },
+    /// Cert reference: { cert = "cert-name" }
+    CertRef {
+        /// Name of the certificate from tls.file.certs
+        cert: String,
+    },
+}
+
+/// Simple TLS modes that can be specified as strings.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SimpleTlsMode {
+    /// Auto-provision certificate via ACME using default_dns
+    Auto,
+    /// Disable TLS for this route (use HTTP)
+    Off,
+}
+
+impl RouteTlsConfig {
+    /// Check if this is an auto TLS config (either simple or with provider).
+    pub fn is_auto(&self) -> bool {
+        matches!(
+            self,
+            RouteTlsConfig::Simple(SimpleTlsMode::Auto) | RouteTlsConfig::AutoWithProvider { .. }
+        )
+    }
+
+    /// Get the provider name if this is an auto config with a specific provider.
+    pub fn provider(&self) -> Option<&str> {
+        match self {
+            RouteTlsConfig::AutoWithProvider { auto } => Some(auto),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a certificate reference config.
+    pub fn is_cert_ref(&self) -> bool {
+        matches!(self, RouteTlsConfig::CertRef { .. })
+    }
+
+    /// Get the certificate name if this is a cert reference.
+    pub fn cert_name(&self) -> Option<&str> {
+        match self {
+            RouteTlsConfig::CertRef { cert } => Some(cert),
+            _ => None,
+        }
+    }
 }
 
 /// Matching rules for a route.
@@ -278,6 +347,8 @@ impl Config {
         // Validate TLS config if present
         if let Some(ref tls) = self.tls {
             self.validate_tls(tls)?;
+            // Validate route TLS configurations
+            self.validate_route_tls(tls)?;
         }
 
         // Validate stream config if present
@@ -320,6 +391,81 @@ impl Config {
                 }
             } else if matches!(tls.mode, TlsMode::File) {
                 anyhow::bail!("TLS mode 'file' requires [tls.file] section");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_route_tls(&self, tls: &TlsConfig) -> Result<()> {
+        // Validate route TLS configurations
+        for route in &self.routes {
+            if let Some(ref route_tls) = route.tls {
+                // Check auto TLS with named provider
+                if let Some(provider_name) = route_tls.provider() {
+                    // Provider must exist in dns_providers
+                    if let Some(ref acme) = tls.acme {
+                        if !acme.dns_providers.contains_key(provider_name) {
+                            anyhow::bail!(
+                                "Route '{}' references unknown DNS provider '{}'. \
+                                 Available providers: {:?}",
+                                route.name.as_deref().unwrap_or("<unnamed>"),
+                                provider_name,
+                                acme.dns_providers.keys().collect::<Vec<_>>()
+                            );
+                        }
+                    } else {
+                        anyhow::bail!(
+                            "Route '{}' uses tls = {{ auto = \"{}\" }} but no [tls.acme] section configured",
+                            route.name.as_deref().unwrap_or("<unnamed>"),
+                            provider_name
+                        );
+                    }
+                }
+
+                // Check simple auto TLS requires default_dns
+                if route_tls.is_auto() && route_tls.provider().is_none() {
+                    if let Some(ref acme) = tls.acme {
+                        if acme.default_dns.is_none() {
+                            anyhow::bail!(
+                                "Route '{}' uses tls = \"auto\" but no [tls.acme.default_dns] configured",
+                                route.name.as_deref().unwrap_or("<unnamed>")
+                            );
+                        }
+                    } else {
+                        anyhow::bail!(
+                            "Route '{}' uses tls = \"auto\" but no [tls.acme] section configured",
+                            route.name.as_deref().unwrap_or("<unnamed>")
+                        );
+                    }
+                }
+
+                // Check cert reference TLS
+                if let Some(cert_name) = route_tls.cert_name() {
+                    // Cert must exist in tls.file.certs
+                    if let Some(ref file_config) = tls.file {
+                        let cert_exists = file_config.certs.iter().any(|c| c.name == cert_name);
+                        if !cert_exists {
+                            anyhow::bail!(
+                                "Route '{}' references unknown certificate '{}'. \
+                                 Available certificates: {:?}",
+                                route.name.as_deref().unwrap_or("<unnamed>"),
+                                cert_name,
+                                file_config
+                                    .certs
+                                    .iter()
+                                    .map(|c| &c.name)
+                                    .collect::<Vec<_>>()
+                            );
+                        }
+                    } else {
+                        anyhow::bail!(
+                            "Route '{}' uses tls = {{ cert = \"{}\" }} but no [tls.file] section configured",
+                            route.name.as_deref().unwrap_or("<unnamed>"),
+                            cert_name
+                        );
+                    }
+                }
             }
         }
 
@@ -374,6 +520,45 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Collect domains from routes that have `tls = "auto"`.
+    ///
+    /// These domains will be auto-provisioned via ACME.
+    /// Only routes with explicit host matches are included (wildcards are supported).
+    pub fn collect_auto_tls_domains(&self) -> Vec<String> {
+        self.routes
+            .iter()
+            .filter(|r| r.tls.as_ref().is_some_and(|t| t.is_auto()))
+            .filter_map(|r| r.match_rules.host.clone())
+            .collect()
+    }
+
+    /// Collect domains with provider info from routes that have `tls = "auto"`.
+    ///
+    /// Returns AutoTlsDomain structs that include the optional provider name.
+    pub fn collect_auto_tls_domains_with_providers(&self) -> Vec<wicket_tls::AutoTlsDomain> {
+        self.routes
+            .iter()
+            .filter_map(|r| {
+                let tls = r.tls.as_ref()?;
+                if !tls.is_auto() {
+                    return None;
+                }
+                let host = r.match_rules.host.clone()?;
+                Some(wicket_tls::AutoTlsDomain {
+                    domain: host,
+                    provider: tls.provider().map(String::from),
+                })
+            })
+            .collect()
+    }
+
+    /// Check if any route requires auto TLS.
+    pub fn has_auto_tls_routes(&self) -> bool {
+        self.routes
+            .iter()
+            .any(|r| r.tls.as_ref().is_some_and(|t| t.is_auto()))
     }
 }
 
@@ -931,5 +1116,634 @@ path_prefix = "/"
             let parsed = Config::parse(&config).unwrap();
             assert_eq!(parsed.stream.unwrap().proxy_protocol, expected);
         }
+    }
+
+    #[test]
+    fn test_route_tls_auto() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.app1]
+backends = ["127.0.0.1:3001"]
+
+[upstreams.app2]
+backends = ["127.0.0.1:3002"]
+
+[[routes]]
+name = "app1"
+upstream = "app1"
+tls = "auto"
+[routes.match]
+host = "app1.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app2"
+upstream = "app2"
+tls = "auto"
+[routes.match]
+host = "app2.example.com"
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        assert_eq!(config.routes.len(), 2);
+        assert_eq!(
+            config.routes[0].tls,
+            Some(RouteTlsConfig::Simple(SimpleTlsMode::Auto))
+        );
+        assert_eq!(
+            config.routes[1].tls,
+            Some(RouteTlsConfig::Simple(SimpleTlsMode::Auto))
+        );
+
+        let domains = config.collect_auto_tls_domains();
+        assert_eq!(domains.len(), 2);
+        assert!(domains.contains(&"app1.example.com".to_string()));
+        assert!(domains.contains(&"app2.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_route_tls_cert_reference() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "api"
+upstream = "backend"
+tls = { cert = "my-cert" }
+[routes.match]
+host = "api.example.com"
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        assert_eq!(
+            config.routes[0].tls,
+            Some(RouteTlsConfig::CertRef {
+                cert: "my-cert".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_route_tls_off() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "health"
+upstream = "backend"
+tls = "off"
+[routes.match]
+path_prefix = "/health"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        assert_eq!(
+            config.routes[0].tls,
+            Some(RouteTlsConfig::Simple(SimpleTlsMode::Off))
+        );
+    }
+
+    #[test]
+    fn test_collect_auto_tls_domains_mixed() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "app1"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app1.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app2"
+upstream = "backend"
+tls = "off"
+[routes.match]
+host = "app2.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app3"
+upstream = "backend"
+[routes.match]
+host = "app3.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app4"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app4.example.com"
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        let domains = config.collect_auto_tls_domains();
+
+        // Only app1 and app4 have tls = "auto"
+        assert_eq!(domains.len(), 2);
+        assert!(domains.contains(&"app1.example.com".to_string()));
+        assert!(domains.contains(&"app4.example.com".to_string()));
+        assert!(!domains.contains(&"app2.example.com".to_string()));
+        assert!(!domains.contains(&"app3.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_has_auto_tls_routes() {
+        let config_with_auto = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "example.com"
+path_prefix = "/"
+"#;
+
+        let config_without_auto = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        assert!(Config::parse(config_with_auto)
+            .unwrap()
+            .has_auto_tls_routes());
+        assert!(!Config::parse(config_without_auto)
+            .unwrap()
+            .has_auto_tls_routes());
+    }
+
+    #[test]
+    fn test_route_tls_auto_with_provider() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "app1"
+upstream = "backend"
+tls = { auto = "acme-corp" }
+[routes.match]
+host = "app1.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app2"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app2.example.com"
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+
+        // First route uses named provider
+        assert_eq!(
+            config.routes[0].tls,
+            Some(RouteTlsConfig::AutoWithProvider {
+                auto: "acme-corp".to_string()
+            })
+        );
+        assert!(config.routes[0].tls.as_ref().unwrap().is_auto());
+        assert_eq!(
+            config.routes[0].tls.as_ref().unwrap().provider(),
+            Some("acme-corp")
+        );
+
+        // Second route uses default provider
+        assert_eq!(
+            config.routes[1].tls,
+            Some(RouteTlsConfig::Simple(SimpleTlsMode::Auto))
+        );
+        assert!(config.routes[1].tls.as_ref().unwrap().is_auto());
+        assert_eq!(config.routes[1].tls.as_ref().unwrap().provider(), None);
+    }
+
+    #[test]
+    fn test_collect_auto_tls_domains_with_providers() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "app1"
+upstream = "backend"
+tls = { auto = "acme-corp" }
+[routes.match]
+host = "app1.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app2"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app2.example.com"
+path_prefix = "/"
+
+[[routes]]
+name = "app3"
+upstream = "backend"
+tls = { auto = "other-account" }
+[routes.match]
+host = "app3.example.com"
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        let domains = config.collect_auto_tls_domains_with_providers();
+
+        assert_eq!(domains.len(), 3);
+
+        // Check domain names and providers
+        let app1 = domains
+            .iter()
+            .find(|d| d.domain == "app1.example.com")
+            .unwrap();
+        assert_eq!(app1.provider.as_deref(), Some("acme-corp"));
+
+        let app2 = domains
+            .iter()
+            .find(|d| d.domain == "app2.example.com")
+            .unwrap();
+        assert_eq!(app2.provider, None);
+
+        let app3 = domains
+            .iter()
+            .find(|d| d.domain == "app3.example.com")
+            .unwrap();
+        assert_eq!(app3.provider.as_deref(), Some("other-account"));
+    }
+
+    #[test]
+    fn test_route_tls_helper_methods() {
+        // Test is_auto() and provider() for all variants
+        let auto = RouteTlsConfig::Simple(SimpleTlsMode::Auto);
+        assert!(auto.is_auto());
+        assert_eq!(auto.provider(), None);
+
+        let auto_with_provider = RouteTlsConfig::AutoWithProvider {
+            auto: "my-provider".to_string(),
+        };
+        assert!(auto_with_provider.is_auto());
+        assert_eq!(auto_with_provider.provider(), Some("my-provider"));
+
+        let cert_ref = RouteTlsConfig::CertRef {
+            cert: "my-cert".to_string(),
+        };
+        assert!(!cert_ref.is_auto());
+        assert_eq!(cert_ref.provider(), None);
+
+        let off = RouteTlsConfig::Simple(SimpleTlsMode::Off);
+        assert!(!off.is_auto());
+        assert_eq!(off.provider(), None);
+
+        // Test is_cert_ref() and cert_name() for all variants
+        let cert_ref = RouteTlsConfig::CertRef {
+            cert: "my-cert".to_string(),
+        };
+        assert!(cert_ref.is_cert_ref());
+        assert_eq!(cert_ref.cert_name(), Some("my-cert"));
+        assert!(!cert_ref.is_auto());
+        assert_eq!(cert_ref.provider(), None);
+
+        // Verify other variants return false/None for cert methods
+        let auto = RouteTlsConfig::Simple(SimpleTlsMode::Auto);
+        assert!(!auto.is_cert_ref());
+        assert_eq!(auto.cert_name(), None);
+
+        let off = RouteTlsConfig::Simple(SimpleTlsMode::Off);
+        assert!(!off.is_cert_ref());
+        assert_eq!(off.cert_name(), None);
+
+        let auto_with_provider = RouteTlsConfig::AutoWithProvider {
+            auto: "my-provider".to_string(),
+        };
+        assert!(!auto_with_provider.is_cert_ref());
+        assert_eq!(auto_with_provider.cert_name(), None);
+    }
+
+    #[test]
+    fn test_validate_auto_tls_unknown_provider() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[tls]
+mode = "acme"
+
+[tls.acme]
+email = "admin@example.com"
+
+[[tls.acme.certs]]
+domains = ["example.com"]
+
+[tls.acme.certs.dns]
+provider = "cloudflare"
+api_token = "token"
+
+[tls.acme.dns_providers.valid-provider]
+provider = "cloudflare"
+api_token = "token"
+
+[[routes]]
+name = "app"
+upstream = "backend"
+tls = { auto = "nonexistent-provider" }
+[routes.match]
+host = "app.example.com"
+path_prefix = "/"
+"#;
+
+        let err = Config::parse(config).unwrap_err();
+        assert!(err.to_string().contains("unknown DNS provider"));
+        assert!(err.to_string().contains("nonexistent-provider"));
+    }
+
+    #[test]
+    fn test_validate_auto_tls_no_default_dns() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[tls]
+mode = "acme"
+
+[tls.acme]
+email = "admin@example.com"
+
+[[tls.acme.certs]]
+domains = ["example.com"]
+
+[tls.acme.certs.dns]
+provider = "cloudflare"
+api_token = "token"
+
+[[routes]]
+name = "app"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app.example.com"
+path_prefix = "/"
+"#;
+
+        let err = Config::parse(config).unwrap_err();
+        assert!(err.to_string().contains("default_dns"));
+    }
+
+    #[test]
+    fn test_validate_auto_tls_no_acme_section() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[tls]
+mode = "file"
+
+[tls.file]
+watch = true
+
+[[tls.file.certs]]
+name = "default"
+cert = "/certs/tls.crt"
+key = "/certs/tls.key"
+domains = ["example.com"]
+
+[[routes]]
+name = "app"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app.example.com"
+path_prefix = "/"
+"#;
+
+        let err = Config::parse(config).unwrap_err();
+        assert!(err.to_string().contains("no [tls.acme] section"));
+    }
+
+    #[test]
+    fn test_validate_auto_tls_valid_provider() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[tls]
+mode = "acme"
+
+[tls.acme]
+email = "admin@example.com"
+
+[[tls.acme.certs]]
+domains = ["example.com"]
+
+[tls.acme.certs.dns]
+provider = "cloudflare"
+api_token = "token"
+
+[tls.acme.dns_providers.my-provider]
+provider = "cloudflare"
+api_token = "token"
+
+[[routes]]
+name = "app"
+upstream = "backend"
+tls = { auto = "my-provider" }
+[routes.match]
+host = "app.example.com"
+path_prefix = "/"
+"#;
+
+        // Should parse successfully
+        Config::parse(config).unwrap();
+    }
+
+    #[test]
+    fn test_validate_auto_tls_with_default_dns() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[tls]
+mode = "acme"
+
+[tls.acme]
+email = "admin@example.com"
+
+[[tls.acme.certs]]
+domains = ["example.com"]
+
+[tls.acme.certs.dns]
+provider = "cloudflare"
+api_token = "token"
+
+[tls.acme.default_dns]
+provider = "cloudflare"
+api_token = "token"
+
+[[routes]]
+name = "app"
+upstream = "backend"
+tls = "auto"
+[routes.match]
+host = "app.example.com"
+path_prefix = "/"
+"#;
+
+        // Should parse successfully
+        Config::parse(config).unwrap();
+    }
+
+    #[test]
+    fn test_validate_cert_ref_unknown_cert() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[tls]
+mode = "file"
+
+[[tls.file.certs]]
+name = "valid-cert"
+cert = "/path/to/cert.pem"
+key = "/path/to/key.pem"
+domains = ["example.com"]
+
+[[routes]]
+name = "app"
+upstream = "backend"
+tls = { cert = "nonexistent-cert" }
+[routes.match]
+host = "app.example.com"
+path_prefix = "/"
+"#;
+
+        let err = Config::parse(config).unwrap_err();
+        assert!(err.to_string().contains("unknown certificate"));
+        assert!(err.to_string().contains("nonexistent-cert"));
+    }
+
+    #[test]
+    fn test_validate_cert_ref_no_file_section() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[tls]
+mode = "acme"
+
+[tls.acme]
+email = "admin@example.com"
+
+[[tls.acme.certs]]
+domains = ["example.com"]
+
+[tls.acme.certs.dns]
+provider = "cloudflare"
+api_token = "token"
+
+[[routes]]
+name = "app"
+upstream = "backend"
+tls = { cert = "some-cert" }
+[routes.match]
+host = "app.example.com"
+path_prefix = "/"
+"#;
+
+        let err = Config::parse(config).unwrap_err();
+        assert!(err.to_string().contains("no [tls.file] section"));
+    }
+
+    #[test]
+    fn test_validate_cert_ref_valid() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[tls]
+mode = "file"
+
+[[tls.file.certs]]
+name = "my-cert"
+cert = "/path/to/cert.pem"
+key = "/path/to/key.pem"
+domains = ["example.com"]
+
+[[routes]]
+name = "app"
+upstream = "backend"
+tls = { cert = "my-cert" }
+[routes.match]
+host = "app.example.com"
+path_prefix = "/"
+"#;
+
+        // Should parse successfully
+        Config::parse(config).unwrap();
     }
 }

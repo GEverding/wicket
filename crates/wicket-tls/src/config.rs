@@ -6,7 +6,9 @@
 //! - `mixed`: Both ACME and file-based certificates
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use tracing::warn;
 
 /// Top-level TLS configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -51,6 +53,86 @@ pub struct AcmeConfig {
     /// Certificate configurations
     #[serde(default)]
     pub certs: Vec<AcmeCertConfig>,
+    /// Default DNS provider for per-route auto TLS (routes with `tls = "auto"`)
+    #[serde(default)]
+    pub default_dns: Option<DnsProviderConfig>,
+    /// Named DNS providers for multi-account support
+    /// Routes can reference these by name: `tls = { auto = "provider-name" }`
+    #[serde(default)]
+    pub dns_providers: HashMap<String, DnsProviderConfig>,
+}
+
+/// Domain with optional provider override for auto-TLS.
+#[derive(Debug, Clone)]
+pub struct AutoTlsDomain {
+    /// The domain name
+    pub domain: String,
+    /// Optional DNS provider name (uses default_dns if None)
+    pub provider: Option<String>,
+}
+
+impl AcmeConfig {
+    /// Get all certificate configs, including auto-generated ones from route domains.
+    ///
+    /// Domains can optionally specify a provider name to use instead of default_dns.
+    /// Provider names are resolved from the `dns_providers` map.
+    pub fn all_certs_with_providers(
+        &self,
+        auto_tls_domains: &[AutoTlsDomain],
+    ) -> Vec<AcmeCertConfig> {
+        let mut all_certs = self.certs.clone();
+
+        // Build set of domains already covered by explicit certs - O(m)
+        let covered: HashSet<&str> = self
+            .certs
+            .iter()
+            .flat_map(|c| c.domains.iter().map(|d| d.as_str()))
+            .collect();
+
+        for auto_domain in auto_tls_domains {
+            // O(1) lookup instead of O(m)
+            if covered.contains(auto_domain.domain.as_str()) {
+                continue;
+            }
+
+            // Resolve DNS provider: named provider > default_dns
+            let dns = if let Some(ref provider_name) = auto_domain.provider {
+                self.dns_providers.get(provider_name).cloned()
+            } else {
+                self.default_dns.clone()
+            };
+
+            if let Some(dns) = dns {
+                all_certs.push(AcmeCertConfig {
+                    domains: vec![auto_domain.domain.clone()],
+                    dns,
+                });
+            } else {
+                warn!(
+                    domain = %auto_domain.domain,
+                    provider = ?auto_domain.provider,
+                    "Skipping domain: no DNS provider configured (validation should have caught this)"
+                );
+            }
+        }
+
+        all_certs
+    }
+
+    /// Get all certificate configs (simple version for backwards compatibility).
+    ///
+    /// If `auto_tls_domains` is provided and `default_dns` is configured,
+    /// generates additional cert configs for each domain.
+    pub fn all_certs(&self, auto_tls_domains: &[String]) -> Vec<AcmeCertConfig> {
+        let domains: Vec<AutoTlsDomain> = auto_tls_domains
+            .iter()
+            .map(|d| AutoTlsDomain {
+                domain: d.clone(),
+                provider: None,
+            })
+            .collect();
+        self.all_certs_with_providers(&domains)
+    }
 }
 
 /// Individual ACME certificate configuration.
@@ -235,13 +317,13 @@ mod tests {
     fn test_dns_provider_optional_zone_id() {
         let toml = r#"
             mode = "acme"
-            
+
             [acme]
             email = "admin@example.com"
-            
+
             [[acme.certs]]
             domains = ["example.com"]
-            
+
             [acme.certs.dns]
             provider = "cloudflare"
             api_token = "token123"
@@ -251,5 +333,163 @@ mod tests {
         let config: TlsConfig = toml::from_str(toml).unwrap();
         let dns = &config.acme.unwrap().certs[0].dns;
         assert_eq!(dns.zone_id, Some("zone123".to_string()));
+    }
+
+    #[test]
+    fn test_parse_dns_providers_map() {
+        let toml = r#"
+            mode = "acme"
+
+            [acme]
+            email = "admin@example.com"
+
+            [acme.default_dns]
+            provider = "cloudflare"
+            api_token = "default-token"
+
+            [acme.dns_providers.acme-corp]
+            provider = "cloudflare"
+            api_token = "acme-corp-token"
+            zone_id = "zone-acme"
+
+            [acme.dns_providers.other-account]
+            provider = "cloudflare"
+            api_token = "other-token"
+        "#;
+
+        let config: TlsConfig = toml::from_str(toml).unwrap();
+        let acme = config.acme.unwrap();
+
+        assert!(acme.default_dns.is_some());
+        assert_eq!(
+            acme.default_dns.as_ref().unwrap().api_token,
+            "default-token"
+        );
+
+        assert_eq!(acme.dns_providers.len(), 2);
+
+        let acme_corp = acme.dns_providers.get("acme-corp").unwrap();
+        assert_eq!(acme_corp.api_token, "acme-corp-token");
+        assert_eq!(acme_corp.zone_id, Some("zone-acme".to_string()));
+
+        let other = acme.dns_providers.get("other-account").unwrap();
+        assert_eq!(other.api_token, "other-token");
+        assert_eq!(other.zone_id, None);
+    }
+
+    #[test]
+    fn test_all_certs_with_providers() {
+        let acme_config = AcmeConfig {
+            email: "admin@example.com".to_string(),
+            staging: false,
+            storage: PathBuf::from("/tmp/acme"),
+            renew_before_days: 30,
+            certs: vec![AcmeCertConfig {
+                domains: vec!["explicit.example.com".to_string()],
+                dns: DnsProviderConfig {
+                    provider: "cloudflare".to_string(),
+                    api_token: "explicit-token".to_string(),
+                    zone_id: None,
+                },
+            }],
+            default_dns: Some(DnsProviderConfig {
+                provider: "cloudflare".to_string(),
+                api_token: "default-token".to_string(),
+                zone_id: None,
+            }),
+            dns_providers: [
+                (
+                    "acme-corp".to_string(),
+                    DnsProviderConfig {
+                        provider: "cloudflare".to_string(),
+                        api_token: "acme-corp-token".to_string(),
+                        zone_id: Some("zone-acme".to_string()),
+                    },
+                ),
+                (
+                    "other-account".to_string(),
+                    DnsProviderConfig {
+                        provider: "cloudflare".to_string(),
+                        api_token: "other-token".to_string(),
+                        zone_id: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let auto_domains = vec![
+            AutoTlsDomain {
+                domain: "app1.example.com".to_string(),
+                provider: Some("acme-corp".to_string()),
+            },
+            AutoTlsDomain {
+                domain: "app2.example.com".to_string(),
+                provider: None, // uses default_dns
+            },
+            AutoTlsDomain {
+                domain: "app3.example.com".to_string(),
+                provider: Some("other-account".to_string()),
+            },
+            AutoTlsDomain {
+                domain: "explicit.example.com".to_string(), // already in certs, should be skipped
+                provider: None,
+            },
+        ];
+
+        let all_certs = acme_config.all_certs_with_providers(&auto_domains);
+
+        // 1 explicit + 3 auto (1 skipped because already covered)
+        assert_eq!(all_certs.len(), 4);
+
+        // Explicit cert is first
+        assert_eq!(all_certs[0].domains, vec!["explicit.example.com"]);
+        assert_eq!(all_certs[0].dns.api_token, "explicit-token");
+
+        // app1 uses acme-corp provider
+        let app1 = all_certs
+            .iter()
+            .find(|c| c.domains[0] == "app1.example.com")
+            .unwrap();
+        assert_eq!(app1.dns.api_token, "acme-corp-token");
+        assert_eq!(app1.dns.zone_id, Some("zone-acme".to_string()));
+
+        // app2 uses default_dns
+        let app2 = all_certs
+            .iter()
+            .find(|c| c.domains[0] == "app2.example.com")
+            .unwrap();
+        assert_eq!(app2.dns.api_token, "default-token");
+
+        // app3 uses other-account provider
+        let app3 = all_certs
+            .iter()
+            .find(|c| c.domains[0] == "app3.example.com")
+            .unwrap();
+        assert_eq!(app3.dns.api_token, "other-token");
+    }
+
+    #[test]
+    fn test_all_certs_unknown_provider_skipped() {
+        let acme_config = AcmeConfig {
+            email: "admin@example.com".to_string(),
+            staging: false,
+            storage: PathBuf::from("/tmp/acme"),
+            renew_before_days: 30,
+            certs: vec![],
+            default_dns: None,
+            dns_providers: Default::default(),
+        };
+
+        let auto_domains = vec![AutoTlsDomain {
+            domain: "app.example.com".to_string(),
+            provider: Some("nonexistent".to_string()),
+        }];
+
+        let all_certs = acme_config.all_certs_with_providers(&auto_domains);
+
+        // Domain with unknown provider and no default_dns is skipped
+        assert_eq!(all_certs.len(), 0);
     }
 }
