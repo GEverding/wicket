@@ -173,6 +173,113 @@ lazy_static! {
         Opts::new("wicket_k8s_api_errors_total", "Total Kubernetes API errors"),
         &["operation", "resource", "error_type"]
     ).expect("metric can be created");
+
+    // ============================================================
+    // TLS Secret Metrics (RED pattern)
+    // ============================================================
+
+    /// TLS secret extraction attempts (Rate).
+    pub static ref TLS_SECRET_EXTRACTIONS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("wicket_tls_secret_extractions_total", "Total TLS secret extraction attempts"),
+        &["namespace", "result"]
+    ).expect("metric can be created");
+
+    /// TLS secret extraction duration (Duration).
+    pub static ref TLS_SECRET_EXTRACTION_DURATION_SECONDS: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "wicket_tls_secret_extraction_duration_seconds",
+            "Time to extract TLS secrets from Kubernetes"
+        ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
+        &["namespace"]
+    ).expect("metric can be created");
+
+    /// ReferenceGrant validation attempts.
+    pub static ref REFERENCE_GRANT_VALIDATIONS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("wicket_reference_grant_validations_total", "Total ReferenceGrant validation attempts"),
+        &["from_namespace", "to_namespace", "result"]
+    ).expect("metric can be created");
+
+    /// Cross-namespace references blocked (Errors - security metric).
+    pub static ref CROSS_NAMESPACE_BLOCKED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("wicket_cross_namespace_blocked_total", "Cross-namespace references blocked by missing ReferenceGrant"),
+        &["from_namespace", "to_namespace", "resource_type"]
+    ).expect("metric can be created");
+
+    // ============================================================
+    // Gateway Status Metrics
+    // ============================================================
+
+    /// Gateway programmed status (1 = programmed, 0 = not programmed).
+    pub static ref GATEWAY_PROGRAMMED: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_gateway_programmed", "Whether gateway is programmed and ready"),
+        &["namespace", "name"]
+    ).expect("metric can be created");
+
+    /// Gateway listener status.
+    pub static ref GATEWAY_LISTENER_ATTACHED_ROUTES: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_gateway_listener_attached_routes", "Number of routes attached to listener"),
+        &["namespace", "gateway", "listener"]
+    ).expect("metric can be created");
+
+    // ============================================================
+    // Route Status Metrics
+    // ============================================================
+
+    /// Routes accepted by parent gateway.
+    pub static ref ROUTES_ACCEPTED: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_routes_accepted", "Routes accepted by parent gateway"),
+        &["namespace", "route_type", "gateway"]
+    ).expect("metric can be created");
+
+    /// Routes rejected (validation failures, no matching gateway, etc).
+    pub static ref ROUTES_REJECTED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("wicket_routes_rejected_total", "Routes rejected"),
+        &["namespace", "route_type", "reason"]
+    ).expect("metric can be created");
+
+    // ============================================================
+    // Config Sync Metrics (critical for controller health)
+    // ============================================================
+
+    /// Config sync lag - time since last successful sync.
+    pub static ref CONFIG_SYNC_LAG_SECONDS: IntGauge = IntGauge::new(
+        "wicket_config_sync_lag_seconds",
+        "Seconds since last successful config synchronization"
+    ).expect("metric can be created");
+
+    /// Config hash for detecting drift.
+    pub static ref CONFIG_HASH: IntGauge = IntGauge::new(
+        "wicket_config_hash",
+        "Hash of current configuration for drift detection"
+    ).expect("metric can be created");
+
+    /// Number of resources pending reconciliation.
+    pub static ref RESOURCES_PENDING_SYNC: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_resources_pending_sync", "Resources waiting to be synchronized"),
+        &["resource_type"]
+    ).expect("metric can be created");
+
+    // ============================================================
+    // Watch/Informer Metrics
+    // ============================================================
+
+    /// Watch connection status per resource type.
+    pub static ref WATCH_CONNECTIONS_ACTIVE: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_watch_connections_active", "Active watch connections"),
+        &["resource_type"]
+    ).expect("metric can be created");
+
+    /// Watch errors requiring reconnection.
+    pub static ref WATCH_ERRORS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("wicket_watch_errors_total", "Watch connection errors"),
+        &["resource_type", "error_type"]
+    ).expect("metric can be created");
+
+    /// Events received from watches.
+    pub static ref WATCH_EVENTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("wicket_watch_events_total", "Events received from Kubernetes watches"),
+        &["resource_type", "event_type"]
+    ).expect("metric can be created");
 }
 
 /// Register all metrics with the global registry.
@@ -199,6 +306,31 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     REGISTRY.register(Box::new(CONTROLLER_UPTIME_SECONDS.clone()))?;
     REGISTRY.register(Box::new(K8S_API_LATENCY_SECONDS.clone()))?;
     REGISTRY.register(Box::new(K8S_API_ERRORS_TOTAL.clone()))?;
+
+    // TLS Secret metrics
+    REGISTRY.register(Box::new(TLS_SECRET_EXTRACTIONS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(TLS_SECRET_EXTRACTION_DURATION_SECONDS.clone()))?;
+    REGISTRY.register(Box::new(REFERENCE_GRANT_VALIDATIONS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(CROSS_NAMESPACE_BLOCKED_TOTAL.clone()))?;
+
+    // Gateway status metrics
+    REGISTRY.register(Box::new(GATEWAY_PROGRAMMED.clone()))?;
+    REGISTRY.register(Box::new(GATEWAY_LISTENER_ATTACHED_ROUTES.clone()))?;
+
+    // Route status metrics
+    REGISTRY.register(Box::new(ROUTES_ACCEPTED.clone()))?;
+    REGISTRY.register(Box::new(ROUTES_REJECTED_TOTAL.clone()))?;
+
+    // Config sync metrics
+    REGISTRY.register(Box::new(CONFIG_SYNC_LAG_SECONDS.clone()))?;
+    REGISTRY.register(Box::new(CONFIG_HASH.clone()))?;
+    REGISTRY.register(Box::new(RESOURCES_PENDING_SYNC.clone()))?;
+
+    // Watch metrics
+    REGISTRY.register(Box::new(WATCH_CONNECTIONS_ACTIVE.clone()))?;
+    REGISTRY.register(Box::new(WATCH_ERRORS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(WATCH_EVENTS_TOTAL.clone()))?;
+
     Ok(())
 }
 
