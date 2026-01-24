@@ -15,7 +15,8 @@ use wicket_controller::{
     metrics::{register_metrics, serve_metrics, CONTROLLER_IS_LEADER, CONTROLLER_UPTIME_SECONDS},
     reconcilers::{
         run_endpoints_controller, run_gateway_class_controller, run_gateway_controller,
-        run_httproute_controller, run_secret_controller, Context,
+        run_httproute_controller, run_secret_controller, run_tcproute_controller,
+        run_tlsroute_controller, Context,
     },
 };
 
@@ -115,7 +116,9 @@ async fn main() -> anyhow::Result<()> {
 
     let gc_ctx = ctx.clone();
     let gw_ctx = ctx.clone();
-    let route_ctx = ctx.clone();
+    let http_route_ctx = ctx.clone();
+    let tcp_route_ctx = ctx.clone();
+    let tls_route_ctx = ctx.clone();
     let endpoints_ctx = ctx.clone();
     let secret_ctx = ctx.clone();
 
@@ -130,9 +133,19 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!(error = %e, "Gateway controller failed");
             }
         }
-        result = run_httproute_controller(route_ctx) => {
+        result = run_httproute_controller(http_route_ctx) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "HTTPRoute controller failed");
+            }
+        }
+        result = run_tcproute_controller(tcp_route_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "TCPRoute controller failed");
+            }
+        }
+        result = run_tlsroute_controller(tls_route_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "TLSRoute controller failed");
             }
         }
         result = run_endpoints_controller(endpoints_ctx) => {
