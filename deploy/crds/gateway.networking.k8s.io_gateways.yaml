@@ -1,0 +1,346 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gateways.gateway.networking.k8s.io
+  annotations:
+    api-approved.kubernetes.io: "https://github.com/kubernetes-sigs/gateway-api/pull/891"
+spec:
+  group: gateway.networking.k8s.io
+  names:
+    kind: Gateway
+    listKind: GatewayList
+    plural: gateways
+    singular: gateway
+    shortNames:
+      - gtw
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Class
+          type: string
+          jsonPath: .spec.gatewayClassName
+        - name: Address
+          type: string
+          jsonPath: .status.addresses[*].value
+        - name: Programmed
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Programmed")].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - gatewayClassName
+                - listeners
+              properties:
+                gatewayClassName:
+                  type: string
+                  maxLength: 253
+                  minLength: 1
+                addresses:
+                  type: array
+                  maxItems: 16
+                  items:
+                    type: object
+                    required:
+                      - value
+                    properties:
+                      type:
+                        type: string
+                        default: IPAddress
+                        enum:
+                          - IPAddress
+                          - Hostname
+                          - NamedAddress
+                      value:
+                        type: string
+                        maxLength: 253
+                        minLength: 1
+                listeners:
+                  type: array
+                  maxItems: 64
+                  minItems: 1
+                  items:
+                    type: object
+                    required:
+                      - name
+                      - port
+                      - protocol
+                    properties:
+                      name:
+                        type: string
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      hostname:
+                        type: string
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^(\*\.)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      port:
+                        type: integer
+                        format: int32
+                        minimum: 1
+                        maximum: 65535
+                      protocol:
+                        type: string
+                        enum:
+                          - HTTP
+                          - HTTPS
+                          - TLS
+                          - TCP
+                          - UDP
+                      tls:
+                        type: object
+                        properties:
+                          mode:
+                            type: string
+                            default: Terminate
+                            enum:
+                              - Terminate
+                              - Passthrough
+                          certificateRefs:
+                            type: array
+                            maxItems: 64
+                            items:
+                              type: object
+                              required:
+                                - name
+                              properties:
+                                group:
+                                  type: string
+                                  default: ""
+                                  maxLength: 253
+                                  pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                kind:
+                                  type: string
+                                  default: Secret
+                                  maxLength: 63
+                                  minLength: 1
+                                  pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                                name:
+                                  type: string
+                                  maxLength: 253
+                                  minLength: 1
+                                namespace:
+                                  type: string
+                                  maxLength: 63
+                                  minLength: 1
+                                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          options:
+                            type: object
+                            additionalProperties:
+                              type: string
+                      allowedRoutes:
+                        type: object
+                        properties:
+                          namespaces:
+                            type: object
+                            properties:
+                              from:
+                                type: string
+                                default: Same
+                                enum:
+                                  - All
+                                  - Same
+                                  - Selector
+                              selector:
+                                type: object
+                                properties:
+                                  matchLabels:
+                                    type: object
+                                    additionalProperties:
+                                      type: string
+                                  matchExpressions:
+                                    type: array
+                                    items:
+                                      type: object
+                                      required:
+                                        - key
+                                        - operator
+                                      properties:
+                                        key:
+                                          type: string
+                                        operator:
+                                          type: string
+                                        values:
+                                          type: array
+                                          items:
+                                            type: string
+                          kinds:
+                            type: array
+                            maxItems: 8
+                            items:
+                              type: object
+                              required:
+                                - kind
+                              properties:
+                                group:
+                                  type: string
+                                  default: gateway.networking.k8s.io
+                                  maxLength: 253
+                                  pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                kind:
+                                  type: string
+                                  maxLength: 63
+                                  minLength: 1
+                                  pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                infrastructure:
+                  type: object
+                  properties:
+                    labels:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    annotations:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    parametersRef:
+                      type: object
+                      required:
+                        - group
+                        - kind
+                        - name
+                      properties:
+                        group:
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+            status:
+              type: object
+              default: {}
+              properties:
+                addresses:
+                  type: array
+                  maxItems: 16
+                  items:
+                    type: object
+                    required:
+                      - value
+                    properties:
+                      type:
+                        type: string
+                        default: IPAddress
+                      value:
+                        type: string
+                conditions:
+                  type: array
+                  maxItems: 8
+                  default:
+                    - type: Accepted
+                      status: Unknown
+                      reason: Pending
+                      message: Waiting for controller
+                      lastTransitionTime: "1970-01-01T00:00:00Z"
+                    - type: Programmed
+                      status: Unknown
+                      reason: Pending
+                      message: Waiting for controller
+                      lastTransitionTime: "1970-01-01T00:00:00Z"
+                  items:
+                    type: object
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    properties:
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      message:
+                        type: string
+                        maxLength: 32768
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                        minimum: 0
+                      reason:
+                        type: string
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      status:
+                        type: string
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                      type:
+                        type: string
+                        maxLength: 316
+                listeners:
+                  type: array
+                  maxItems: 64
+                  items:
+                    type: object
+                    required:
+                      - attachedRoutes
+                      - conditions
+                      - name
+                      - supportedKinds
+                    properties:
+                      name:
+                        type: string
+                      supportedKinds:
+                        type: array
+                        items:
+                          type: object
+                          required:
+                            - kind
+                          properties:
+                            group:
+                              type: string
+                            kind:
+                              type: string
+                      attachedRoutes:
+                        type: integer
+                        format: int32
+                      conditions:
+                        type: array
+                        items:
+                          type: object
+                          required:
+                            - lastTransitionTime
+                            - message
+                            - reason
+                            - status
+                            - type
+                          properties:
+                            lastTransitionTime:
+                              type: string
+                              format: date-time
+                            message:
+                              type: string
+                            observedGeneration:
+                              type: integer
+                              format: int64
+                            reason:
+                              type: string
+                            status:
+                              type: string
+                            type:
+                              type: string

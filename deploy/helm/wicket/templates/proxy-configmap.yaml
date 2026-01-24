@@ -1,0 +1,26 @@
+{{- if .Values.proxy.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "wicket.proxy.name" . }}-config
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.proxy.labels" . | nindent 4 }}
+data:
+  wicket.toml: |
+    # Wicket Proxy Configuration
+    # This is a placeholder config - the controller will generate the actual config
+    # based on Gateway API resources
+
+    [server]
+    listen = "{{ .Values.proxy.config.listen }}"
+    {{- if .Values.proxy.config.workers }}
+    workers = {{ .Values.proxy.config.workers }}
+    {{- end }}
+    json_logs = {{ .Values.proxy.config.jsonLogs }}
+    log_level = "{{ .Values.proxy.config.logLevel }}"
+    shutdown_timeout = {{ .Values.proxy.config.shutdownTimeout }}
+
+    # Upstreams and routes will be populated by the controller
+    # when Gateway API resources are created
+{{- end }}

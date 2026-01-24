@@ -1,0 +1,18 @@
+{{- if and .Values.controller.enabled .Values.controller.metrics.enabled .Values.controller.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "wicket.controller.name" . }}
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.controller.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "wicket.controller.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.controller.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.controller.metrics.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+{{- end }}

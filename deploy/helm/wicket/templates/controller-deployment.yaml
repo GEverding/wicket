@@ -1,0 +1,103 @@
+{{- if .Values.controller.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "wicket.controller.name" . }}
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.controller.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controller.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "wicket.controller.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "wicket.controller.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.controller.metrics.port }}"
+        prometheus.io/path: "/metrics"
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "wicket.controller.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.controller.securityContext | nindent 8 }}
+      containers:
+        - name: controller
+          image: {{ include "wicket.controller.image" . }}
+          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          args:
+            - --metrics-addr=0.0.0.0:{{ .Values.controller.metrics.port }}
+            - --namespace=$(POD_NAMESPACE)
+            - --log-level={{ .Values.controller.args.logLevel }}
+            {{- if .Values.controller.args.jsonLogs }}
+            - --json-logs
+            {{- end }}
+            {{- if .Values.controller.args.watchAllNamespaces }}
+            - --watch-all-namespaces=true
+            {{- else }}
+            - --watch-all-namespaces=false
+            {{- end }}
+            {{- if .Values.controller.args.leaderElection }}
+            - --leader-election=true
+            {{- else }}
+            - --leader-election=false
+            {{- end }}
+            - --config-output=/etc/wicket/wicket.toml
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.controller.metrics.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.controller.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/wicket
+      volumes:
+        - name: config
+          emptyDir: {}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

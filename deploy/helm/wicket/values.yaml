@@ -1,0 +1,208 @@
+# Default values for Wicket Gateway API Controller and Proxy
+
+# Global settings
+global:
+  # Image pull secrets for private registries
+  imagePullSecrets: []
+
+# Controller settings
+controller:
+  enabled: true
+
+  image:
+    repository: ghcr.io/geverding/wicket-controller
+    pullPolicy: IfNotPresent
+    tag: ""  # Defaults to Chart appVersion
+
+  replicaCount: 2
+
+  # Resource limits and requests
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # Controller arguments
+  args:
+    logLevel: info
+    jsonLogs: true
+    watchAllNamespaces: true
+    leaderElection: true
+
+  # Metrics configuration
+  metrics:
+    enabled: true
+    port: 8081
+    serviceMonitor:
+      enabled: false
+      interval: 30s
+      scrapeTimeout: 10s
+
+  # Pod disruption budget
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  # Node selector
+  nodeSelector: {}
+
+  # Tolerations
+  tolerations: []
+
+  # Affinity
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/name
+                  operator: In
+                  values:
+                    - wicket-controller
+            topologyKey: kubernetes.io/hostname
+
+  # Security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    fsGroup: 65532
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+  # Service account
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+
+# Proxy settings (data plane)
+proxy:
+  enabled: true
+
+  image:
+    repository: ghcr.io/geverding/wicket
+    pullPolicy: IfNotPresent
+    tag: ""  # Defaults to Chart appVersion
+
+  replicaCount: 2
+
+  # Resource limits and requests
+  resources:
+    limits:
+      cpu: 2
+      memory: 1Gi
+    requests:
+      cpu: 500m
+      memory: 256Mi
+
+  # Proxy configuration
+  config:
+    # Server settings
+    listen: "0.0.0.0:8080"
+    workers: 0  # 0 = auto-detect CPU count
+    jsonLogs: true
+    logLevel: info
+    shutdownTimeout: 30
+
+  # Service configuration
+  service:
+    type: LoadBalancer
+    annotations: {}
+    # For AWS NLB:
+    # service.beta.kubernetes.io/aws-load-balancer-type: external
+    # service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    # service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    ports:
+      - name: http
+        port: 80
+        targetPort: 8080
+        protocol: TCP
+      - name: https
+        port: 443
+        targetPort: 8443
+        protocol: TCP
+
+  # Horizontal Pod Autoscaler
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: 80
+
+  # Pod disruption budget
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  # Node selector
+  nodeSelector: {}
+
+  # Tolerations
+  tolerations: []
+
+  # Affinity - spread across nodes
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/name
+                  operator: In
+                  values:
+                    - wicket-proxy
+            topologyKey: kubernetes.io/hostname
+
+  # Security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+      add:
+        - NET_BIND_SERVICE
+
+  # Service account
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+
+# GatewayClass settings
+gatewayClass:
+  # Create a GatewayClass resource
+  create: true
+  name: wicket
+  description: "Wicket Gateway API implementation"
+
+# CRDs
+crds:
+  # Install Gateway API CRDs
+  install: true
+
+# RBAC settings
+rbac:
+  create: true
+
+# Namespace
+namespace:
+  create: false
+  name: wicket-system

@@ -1,0 +1,14 @@
+{{- if and .Values.proxy.enabled .Values.rbac.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "wicket.proxy.serviceAccountName" . }}
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.proxy.labels" . | nindent 4 }}
+  {{- with .Values.proxy.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

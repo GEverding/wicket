@@ -1,0 +1,23 @@
+apiVersion: v2
+name: wicket
+description: Wicket - Kubernetes Gateway API implementation and high-performance reverse proxy
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/GEverding/wicket
+sources:
+  - https://github.com/GEverding/wicket
+maintainers:
+  - name: GEverding
+keywords:
+  - gateway
+  - gateway-api
+  - proxy
+  - reverse-proxy
+  - load-balancer
+  - ingress
+  - kubernetes
+annotations:
+  artifacthub.io/category: networking
+  artifacthub.io/license: Apache-2.0
