@@ -20,7 +20,10 @@ use kube::{
 };
 
 use crate::crds::{Gateway, GatewayClass, ReferenceGrant};
-use crate::metrics::ReconcileMetrics;
+use crate::metrics::{
+    ReconcileMetrics, TLS_CERTIFICATES_TOTAL, TLS_CERTIFICATE_EXPIRY_TIMESTAMP,
+    TLS_SECRET_EXTRACTIONS_TOTAL, TLS_SECRET_EXTRACTION_DURATION_SECONDS,
+};
 
 use super::config_generator::GatewayState;
 use super::context::Context;
@@ -129,17 +132,37 @@ pub async fn reconcile_secret(
     }
 
     // Extract and write certificate files
+    let extraction_start = std::time::Instant::now();
     let cert_data = data.get("tls.crt").ok_or(SecretError::MissingTlsData)?;
     let key_data = data.get("tls.key").ok_or(SecretError::MissingTlsData)?;
 
     let cert_path = write_tls_file(&namespace, &name, "crt", &cert_data.0).await?;
     let key_path = write_tls_file(&namespace, &name, "key", &key_data.0).await?;
 
+    // Record extraction metrics
+    let extraction_duration = extraction_start.elapsed().as_secs_f64();
+    TLS_SECRET_EXTRACTIONS_TOTAL
+        .with_label_values(&[&namespace, "success"])
+        .inc();
+    TLS_SECRET_EXTRACTION_DURATION_SECONDS
+        .with_label_values(&[&namespace])
+        .observe(extraction_duration);
+
+    // Update TLS certificate count metric
+    TLS_CERTIFICATES_TOTAL
+        .with_label_values(&[&namespace, "kubernetes"])
+        .inc();
+
+    // TODO: Parse X.509 certificate to extract expiry timestamp
+    // This would require adding x509-parser crate
+    // TLS_CERTIFICATE_EXPIRY_TIMESTAMP.with_label_values(&[&namespace, &name]).set(expiry_timestamp);
+
     tracing::info!(
         namespace = %namespace,
         name = %name,
         cert_path = %cert_path.display(),
         key_path = %key_path.display(),
+        extraction_time_ms = extraction_duration * 1000.0,
         "TLS certificate extracted"
     );
 
@@ -165,6 +188,13 @@ pub fn error_policy_secret(
         error = %error,
         "Secret reconciliation failed"
     );
+
+    // Track extraction failures for TLS-related errors
+    if matches!(error, SecretError::MissingTlsData | SecretError::WriteFile(_) | SecretError::Base64Decode(_)) {
+        TLS_SECRET_EXTRACTIONS_TOTAL
+            .with_label_values(&[&namespace, "failure"])
+            .inc();
+    }
 
     crate::metrics::RECONCILE_ERRORS_TOTAL
         .with_label_values(&["Secret", "reconcile_error"])

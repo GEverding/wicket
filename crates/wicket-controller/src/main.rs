@@ -12,11 +12,14 @@ use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use wicket_controller::{
-    metrics::{register_metrics, serve_metrics, CONTROLLER_IS_LEADER, CONTROLLER_UPTIME_SECONDS},
+    metrics::{
+        register_metrics, serve_metrics, CONTROLLER_IS_LEADER, CONTROLLER_UPTIME_SECONDS,
+        CONFIG_SYNC_LAG_SECONDS,
+    },
     reconcilers::{
         run_endpoints_controller, run_gateway_class_controller, run_gateway_controller,
-        run_httproute_controller, run_secret_controller, run_tcproute_controller,
-        run_tlsroute_controller, Context,
+        run_httproute_controller, run_referencegrant_controller, run_secret_controller,
+        run_tcproute_controller, run_tlsroute_controller, Context,
     },
 };
 
@@ -104,12 +107,26 @@ async fn main() -> anyhow::Result<()> {
     // Mark as leader (simplified - in production use proper leader election)
     CONTROLLER_IS_LEADER.set(1);
 
-    // Track uptime
+    // Track uptime and config sync lag
     let start_time = std::time::Instant::now();
-    let uptime_ctx = ctx.clone();
     tokio::spawn(async move {
+        let mut last_config_generation: i64 = 0;
+        let mut last_config_update_time = std::time::Instant::now();
+
         loop {
             CONTROLLER_UPTIME_SECONDS.set(start_time.elapsed().as_secs() as i64);
+
+            // Check if config has been updated by comparing generation
+            let current_generation =
+                wicket_controller::metrics::CONFIG_GENERATION.get();
+            if current_generation != last_config_generation {
+                last_config_generation = current_generation;
+                last_config_update_time = std::time::Instant::now();
+            }
+
+            // Track time since last successful config sync
+            CONFIG_SYNC_LAG_SECONDS.set(last_config_update_time.elapsed().as_secs() as i64);
+
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
@@ -133,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
     let tls_route_ctx = ctx.clone();
     let endpoints_ctx = ctx.clone();
     let secret_ctx = ctx.clone();
+    let refgrant_ctx = ctx.clone();
 
     tokio::select! {
         result = run_gateway_class_controller(gc_ctx) => {
@@ -168,6 +186,11 @@ async fn main() -> anyhow::Result<()> {
         result = run_secret_controller(secret_ctx) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "Secret controller failed");
+            }
+        }
+        result = run_referencegrant_controller(refgrant_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "ReferenceGrant controller failed");
             }
         }
         _ = shutdown_signal() => {

@@ -18,7 +18,9 @@ use crate::crds::{
     Gateway, GatewayClass, GatewayStatus, GatewayStatusAddress, AddressType,
     Condition, ListenerStatus, RouteGroupKind,
 };
-use crate::metrics::{ReconcileMetrics, GATEWAYS_TOTAL};
+use crate::metrics::{
+    ReconcileMetrics, GATEWAYS_TOTAL, GATEWAY_PROGRAMMED, GATEWAY_LISTENER_ATTACHED_ROUTES,
+};
 
 use super::context::Context;
 
@@ -118,7 +120,7 @@ pub async fn reconcile_gateway(
             Condition::accepted(),
             Condition::programmed(),
         ],
-        listeners: listener_statuses,
+        listeners: listener_statuses.clone(),
     };
 
     let api: Api<Gateway> = Api::namespaced(ctx.client.clone(), &namespace);
@@ -134,6 +136,19 @@ pub async fn reconcile_gateway(
     .await?;
 
     tracing::info!(namespace = %namespace, name = %name, "Gateway programmed");
+
+    // Update Gateway status metrics
+    GATEWAY_PROGRAMMED
+        .with_label_values(&[&namespace, &name])
+        .set(1);
+
+    // Update listener attached routes metrics
+    for listener_status in &listener_statuses {
+        GATEWAY_LISTENER_ATTACHED_ROUTES
+            .with_label_values(&[&namespace, &name, &listener_status.name])
+            .set(listener_status.attached_routes as i64);
+    }
+
     metrics.record_success();
 
     // Update metrics
