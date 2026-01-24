@@ -1,0 +1,14 @@
+{{- if and .Values.controller.enabled .Values.controller.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "wicket.controller.name" . }}
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.controller.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.controller.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "wicket.controller.selectorLabels" . | nindent 6 }}
+{{- end }}
