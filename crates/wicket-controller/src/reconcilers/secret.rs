@@ -153,9 +153,18 @@ pub async fn reconcile_secret(
         .with_label_values(&[&namespace, "kubernetes"])
         .inc();
 
-    // TODO: Parse X.509 certificate to extract expiry timestamp
-    // This would require adding x509-parser crate
-    // TLS_CERTIFICATE_EXPIRY_TIMESTAMP.with_label_values(&[&namespace, &name]).set(expiry_timestamp);
+    // Parse X.509 certificate to extract expiry timestamp
+    if let Some(expiry) = parse_certificate_expiry(&cert_data.0) {
+        TLS_CERTIFICATE_EXPIRY_TIMESTAMP
+            .with_label_values(&[&namespace, &name])
+            .set(expiry as f64);
+        tracing::debug!(
+            namespace = %namespace,
+            name = %name,
+            expiry_timestamp = expiry,
+            "Certificate expiry timestamp extracted"
+        );
+    }
 
     tracing::info!(
         namespace = %namespace,
@@ -419,6 +428,33 @@ async fn trigger_config_update(
         .map_err(|e| SecretError::ConfigError(e.to_string()))?;
 
     Ok(())
+}
+
+/// Parse a PEM-encoded X.509 certificate to extract its expiry timestamp.
+///
+/// Returns the expiry as a Unix timestamp (seconds since epoch), or None if parsing fails.
+fn parse_certificate_expiry(cert_data: &[u8]) -> Option<i64> {
+    use x509_parser::prelude::*;
+
+    // Try to parse as PEM first
+    let cert_bytes = if let Ok((_, pem)) = parse_x509_pem(cert_data) {
+        pem.contents
+    } else {
+        // Already DER format
+        cert_data.to_vec()
+    };
+
+    // Parse the X.509 certificate
+    match X509Certificate::from_der(&cert_bytes) {
+        Ok((_, cert)) => {
+            let expiry = cert.validity().not_after;
+            Some(expiry.timestamp())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to parse X.509 certificate for expiry");
+            None
+        }
+    }
 }
 
 /// Load existing TLS secrets from the certificate directory.

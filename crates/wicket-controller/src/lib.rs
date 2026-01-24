@@ -65,9 +65,11 @@
 //! - `wicket_config_updates_total{result}` - Configuration update counts
 
 pub mod crds;
+pub mod leader_election;
 pub mod metrics;
 pub mod reconcilers;
 
 pub use crds::*;
+pub use leader_election::*;
 pub use metrics::*;
 pub use reconcilers::*;
