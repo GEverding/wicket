@@ -13,6 +13,12 @@ use crate::router::SniRouter;
 use crate::sni::extract_sni;
 use crate::StreamError;
 
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use std::sync::Mutex;
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use volt_sockmap::SocketMap;
+
 /// Upstream server configuration.
 #[derive(Debug)]
 pub struct Upstream {
@@ -39,13 +45,14 @@ impl Upstream {
 }
 
 /// Main L4 stream proxy.
-#[derive(Debug)]
 pub struct StreamProxy {
     pub(crate) router: SniRouter,
     pub(crate) upstreams: HashMap<String, Arc<Upstream>>,
     pub(crate) source_ip_pool: Option<SourceIpPool>,
     pub(crate) proxy_protocol: Option<ProxyProtocolVersion>,
     pub(crate) local_addr: SocketAddr,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub(crate) sockmap: Option<Arc<Mutex<SocketMap>>>,
 }
 
 impl StreamProxy {
@@ -63,7 +70,16 @@ impl StreamProxy {
             source_ip_pool,
             proxy_protocol,
             local_addr,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            sockmap: None,
         }
+    }
+
+    /// Set the eBPF sockmap for kernel-level proxying.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub fn with_sockmap(mut self, sockmap: SocketMap) -> Self {
+        self.sockmap = Some(Arc::new(Mutex::new(sockmap)));
+        self
     }
 
     /// Build from config.
@@ -112,6 +128,8 @@ impl StreamProxy {
             source_ip_pool,
             proxy_protocol,
             local_addr,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            sockmap: None,
         })
     }
 
@@ -169,7 +187,44 @@ impl StreamProxy {
             backend.write_all(&header).await?;
         }
 
-        // 5. Bidirectional copy
+        // 5. Bidirectional copy (with optional eBPF sockmap acceleration)
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if let Some(ref sockmap) = self.sockmap {
+            use std::os::fd::AsRawFd;
+            let client_fd = client.as_raw_fd();
+            let backend_fd = backend.as_raw_fd();
+
+            // Try to register for kernel-level proxying
+            let registered = sockmap
+                .lock()
+                .ok()
+                .and_then(|mut sm| sm.register_pair(client_fd, backend_fd).ok())
+                .is_some();
+
+            if registered {
+                tracing::debug!(
+                    client = %client_addr,
+                    "Using eBPF sockmap for kernel-level proxying"
+                );
+
+                // Kernel handles data transfer - just wait for either side to close
+                tokio::select! {
+                    _ = client.readable() => {}
+                    _ = backend.readable() => {}
+                }
+
+                // Unregister on close
+                let _ = sockmap
+                    .lock()
+                    .ok()
+                    .map(|mut sm| sm.unregister_pair(client_fd, backend_fd));
+
+                return Ok(());
+            }
+            // Fall through to user-space proxying if registration failed
+        }
+
+        // User-space bidirectional copy (fallback or non-Linux)
         let (mut client_read, mut client_write) = client.into_split();
         let (mut backend_read, mut backend_write) = backend.into_split();
 
