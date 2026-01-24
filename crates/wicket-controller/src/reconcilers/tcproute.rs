@@ -282,17 +282,24 @@ async fn trigger_config_update(ctx: &Context) -> Result<(), TCPRouteError> {
 
 /// Create the TCPRoute controller.
 pub async fn run_tcproute_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+
     let api: Api<TCPRoute> = if ctx.watch_all_namespaces {
         Api::all(ctx.client.clone())
     } else {
         Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
     };
 
+    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["TCPRoute"]).set(1);
+
     Controller::new(api, Config::default())
         .run(reconcile_tcproute, error_policy_tcproute, ctx)
         .for_each(|result| async move {
             match result {
                 Ok((obj, _)) => {
+                    WATCH_EVENTS_TOTAL
+                        .with_label_values(&["TCPRoute", "reconcile_success"])
+                        .inc();
                     tracing::debug!(
                         namespace = obj.namespace.as_deref().unwrap_or(""),
                         name = %obj.name,
@@ -300,11 +307,19 @@ pub async fn run_tcproute_controller(ctx: Arc<Context>) -> Result<(), kube::Erro
                     );
                 }
                 Err(e) => {
+                    WATCH_EVENTS_TOTAL
+                        .with_label_values(&["TCPRoute", "reconcile_error"])
+                        .inc();
+                    WATCH_ERRORS_TOTAL
+                        .with_label_values(&["TCPRoute", "controller_error"])
+                        .inc();
                     tracing::error!(error = %e, "TCPRoute controller error");
                 }
             }
         })
         .await;
+
+    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["TCPRoute"]).set(0);
 
     Ok(())
 }

@@ -103,6 +103,114 @@ pub struct RouteConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<RouteTlsConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<RouteFilters>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
+/// Filters that can be applied to requests and responses.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RouteFilters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_headers: Option<HeaderModifier>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<HeaderModifier>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<RedirectFilter>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url_rewrite: Option<UrlRewriteFilter>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<MirrorFilter>,
+}
+
+impl RouteFilters {
+    pub fn is_empty(&self) -> bool {
+        self.request_headers.is_none()
+            && self.response_headers.is_none()
+            && self.redirect.is_none()
+            && self.url_rewrite.is_none()
+            && self.mirror.is_none()
+    }
+}
+
+/// Header modification filter.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HeaderModifier {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub add: HashMap<String, String>,
+
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub set: HashMap<String, String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
+}
+
+impl HeaderModifier {
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.set.is_empty() && self.remove.is_empty()
+    }
+}
+
+/// Redirect filter configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RedirectFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathModifier>,
+
+    #[serde(default = "default_redirect_status")]
+    pub status_code: u16,
+}
+
+fn default_redirect_status() -> u16 {
+    302
+}
+
+/// Path modification for redirects and rewrites.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathModifier {
+    ReplaceFullPath(String),
+    ReplacePrefixMatch(String),
+}
+
+/// URL rewrite filter configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UrlRewriteFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathModifier>,
+}
+
+/// Request mirroring filter configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MirrorFilter {
+    pub upstream: String,
+
+    #[serde(default = "default_mirror_percent")]
+    pub percent: u8,
+}
+
+fn default_mirror_percent() -> u8 {
+    100
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -255,6 +363,161 @@ impl GatewayState {
         format!("{}/{}", namespace, name)
     }
 
+    /// Convert HTTPRoute filters to RouteFilters.
+    fn convert_filters(
+        filters: &[crate::crds::HTTPRouteFilter],
+        route_ns: &str,
+        upstreams: &mut HashMap<String, UpstreamConfig>,
+        service_endpoints: &HashMap<String, ServiceEndpoints>,
+    ) -> Option<RouteFilters> {
+        use crate::crds::HTTPRouteFilterType;
+
+        let mut result = RouteFilters::default();
+        let mut has_filters = false;
+
+        for filter in filters {
+            match filter.type_ {
+                HTTPRouteFilterType::RequestHeaderModifier => {
+                    if let Some(ref modifier) = filter.request_header_modifier {
+                        let mut header_mod = HeaderModifier::default();
+                        for h in &modifier.add {
+                            header_mod.add.insert(h.name.clone(), h.value.clone());
+                        }
+                        for h in &modifier.set {
+                            header_mod.set.insert(h.name.clone(), h.value.clone());
+                        }
+                        header_mod.remove = modifier.remove.clone();
+                        if !header_mod.is_empty() {
+                            result.request_headers = Some(header_mod);
+                            has_filters = true;
+                        }
+                    }
+                }
+                HTTPRouteFilterType::ResponseHeaderModifier => {
+                    if let Some(ref modifier) = filter.response_header_modifier {
+                        let mut header_mod = HeaderModifier::default();
+                        for h in &modifier.add {
+                            header_mod.add.insert(h.name.clone(), h.value.clone());
+                        }
+                        for h in &modifier.set {
+                            header_mod.set.insert(h.name.clone(), h.value.clone());
+                        }
+                        header_mod.remove = modifier.remove.clone();
+                        if !header_mod.is_empty() {
+                            result.response_headers = Some(header_mod);
+                            has_filters = true;
+                        }
+                    }
+                }
+                HTTPRouteFilterType::RequestRedirect => {
+                    if let Some(ref redirect) = filter.request_redirect {
+                        let path = redirect.path.as_ref().map(|p| {
+                            match p.type_ {
+                                crate::crds::HTTPPathModifierType::ReplaceFullPath => {
+                                    PathModifier::ReplaceFullPath(
+                                        p.replace_full_path.clone().unwrap_or_default()
+                                    )
+                                }
+                                crate::crds::HTTPPathModifierType::ReplacePrefixMatch => {
+                                    PathModifier::ReplacePrefixMatch(
+                                        p.replace_prefix_match.clone().unwrap_or_default()
+                                    )
+                                }
+                            }
+                        });
+                        result.redirect = Some(RedirectFilter {
+                            scheme: redirect.scheme.clone(),
+                            hostname: redirect.hostname.clone(),
+                            port: redirect.port,
+                            path,
+                            status_code: redirect.status_code as u16,
+                        });
+                        has_filters = true;
+                    }
+                }
+                HTTPRouteFilterType::URLRewrite => {
+                    if let Some(ref rewrite) = filter.url_rewrite {
+                        let path = rewrite.path.as_ref().map(|p| {
+                            match p.type_ {
+                                crate::crds::HTTPPathModifierType::ReplaceFullPath => {
+                                    PathModifier::ReplaceFullPath(
+                                        p.replace_full_path.clone().unwrap_or_default()
+                                    )
+                                }
+                                crate::crds::HTTPPathModifierType::ReplacePrefixMatch => {
+                                    PathModifier::ReplacePrefixMatch(
+                                        p.replace_prefix_match.clone().unwrap_or_default()
+                                    )
+                                }
+                            }
+                        });
+                        result.url_rewrite = Some(UrlRewriteFilter {
+                            hostname: rewrite.hostname.clone(),
+                            path,
+                        });
+                        has_filters = true;
+                    }
+                }
+                HTTPRouteFilterType::RequestMirror => {
+                    if let Some(ref mirror) = filter.request_mirror {
+                        let backend_ns = mirror.backend_ref.namespace.as_deref().unwrap_or(route_ns);
+                        let mirror_upstream_name = format!("mirror-{}-{}", backend_ns, mirror.backend_ref.name);
+
+                        // Create upstream for mirror backend
+                        let backend_key = Self::key(backend_ns, &mirror.backend_ref.name);
+                        let backends = if let Some(endpoints) = service_endpoints.get(&backend_key) {
+                            endpoints.endpoints.clone()
+                        } else {
+                            let port = mirror.backend_ref.port.unwrap_or(80);
+                            vec![format!(
+                                "{}.{}.svc.cluster.local:{}",
+                                mirror.backend_ref.name,
+                                backend_ns,
+                                port
+                            )]
+                        };
+
+                        upstreams.insert(mirror_upstream_name.clone(), UpstreamConfig {
+                            backends,
+                            strategy: "round_robin".to_string(),
+                            health_check: None,
+                        });
+
+                        result.mirror = Some(MirrorFilter {
+                            upstream: mirror_upstream_name,
+                            percent: mirror.percent.map(|p| p as u8).unwrap_or(100),
+                        });
+                        has_filters = true;
+                    }
+                }
+                HTTPRouteFilterType::ExtensionRef => {
+                    // Extension filters not supported yet
+                }
+            }
+        }
+
+        if has_filters { Some(result) } else { None }
+    }
+
+    /// Parse Duration string to seconds.
+    fn parse_duration_to_secs(duration: &str) -> Option<u64> {
+        // Gateway API uses Go duration format like "10s", "1m", "1h"
+        let duration = duration.trim();
+        if duration.is_empty() {
+            return None;
+        }
+
+        let (num, unit) = duration.split_at(duration.len() - 1);
+        let num: u64 = num.parse().ok()?;
+
+        match unit {
+            "s" => Some(num),
+            "m" => Some(num * 60),
+            "h" => Some(num * 3600),
+            _ => None,
+        }
+    }
+
     /// Generate Wicket configuration from the current state.
     pub fn generate_config(&self) -> WicketConfig {
         let mut config = WicketConfig::default();
@@ -326,6 +589,19 @@ impl GatewayState {
                         health_check: None,
                     });
 
+                    // Convert filters from the rule
+                    let filters = Self::convert_filters(
+                        &rule.filters,
+                        route_ns,
+                        &mut upstreams,
+                        &self.service_endpoints,
+                    );
+
+                    // Parse timeout from rule
+                    let timeout = rule.timeouts.as_ref().and_then(|t| {
+                        t.request.as_ref().and_then(|d| Self::parse_duration_to_secs(d))
+                    });
+
                     // Create routes from matches
                     if rule.matches.is_empty() {
                         // Default match - all traffic
@@ -340,6 +616,8 @@ impl GatewayState {
                                 headers: HashMap::new(),
                             },
                             tls: None,
+                            filters: filters.clone(),
+                            timeout,
                         };
                         routes.push(route_config);
                     } else {
@@ -383,6 +661,8 @@ impl GatewayState {
                                     headers,
                                 },
                                 tls: None,
+                                filters: filters.clone(),
+                                timeout,
                             };
                             routes.push(route_config);
                         }

@@ -38,9 +38,13 @@ struct Args {
     #[arg(long, default_value = "true")]
     watch_all_namespaces: bool,
 
-    /// Path to write generated Wicket configuration
-    #[arg(long, default_value = "/etc/wicket/wicket.toml")]
-    config_output: String,
+    /// Name of the ConfigMap to update with proxy configuration
+    #[arg(long, default_value = "wicket-proxy-config")]
+    config_configmap_name: String,
+
+    /// Namespace of the ConfigMap to update (defaults to controller namespace)
+    #[arg(long)]
+    config_configmap_namespace: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, short = 'l', default_value = "info")]
@@ -66,11 +70,18 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging
     init_logging(&args.log_level, args.json_logs)?;
 
+    // Determine ConfigMap namespace (default to controller namespace)
+    let config_configmap_namespace = args
+        .config_configmap_namespace
+        .clone()
+        .unwrap_or_else(|| args.namespace.clone());
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         namespace = %args.namespace,
         watch_all_namespaces = args.watch_all_namespaces,
-        config_output = %args.config_output,
+        config_configmap_name = %args.config_configmap_name,
+        config_configmap_namespace = %config_configmap_namespace,
         "Starting Wicket Gateway API Controller"
     );
 
@@ -86,7 +97,8 @@ async fn main() -> anyhow::Result<()> {
         client.clone(),
         args.namespace.clone(),
         args.watch_all_namespaces,
-        args.config_output.clone(),
+        args.config_configmap_name.clone(),
+        config_configmap_namespace.clone(),
     ));
 
     // Mark as leader (simplified - in production use proper leader election)

@@ -226,19 +226,35 @@ async fn validate_reference_grant(
     gateway_ns: &str,  // Namespace of the Gateway making the reference
     secret_name: &str, // Name of the secret being referenced
 ) -> Result<bool, SecretError> {
+    use crate::metrics::{REFERENCE_GRANT_VALIDATIONS_TOTAL, CROSS_NAMESPACE_BLOCKED_TOTAL};
+
     // ReferenceGrant must exist in the target namespace (secret's namespace)
     let grant_api: Api<ReferenceGrant> = Api::namespaced(client.clone(), secret_ns);
     let grants = grant_api.list(&Default::default()).await?;
 
     for grant in grants.items {
         if grant.allows_tls_secret_reference(gateway_ns, Some(secret_name)) {
+            REFERENCE_GRANT_VALIDATIONS_TOTAL
+                .with_label_values(&[gateway_ns, secret_ns, "allowed"])
+                .inc();
             return Ok(true);
         }
         // Also check if there's a wildcard grant (no specific name)
         if grant.allows_tls_secret_reference(gateway_ns, None) {
+            REFERENCE_GRANT_VALIDATIONS_TOTAL
+                .with_label_values(&[gateway_ns, secret_ns, "allowed"])
+                .inc();
             return Ok(true);
         }
     }
+
+    // No ReferenceGrant allows this access
+    REFERENCE_GRANT_VALIDATIONS_TOTAL
+        .with_label_values(&[gateway_ns, secret_ns, "denied"])
+        .inc();
+    CROSS_NAMESPACE_BLOCKED_TOTAL
+        .with_label_values(&[gateway_ns, secret_ns, "Secret"])
+        .inc();
 
     Ok(false)
 }
@@ -417,6 +433,8 @@ async fn load_existing_tls_secrets(state: &mut GatewayState) {
 
 /// Create the Secret controller for watching TLS secret changes.
 pub async fn run_secret_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+
     let api: Api<Secret> = if ctx.watch_all_namespaces {
         Api::all(ctx.client.clone())
     } else {
@@ -426,11 +444,16 @@ pub async fn run_secret_controller(ctx: Arc<Context>) -> Result<(), kube::Error>
     // Only watch TLS-type secrets
     let config = Config::default();
 
+    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Secret"]).set(1);
+
     Controller::new(api, config)
         .run(reconcile_secret, error_policy_secret, ctx)
         .for_each(|result| async move {
             match result {
                 Ok((obj, _)) => {
+                    WATCH_EVENTS_TOTAL
+                        .with_label_values(&["Secret", "reconcile_success"])
+                        .inc();
                     tracing::trace!(
                         namespace = obj.namespace.as_deref().unwrap_or(""),
                         name = %obj.name,
@@ -438,11 +461,19 @@ pub async fn run_secret_controller(ctx: Arc<Context>) -> Result<(), kube::Error>
                     );
                 }
                 Err(e) => {
+                    WATCH_EVENTS_TOTAL
+                        .with_label_values(&["Secret", "reconcile_error"])
+                        .inc();
+                    WATCH_ERRORS_TOTAL
+                        .with_label_values(&["Secret", "controller_error"])
+                        .inc();
                     tracing::error!(error = %e, "Secret controller error");
                 }
             }
         })
         .await;
+
+    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Secret"]).set(0);
 
     Ok(())
 }

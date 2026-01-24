@@ -4,18 +4,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use k8s_openapi::api::core::v1::Service;
 use kube::{
     api::{Api, ListParams, Patch, PatchParams},
     runtime::{
         controller::{Action, Controller},
         watcher::Config,
     },
-    Client, Resource, ResourceExt,
+    Client, ResourceExt,
 };
 
 use crate::crds::{
     Gateway, GatewayClass, GatewayStatus, GatewayStatusAddress, AddressType,
-    Condition, ListenerStatus, RouteGroupKind, WICKET_CONTROLLER_NAME,
+    Condition, ListenerStatus, RouteGroupKind,
 };
 use crate::metrics::{ReconcileMetrics, GATEWAYS_TOTAL};
 
@@ -107,14 +108,12 @@ pub async fn reconcile_gateway(
         })
         .collect();
 
+    // Get addresses from LoadBalancer Service or Gateway spec
+    let addresses = get_gateway_addresses(&ctx.client, &namespace, &name, &gateway).await;
+
     // Update Gateway status
     let status = GatewayStatus {
-        addresses: vec![
-            GatewayStatusAddress {
-                type_: AddressType::IPAddress,
-                value: "0.0.0.0".to_string(), // Will be updated with actual address
-            },
-        ],
+        addresses,
         conditions: vec![
             Condition::accepted(),
             Condition::programmed(),
@@ -167,6 +166,123 @@ pub fn error_policy_gateway(
         .inc();
 
     Action::requeue(Duration::from_secs(60))
+}
+
+/// Get addresses for a Gateway from its associated LoadBalancer Service.
+///
+/// This function tries to find addresses in the following order:
+/// 1. LoadBalancer Service status (external IP or hostname assigned by cloud provider)
+/// 2. Addresses specified in the Gateway spec
+/// 3. Fallback to a placeholder if nothing is available
+async fn get_gateway_addresses(
+    client: &Client,
+    namespace: &str,
+    gateway_name: &str,
+    gateway: &Gateway,
+) -> Vec<GatewayStatusAddress> {
+    let mut addresses = Vec::new();
+
+    // Try to find the associated Service (convention: same name as Gateway, or with -lb suffix)
+    let svc_api: Api<Service> = Api::namespaced(client.clone(), namespace);
+
+    // Check for Service with the same name or common naming patterns
+    let service_names = [
+        gateway_name.to_string(),
+        format!("{}-lb", gateway_name),
+        format!("{}-gateway", gateway_name),
+        format!("wicket-{}", gateway_name),
+    ];
+
+    for svc_name in &service_names {
+        if let Ok(service) = svc_api.get(svc_name).await {
+            // Check if it's a LoadBalancer type Service
+            if let Some(spec) = &service.spec {
+                if spec.type_.as_deref() == Some("LoadBalancer") {
+                    // Get addresses from LoadBalancer status
+                    if let Some(status) = &service.status {
+                        if let Some(lb_status) = &status.load_balancer {
+                            if let Some(ingresses) = &lb_status.ingress {
+                                for ingress in ingresses {
+                                    if let Some(ip) = &ingress.ip {
+                                        addresses.push(GatewayStatusAddress {
+                                            type_: AddressType::IPAddress,
+                                            value: ip.clone(),
+                                        });
+                                    }
+                                    if let Some(hostname) = &ingress.hostname {
+                                        addresses.push(GatewayStatusAddress {
+                                            type_: AddressType::Hostname,
+                                            value: hostname.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // If LoadBalancer is pending, check external IPs
+                    if addresses.is_empty() {
+                        if let Some(external_ips) = &spec.external_ips {
+                            for ip in external_ips {
+                                addresses.push(GatewayStatusAddress {
+                                    type_: AddressType::IPAddress,
+                                    value: ip.clone(),
+                                });
+                            }
+                        }
+                    }
+                } else if spec.type_.as_deref() == Some("NodePort") {
+                    // For NodePort, we could potentially get node IPs
+                    // but that's complex - skip for now
+                } else if spec.type_.as_deref() == Some("ClusterIP") {
+                    // Use ClusterIP if available
+                    if let Some(cluster_ip) = &spec.cluster_ip {
+                        if cluster_ip != "None" {
+                            addresses.push(GatewayStatusAddress {
+                                type_: AddressType::IPAddress,
+                                value: cluster_ip.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // If we found a service with addresses, break
+            if !addresses.is_empty() {
+                tracing::debug!(
+                    namespace = %namespace,
+                    gateway = %gateway_name,
+                    service = %svc_name,
+                    addresses = ?addresses,
+                    "Found Gateway addresses from Service"
+                );
+                break;
+            }
+        }
+    }
+
+    // Fall back to addresses specified in Gateway spec
+    if addresses.is_empty() {
+        for addr in &gateway.spec.addresses {
+            addresses.push(GatewayStatusAddress {
+                type_: addr.type_.clone(),
+                value: addr.value.clone(),
+            });
+        }
+    }
+
+    // If still no addresses, use a placeholder that indicates pending
+    if addresses.is_empty() {
+        tracing::debug!(
+            namespace = %namespace,
+            gateway = %gateway_name,
+            "No addresses found, using pending placeholder"
+        );
+        // Don't set an address - leave empty to indicate pending
+        // Some implementations use a specific IP, but empty is cleaner
+    }
+
+    addresses
 }
 
 /// Update Gateway metrics.
@@ -350,17 +466,25 @@ pub async fn load_service_endpoints(client: &Client, state: &mut super::config_g
 
 /// Create the Gateway controller.
 pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+
     let api: Api<Gateway> = if ctx.watch_all_namespaces {
         Api::all(ctx.client.clone())
     } else {
         Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
     };
 
+    // Track that we have an active watch connection
+    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Gateway"]).set(1);
+
     Controller::new(api, Config::default())
         .run(reconcile_gateway, error_policy_gateway, ctx)
         .for_each(|result| async move {
             match result {
                 Ok((obj, _)) => {
+                    WATCH_EVENTS_TOTAL
+                        .with_label_values(&["Gateway", "reconcile_success"])
+                        .inc();
                     tracing::debug!(
                         namespace = obj.namespace.as_deref().unwrap_or(""),
                         name = %obj.name,
@@ -368,11 +492,20 @@ pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error
                     );
                 }
                 Err(e) => {
+                    WATCH_EVENTS_TOTAL
+                        .with_label_values(&["Gateway", "reconcile_error"])
+                        .inc();
+                    WATCH_ERRORS_TOTAL
+                        .with_label_values(&["Gateway", "controller_error"])
+                        .inc();
                     tracing::error!(error = %e, "Gateway controller error");
                 }
             }
         })
         .await;
+
+    // Watch ended
+    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Gateway"]).set(0);
 
     Ok(())
 }

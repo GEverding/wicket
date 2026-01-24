@@ -130,21 +130,36 @@ async fn update_gateway_class_metrics(client: &Client) {
 
 /// Create the GatewayClass controller.
 pub async fn run_gateway_class_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+
     let api: Api<GatewayClass> = Api::all(ctx.client.clone());
+
+    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["GatewayClass"]).set(1);
 
     Controller::new(api, Config::default())
         .run(reconcile_gateway_class, error_policy_gateway_class, ctx)
         .for_each(|result| async move {
             match result {
                 Ok((obj, _)) => {
+                    WATCH_EVENTS_TOTAL
+                        .with_label_values(&["GatewayClass", "reconcile_success"])
+                        .inc();
                     tracing::debug!(name = %obj.name, "GatewayClass reconciled");
                 }
                 Err(e) => {
+                    WATCH_EVENTS_TOTAL
+                        .with_label_values(&["GatewayClass", "reconcile_error"])
+                        .inc();
+                    WATCH_ERRORS_TOTAL
+                        .with_label_values(&["GatewayClass", "controller_error"])
+                        .inc();
                     tracing::error!(error = %e, "GatewayClass controller error");
                 }
             }
         })
         .await;
+
+    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["GatewayClass"]).set(0);
 
     Ok(())
 }
