@@ -353,8 +353,12 @@ impl AcmeProvider {
             }
         }
 
-        // Parse expiry from cert (simplified - assume 90 days from now)
-        let expiry = Utc::now() + chrono::Duration::days(90);
+        // Parse expiry from the actual certificate
+        let expiry = parse_certificate_expiry(&cert_pem)
+            .unwrap_or_else(|| {
+                warn!("Failed to parse certificate expiry, using 90 days from now");
+                Utc::now() + chrono::Duration::days(90)
+            });
 
         let stored = StoredCert {
             cert_pem,
@@ -452,6 +456,21 @@ fn generate_csr(domains: &[String]) -> Result<(String, Vec<u8>), AcmeError> {
     let csr_der = pem_to_der(&csr_pem)?;
 
     Ok((key_pem, csr_der))
+}
+
+/// Parse a PEM-encoded X.509 certificate to extract its expiry datetime.
+fn parse_certificate_expiry(cert_pem: &str) -> Option<chrono::DateTime<Utc>> {
+    use x509_parser::prelude::*;
+
+    // Parse PEM
+    let (_, pem) = parse_x509_pem(cert_pem.as_bytes()).ok()?;
+
+    // Parse the X.509 certificate
+    let (_, cert) = X509Certificate::from_der(&pem.contents).ok()?;
+
+    // Get the expiry timestamp
+    let expiry = cert.validity().not_after;
+    chrono::DateTime::from_timestamp(expiry.timestamp(), 0)
 }
 
 /// Convert PEM to DER format.

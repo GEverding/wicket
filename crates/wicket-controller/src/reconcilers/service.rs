@@ -397,3 +397,126 @@ pub async fn run_endpoints_controller(ctx: Arc<Context>) -> Result<(), kube::Err
 
     Ok(())
 }
+
+/// Reconcile a Service resource.
+///
+/// This is triggered when a Service changes (spec changes like port updates).
+/// We check if this service is referenced by any route and regenerate configuration if so.
+pub async fn reconcile_service(
+    service: Arc<Service>,
+    ctx: Arc<Context>,
+) -> Result<Action, ServiceError> {
+    let metrics = ReconcileMetrics::new("Service");
+    let namespace = service.namespace().unwrap_or_default();
+    let name = service.name_any();
+
+    tracing::debug!(namespace = %namespace, name = %name, "Reconciling Service");
+
+    // Check if this service is referenced by any route
+    let is_referenced = is_service_referenced(&ctx.client, &namespace, &name).await;
+
+    if !is_referenced {
+        tracing::trace!(
+            namespace = %namespace,
+            name = %name,
+            "Service not referenced by any route, skipping"
+        );
+        metrics.record_success();
+        return Ok(Action::await_change());
+    }
+
+    // Log service spec details for debugging
+    if let Some(ref spec) = service.spec {
+        let ports: Vec<String> = spec
+            .ports
+            .as_ref()
+            .map(|ports| {
+                ports
+                    .iter()
+                    .map(|p| format!("{}:{}", p.name.as_deref().unwrap_or("unnamed"), p.port))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        tracing::info!(
+            namespace = %namespace,
+            name = %name,
+            service_type = ?spec.type_,
+            ports = ?ports,
+            "Service spec updated, triggering config refresh"
+        );
+    }
+
+    // Trigger configuration regeneration
+    trigger_config_update(&ctx).await?;
+
+    metrics.record_success();
+    Ok(Action::requeue(Duration::from_secs(300))) // Recheck every 5 minutes
+}
+
+/// Handle errors during Service reconciliation.
+pub fn error_policy_service(
+    service: Arc<Service>,
+    error: &ServiceError,
+    _ctx: Arc<Context>,
+) -> Action {
+    let namespace = service.namespace().unwrap_or_default();
+    let name = service.name_any();
+
+    tracing::error!(
+        namespace = %namespace,
+        name = %name,
+        error = %error,
+        "Service reconciliation failed"
+    );
+
+    crate::metrics::RECONCILE_ERRORS_TOTAL
+        .with_label_values(&["Service", "reconcile_error"])
+        .inc();
+
+    Action::requeue(Duration::from_secs(30))
+}
+
+/// Create the Service controller for watching service spec changes.
+pub async fn run_service_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+
+    let api: Api<Service> = if ctx.watch_all_namespaces {
+        Api::all(ctx.client.clone())
+    } else {
+        Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
+    };
+
+    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Service"]).set(1);
+
+    Controller::new(api, Config::default())
+        .run(reconcile_service, error_policy_service, ctx)
+        .for_each(|result| async move {
+            match result {
+                Ok((obj, _)) => {
+                    WATCH_EVENTS_TOTAL
+                        .with_label_values(&["Service", "reconcile_success"])
+                        .inc();
+                    tracing::trace!(
+                        namespace = obj.namespace.as_deref().unwrap_or(""),
+                        name = %obj.name,
+                        "Service reconciled"
+                    );
+                }
+                Err(e) => {
+                    WATCH_EVENTS_TOTAL
+                        .with_label_values(&["Service", "reconcile_error"])
+                        .inc();
+                    WATCH_ERRORS_TOTAL
+                        .with_label_values(&["Service", "controller_error"])
+                        .inc();
+                    tracing::error!(error = %e, "Service controller error");
+                }
+            }
+        })
+        .await;
+
+    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Service"]).set(0);
+
+    Ok(())
+}
