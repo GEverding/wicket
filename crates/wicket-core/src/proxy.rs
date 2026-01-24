@@ -26,6 +26,15 @@ use tracing::{debug, error, info, warn};
 use wicket_config::{Config, LoadBalanceStrategy, UpstreamConfig};
 use wicket_tls::CertManager;
 
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use std::os::unix::io::RawFd;
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use std::sync::Mutex;
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use volt_sockmap::SocketMap;
+
 /// Per-request context for the Wicket proxy.
 ///
 /// This struct carries request-specific information through the entire request lifecycle,
@@ -59,6 +68,18 @@ pub struct WicketCtx {
     /// Whether we've already decremented the active request counter.
     /// Prevents double-decrement on error paths.
     pub metrics_recorded: bool,
+
+    /// Whether eBPF sockmap is registered for this connection.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub ebpf_registered: bool,
+
+    /// Client socket FD (for sockmap unregistration).
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub client_fd: Option<RawFd>,
+
+    /// Upstream socket FD (for sockmap unregistration).
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub upstream_fd: Option<RawFd>,
 }
 
 /// The main Wicket proxy service.
@@ -71,6 +92,10 @@ pub struct WicketProxy {
 
     /// TLS certificate manager (if TLS is enabled)
     cert_manager: Option<Arc<CertManager>>,
+
+    /// eBPF sockmap for kernel-level proxying (Linux only)
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    sockmap: Option<Arc<Mutex<SocketMap>>>,
 }
 
 /// An upstream cluster with load balancing and health checking.
@@ -110,12 +135,21 @@ impl WicketProxy {
             router: ArcSwap::new(Arc::new(router)),
             upstreams: ArcSwap::new(Arc::new(upstreams)),
             cert_manager: None,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            sockmap: None,
         })
     }
 
     /// Set the TLS certificate manager.
     pub fn with_cert_manager(mut self, manager: Arc<CertManager>) -> Self {
         self.cert_manager = Some(manager);
+        self
+    }
+
+    /// Set the eBPF sockmap for kernel-level proxying.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub fn with_sockmap(mut self, sockmap: SocketMap) -> Self {
+        self.sockmap = Some(Arc::new(Mutex::new(sockmap)));
         self
     }
 
@@ -250,6 +284,12 @@ impl ProxyHttp for WicketProxy {
             method: String::new(),
             upstream_connect_time: None,
             metrics_recorded: false,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            ebpf_registered: false,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            client_fd: None,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            upstream_fd: None,
         }
     }
 
@@ -370,10 +410,57 @@ impl ProxyHttp for WicketProxy {
         Ok(Box::new(peer))
     }
 
+    /// Called after successfully connecting to upstream.
+    /// Register socket pair with eBPF sockmap for kernel-level proxying.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    async fn connected_to_upstream(
+        &self,
+        session: &mut Session,
+        _reused: bool,
+        _peer: &HttpPeer,
+        upstream_fd: std::os::unix::io::RawFd,
+        _digest: Option<&pingora_core::protocols::Digest>,
+        ctx: &mut Self::CTX,
+    ) -> PingoraResult<()> {
+        use std::os::unix::io::AsRawFd;
+
+        if let Some(ref sockmap) = self.sockmap {
+            // Get client FD from downstream session (only works for HTTP/1.1)
+            if let Some(stream) = session.as_downstream().stream() {
+                let client_fd = stream.as_raw_fd();
+
+                if let Ok(mut sm) = sockmap.lock() {
+                    if sm.register_pair(client_fd, upstream_fd).is_ok() {
+                        ctx.ebpf_registered = true;
+                        ctx.client_fd = Some(client_fd);
+                        ctx.upstream_fd = Some(upstream_fd);
+                        debug!(
+                            request_id = %ctx.request_id,
+                            "eBPF sockmap registered for kernel-level proxying"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX)
     where
         Self::CTX: Send + Sync,
     {
+        // Unregister eBPF sockmap if registered
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if ctx.ebpf_registered {
+            if let (Some(client_fd), Some(upstream_fd)) = (ctx.client_fd, ctx.upstream_fd) {
+                if let Some(ref sockmap) = self.sockmap {
+                    if let Ok(mut sm) = sockmap.lock() {
+                        let _ = sm.unregister_pair(client_fd, upstream_fd);
+                    }
+                }
+            }
+        }
+
         // Prevent double recording
         if ctx.metrics_recorded {
             return;
