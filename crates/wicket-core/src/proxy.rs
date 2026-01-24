@@ -2,6 +2,12 @@
 //!
 //! This module implements the core proxy functionality using Pingora's HttpProxy trait.
 
+use crate::metrics::{
+    BYTES_RECEIVED_TOTAL, BYTES_SENT_TOTAL, CLIENT_CONNECTIONS_ACTIVE, CLIENT_CONNECTIONS_TOTAL,
+    HTTP_ERRORS_TOTAL, HTTP_REQUESTS_ACTIVE, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS,
+    ROUTE_NOT_FOUND_TOTAL, UPSTREAM_CONNECTIONS_ACTIVE, UPSTREAM_DURATION_SECONDS,
+    UPSTREAM_ERRORS_TOTAL,
+};
 use crate::routing::{RouteMatch, Router};
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -43,6 +49,16 @@ pub struct WicketCtx {
     /// Generated as a hex-encoded nanosecond timestamp, ensuring uniqueness
     /// across requests for correlation in logs and distributed tracing.
     pub request_id: String,
+
+    /// HTTP method for this request (cached for metrics).
+    pub method: String,
+
+    /// Start time when we connected to upstream (for upstream duration metric).
+    pub upstream_connect_time: Option<std::time::Instant>,
+
+    /// Whether we've already decremented the active request counter.
+    /// Prevents double-decrement on error paths.
+    pub metrics_recorded: bool,
 }
 
 /// The main Wicket proxy service.
@@ -218,10 +234,22 @@ impl ProxyHttp for WicketProxy {
     type CTX = WicketCtx;
 
     fn new_ctx(&self) -> Self::CTX {
+        // Increment active connection counter
+        // Note: "default" listener since we don't have listener info here
+        CLIENT_CONNECTIONS_ACTIVE
+            .with_label_values(&["default"])
+            .inc();
+        CLIENT_CONNECTIONS_TOTAL
+            .with_label_values(&["default"])
+            .inc();
+
         WicketCtx {
             route_match: None,
             start_time: std::time::Instant::now(),
             request_id: generate_request_id(),
+            method: String::new(),
+            upstream_connect_time: None,
+            metrics_recorded: false,
         }
     }
 
@@ -240,6 +268,9 @@ impl ProxyHttp for WicketProxy {
 
         let path = req_header.uri.path();
         let method = req_header.method.as_str();
+
+        // Store method for metrics
+        ctx.method = method.to_string();
 
         // Match route
         let router = self.router.load();
@@ -262,6 +293,10 @@ impl ProxyHttp for WicketProxy {
         let route_match = router.match_request(host, path, method, &headers);
 
         if let Some(ref rm) = route_match {
+            // Increment active requests for this route
+            let route_label = rm.route_name.as_deref().unwrap_or(&rm.upstream);
+            HTTP_REQUESTS_ACTIVE.with_label_values(&[route_label]).inc();
+
             debug!(
                 request_id = %ctx.request_id,
                 route = ?rm.route_name,
@@ -272,6 +307,9 @@ impl ProxyHttp for WicketProxy {
                 "Request matched route"
             );
         } else {
+            // Track route not found
+            ROUTE_NOT_FOUND_TOTAL.inc();
+
             warn!(
                 request_id = %ctx.request_id,
                 method = %method,
@@ -305,12 +343,23 @@ impl ProxyHttp for WicketProxy {
         let key = session.req_header().uri.path().as_bytes();
 
         let peer = self.get_peer(&route_match.upstream, key).ok_or_else(|| {
+            // Track upstream error
+            UPSTREAM_ERRORS_TOTAL
+                .with_label_values(&[&route_match.upstream, "no_healthy_backends"])
+                .inc();
+
             error!(
                 upstream = %route_match.upstream,
                 "No healthy backends available"
             );
             Error::new(ErrorType::HTTPStatus(503))
         })?;
+
+        // Track upstream connection and start timing
+        UPSTREAM_CONNECTIONS_ACTIVE
+            .with_label_values(&[&route_match.upstream])
+            .inc();
+        ctx.upstream_connect_time = Some(std::time::Instant::now());
 
         debug!(
             request_id = %ctx.request_id,
@@ -321,11 +370,18 @@ impl ProxyHttp for WicketProxy {
         Ok(Box::new(peer))
     }
 
-    async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX)
+    async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX)
     where
         Self::CTX: Send + Sync,
     {
+        // Prevent double recording
+        if ctx.metrics_recorded {
+            return;
+        }
+        ctx.metrics_recorded = true;
+
         let duration = ctx.start_time.elapsed();
+        let duration_secs = duration.as_secs_f64();
         let req_header = session.req_header();
 
         let status = session
@@ -333,7 +389,11 @@ impl ProxyHttp for WicketProxy {
             .map(|r| r.status.as_u16())
             .unwrap_or(0);
 
-        let method = req_header.method.as_str();
+        let method = if ctx.method.is_empty() {
+            req_header.method.as_str()
+        } else {
+            &ctx.method
+        };
         let path = req_header.uri.path();
         let host = req_header
             .headers
@@ -341,17 +401,98 @@ impl ProxyHttp for WicketProxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("-");
 
-        let route_name = ctx
+        let route_label = ctx
             .route_match
             .as_ref()
             .and_then(|r| r.route_name.as_deref())
-            .unwrap_or("-");
+            .or_else(|| ctx.route_match.as_ref().map(|r| r.upstream.as_str()))
+            .unwrap_or("unknown");
 
         let upstream = ctx
             .route_match
             .as_ref()
             .map(|r| r.upstream.as_str())
-            .unwrap_or("-");
+            .unwrap_or("unknown");
+
+        let status_str = status.to_string();
+
+        // Record request total
+        HTTP_REQUESTS_TOTAL
+            .with_label_values(&[method, route_label, &status_str])
+            .inc();
+
+        // Record request duration
+        HTTP_REQUEST_DURATION_SECONDS
+            .with_label_values(&[method, route_label])
+            .observe(duration_secs);
+
+        // Decrement active requests
+        if ctx.route_match.is_some() {
+            HTTP_REQUESTS_ACTIVE.with_label_values(&[route_label]).dec();
+        }
+
+        // Record upstream duration if we connected
+        if let Some(upstream_start) = ctx.upstream_connect_time {
+            let upstream_duration = upstream_start.elapsed().as_secs_f64();
+            UPSTREAM_DURATION_SECONDS
+                .with_label_values(&[upstream])
+                .observe(upstream_duration);
+
+            // Decrement upstream connection counter
+            UPSTREAM_CONNECTIONS_ACTIVE
+                .with_label_values(&[upstream])
+                .dec();
+        }
+
+        // Record errors (4xx, 5xx)
+        if status >= 400 {
+            let error_type = if status >= 500 {
+                "server_error"
+            } else {
+                "client_error"
+            };
+            HTTP_ERRORS_TOTAL
+                .with_label_values(&[method, route_label, &status_str, error_type])
+                .inc();
+        }
+
+        // Record upstream errors if there was an error connecting
+        if let Some(e) = error {
+            let error_type = match e.etype() {
+                ErrorType::ConnectTimedout => "connect_timeout",
+                ErrorType::ReadTimedout => "read_timeout",
+                ErrorType::WriteTimedout => "write_timeout",
+                ErrorType::ConnectRefused => "connect_refused",
+                ErrorType::ConnectionClosed => "connection_closed",
+                _ => "other",
+            };
+            UPSTREAM_ERRORS_TOTAL
+                .with_label_values(&[upstream, error_type])
+                .inc();
+        }
+
+        // Record bytes (approximate from content-length headers if available)
+        // Note: For accurate byte counting, we'd need to track actual bytes in
+        // upstream_request_filter and upstream_response_filter
+        if let Some(resp) = session.response_written() {
+            if let Some(cl) = resp.headers.get("content-length") {
+                if let Ok(bytes) = cl.to_str().unwrap_or("0").parse::<u64>() {
+                    BYTES_SENT_TOTAL.with_label_values(&[route_label]).inc_by(bytes);
+                }
+            }
+        }
+        if let Some(cl) = req_header.headers.get("content-length") {
+            if let Ok(bytes) = cl.to_str().unwrap_or("0").parse::<u64>() {
+                BYTES_RECEIVED_TOTAL
+                    .with_label_values(&[route_label])
+                    .inc_by(bytes);
+            }
+        }
+
+        // Decrement connection counter
+        CLIENT_CONNECTIONS_ACTIVE
+            .with_label_values(&["default"])
+            .dec();
 
         info!(
             request_id = %ctx.request_id,
@@ -360,7 +501,7 @@ impl ProxyHttp for WicketProxy {
             host = %host,
             status = status,
             duration_ms = duration.as_millis() as u64,
-            route = %route_name,
+            route = %route_label,
             upstream = %upstream,
             "Request completed"
         );

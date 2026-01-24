@@ -1,0 +1,52 @@
+[package]
+name = "wicket-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kubernetes Gateway API controller for Wicket"
+
+[[bin]]
+name = "wicket-controller"
+path = "src/main.rs"
+
+[dependencies]
+wicket-config = { workspace = true }
+
+# Kubernetes client and controller runtime
+kube = { version = "0.98", features = ["runtime", "derive", "client"] }
+k8s-openapi = { version = "0.24", features = ["latest"] }
+
+# JSON schema for CRD generation
+schemars = "0.8"
+
+# Async runtime
+tokio = { workspace = true }
+futures = "0.3"
+
+# Serialization
+serde = { workspace = true }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = { workspace = true }
+
+# Logging / Telemetry
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Metrics
+prometheus = "0.13"
+lazy_static = "1.4"
+
+# HTTP server for metrics endpoint
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Utilities
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio-test = "0.4"

@@ -113,6 +113,119 @@ pub struct RouteConfig {
     /// Per-route TLS configuration
     #[serde(default)]
     pub tls: Option<RouteTlsConfig>,
+
+    /// Request/response filters to apply
+    #[serde(default)]
+    pub filters: Option<RouteFilters>,
+
+    /// Request timeout in seconds
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
+/// Filters that can be applied to requests and responses.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RouteFilters {
+    /// Modify request headers
+    #[serde(default)]
+    pub request_headers: Option<HeaderModifier>,
+
+    /// Modify response headers
+    #[serde(default)]
+    pub response_headers: Option<HeaderModifier>,
+
+    /// Redirect the request
+    #[serde(default)]
+    pub redirect: Option<RedirectFilter>,
+
+    /// Rewrite the URL
+    #[serde(default)]
+    pub url_rewrite: Option<UrlRewriteFilter>,
+
+    /// Mirror traffic to another backend
+    #[serde(default)]
+    pub mirror: Option<MirrorFilter>,
+}
+
+/// Header modification filter.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HeaderModifier {
+    /// Headers to add (appends to existing)
+    #[serde(default)]
+    pub add: HashMap<String, String>,
+
+    /// Headers to set (overwrites existing)
+    #[serde(default)]
+    pub set: HashMap<String, String>,
+
+    /// Headers to remove
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// Redirect filter configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RedirectFilter {
+    /// Scheme to redirect to (http or https)
+    #[serde(default)]
+    pub scheme: Option<String>,
+
+    /// Hostname to redirect to
+    #[serde(default)]
+    pub hostname: Option<String>,
+
+    /// Port to redirect to
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// Path replacement type
+    #[serde(default)]
+    pub path: Option<PathModifier>,
+
+    /// HTTP status code (301, 302, 303, 307, 308)
+    #[serde(default = "default_redirect_status")]
+    pub status_code: u16,
+}
+
+fn default_redirect_status() -> u16 {
+    302
+}
+
+/// Path modification for redirects and rewrites.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathModifier {
+    /// Replace the entire path
+    ReplaceFullPath(String),
+    /// Replace the matched prefix
+    ReplacePrefixMatch(String),
+}
+
+/// URL rewrite filter configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UrlRewriteFilter {
+    /// Hostname to rewrite to
+    #[serde(default)]
+    pub hostname: Option<String>,
+
+    /// Path modification
+    #[serde(default)]
+    pub path: Option<PathModifier>,
+}
+
+/// Request mirroring filter configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MirrorFilter {
+    /// Upstream to mirror traffic to
+    pub upstream: String,
+
+    /// Percentage of traffic to mirror (1-100)
+    #[serde(default = "default_mirror_percent")]
+    pub percent: u8,
+}
+
+fn default_mirror_percent() -> u8 {
+    100
 }
 
 /// Per-route TLS configuration.

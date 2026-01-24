@@ -1,0 +1,18 @@
+{{- if and .Values.controller.enabled .Values.controller.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "wicket.controller.name" . }}-metrics
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.controller.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: {{ .Values.controller.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "wicket.controller.selectorLabels" . | nindent 4 }}
+{{- end }}

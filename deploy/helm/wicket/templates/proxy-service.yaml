@@ -1,0 +1,27 @@
+{{- if .Values.proxy.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "wicket.proxy.name" . }}
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.proxy.labels" . | nindent 4 }}
+  {{- with .Values.proxy.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.proxy.service.type }}
+  ports:
+    {{- range .Values.proxy.service.ports }}
+    - name: {{ .name }}
+      port: {{ .port }}
+      targetPort: {{ .targetPort }}
+      protocol: {{ .protocol }}
+      {{- if and (eq $.Values.proxy.service.type "NodePort") .nodePort }}
+      nodePort: {{ .nodePort }}
+      {{- end }}
+    {{- end }}
+  selector:
+    {{- include "wicket.proxy.selectorLabels" . | nindent 4 }}
+{{- end }}
