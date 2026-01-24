@@ -1,0 +1,248 @@
+//! Wicket Kubernetes Gateway API Controller
+//!
+//! This binary runs the Kubernetes controller that watches Gateway API resources
+//! and generates Wicket configuration.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use clap::Parser;
+use kube::Client;
+use tokio::signal;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+use wicket_controller::{
+    metrics::{
+        register_metrics, serve_metrics, CONTROLLER_IS_LEADER, CONTROLLER_UPTIME_SECONDS,
+        CONFIG_SYNC_LAG_SECONDS,
+    },
+    reconcilers::{
+        run_endpoints_controller, run_gateway_class_controller, run_gateway_controller,
+        run_httproute_controller, run_referencegrant_controller, run_secret_controller,
+        run_tcproute_controller, run_tlsroute_controller, Context,
+    },
+};
+
+/// Wicket Gateway API Controller
+#[derive(Parser, Debug)]
+#[command(name = "wicket-controller")]
+#[command(about = "Kubernetes Gateway API controller for Wicket")]
+#[command(version)]
+struct Args {
+    /// Metrics server listen address
+    #[arg(long, default_value = "0.0.0.0:8081")]
+    metrics_addr: SocketAddr,
+
+    /// Namespace the controller is deployed in
+    #[arg(long, env = "POD_NAMESPACE", default_value = "wicket-system")]
+    namespace: String,
+
+    /// Watch all namespaces (if false, only watches controller namespace)
+    #[arg(long, default_value = "true")]
+    watch_all_namespaces: bool,
+
+    /// Name of the ConfigMap to update with proxy configuration
+    #[arg(long, default_value = "wicket-proxy-config")]
+    config_configmap_name: String,
+
+    /// Namespace of the ConfigMap to update (defaults to controller namespace)
+    #[arg(long)]
+    config_configmap_namespace: Option<String>,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, short = 'l', default_value = "info")]
+    log_level: String,
+
+    /// Enable JSON log format
+    #[arg(long)]
+    json_logs: bool,
+
+    /// Enable leader election (for HA deployments)
+    #[arg(long, default_value = "true")]
+    leader_election: bool,
+
+    /// Leader election lease name
+    #[arg(long, default_value = "wicket-controller-leader")]
+    leader_election_name: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    // Initialize logging
+    init_logging(&args.log_level, args.json_logs)?;
+
+    // Determine ConfigMap namespace (default to controller namespace)
+    let config_configmap_namespace = args
+        .config_configmap_namespace
+        .clone()
+        .unwrap_or_else(|| args.namespace.clone());
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        namespace = %args.namespace,
+        watch_all_namespaces = args.watch_all_namespaces,
+        config_configmap_name = %args.config_configmap_name,
+        config_configmap_namespace = %config_configmap_namespace,
+        "Starting Wicket Gateway API Controller"
+    );
+
+    // Register Prometheus metrics
+    register_metrics().expect("Failed to register metrics");
+
+    // Create Kubernetes client
+    let client = Client::try_default().await?;
+    tracing::info!("Connected to Kubernetes API server");
+
+    // Create shared context
+    let ctx = Arc::new(Context::new(
+        client.clone(),
+        args.namespace.clone(),
+        args.watch_all_namespaces,
+        args.config_configmap_name.clone(),
+        config_configmap_namespace.clone(),
+    ));
+
+    // Mark as leader (simplified - in production use proper leader election)
+    CONTROLLER_IS_LEADER.set(1);
+
+    // Track uptime and config sync lag
+    let start_time = std::time::Instant::now();
+    tokio::spawn(async move {
+        let mut last_config_generation: i64 = 0;
+        let mut last_config_update_time = std::time::Instant::now();
+
+        loop {
+            CONTROLLER_UPTIME_SECONDS.set(start_time.elapsed().as_secs() as i64);
+
+            // Check if config has been updated by comparing generation
+            let current_generation =
+                wicket_controller::metrics::CONFIG_GENERATION.get();
+            if current_generation != last_config_generation {
+                last_config_generation = current_generation;
+                last_config_update_time = std::time::Instant::now();
+            }
+
+            // Track time since last successful config sync
+            CONFIG_SYNC_LAG_SECONDS.set(last_config_update_time.elapsed().as_secs() as i64);
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+
+    // Start metrics server
+    let metrics_addr = args.metrics_addr;
+    tokio::spawn(async move {
+        if let Err(e) = serve_metrics(metrics_addr).await {
+            tracing::error!(error = %e, "Metrics server failed");
+        }
+    });
+    tracing::info!(addr = %args.metrics_addr, "Metrics server started");
+
+    // Run all controllers concurrently
+    tracing::info!("Starting controllers");
+
+    let gc_ctx = ctx.clone();
+    let gw_ctx = ctx.clone();
+    let http_route_ctx = ctx.clone();
+    let tcp_route_ctx = ctx.clone();
+    let tls_route_ctx = ctx.clone();
+    let endpoints_ctx = ctx.clone();
+    let secret_ctx = ctx.clone();
+    let refgrant_ctx = ctx.clone();
+
+    tokio::select! {
+        result = run_gateway_class_controller(gc_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "GatewayClass controller failed");
+            }
+        }
+        result = run_gateway_controller(gw_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "Gateway controller failed");
+            }
+        }
+        result = run_httproute_controller(http_route_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "HTTPRoute controller failed");
+            }
+        }
+        result = run_tcproute_controller(tcp_route_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "TCPRoute controller failed");
+            }
+        }
+        result = run_tlsroute_controller(tls_route_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "TLSRoute controller failed");
+            }
+        }
+        result = run_endpoints_controller(endpoints_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "Endpoints controller failed");
+            }
+        }
+        result = run_secret_controller(secret_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "Secret controller failed");
+            }
+        }
+        result = run_referencegrant_controller(refgrant_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "ReferenceGrant controller failed");
+            }
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("Received shutdown signal");
+        }
+    }
+
+    tracing::info!("Wicket controller shutting down");
+    Ok(())
+}
+
+/// Initialize logging with the specified level and format.
+fn init_logging(level: &str, json: bool) -> anyhow::Result<()> {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(level));
+
+    if json {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
+
+    Ok(())
+}
+
+/// Wait for shutdown signal (SIGTERM or SIGINT).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}

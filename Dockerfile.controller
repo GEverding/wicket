@@ -1,0 +1,74 @@
+# Wicket Gateway API Controller Dockerfile
+# Multi-stage build for minimal runtime image
+
+# Stage 1: Build
+FROM rust:1.85-slim-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy manifests first for layer caching
+COPY Cargo.toml Cargo.lock ./
+COPY crates/wicket-config/Cargo.toml crates/wicket-config/
+COPY crates/wicket-controller/Cargo.toml crates/wicket-controller/
+
+# Create dummy source files to build dependencies
+RUN mkdir -p crates/wicket-config/src crates/wicket-controller/src && \
+    echo "pub fn dummy() {}" > crates/wicket-config/src/lib.rs && \
+    echo "fn main() {}" > crates/wicket-controller/src/main.rs && \
+    echo "pub fn dummy() {}" > crates/wicket-controller/src/lib.rs
+
+# Build dependencies only (cached layer)
+RUN cargo build --release --package wicket-controller 2>/dev/null || true
+
+# Copy actual source code
+COPY crates/wicket-config crates/wicket-config
+COPY crates/wicket-controller crates/wicket-controller
+
+# Touch source files to ensure rebuild
+RUN touch crates/wicket-config/src/lib.rs crates/wicket-controller/src/main.rs crates/wicket-controller/src/lib.rs
+
+# Build the controller binary
+RUN cargo build --release --package wicket-controller
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -g 65532 wicket && \
+    useradd -u 65532 -g wicket -s /sbin/nologin wicket
+
+# Create directories for TLS certificates and config
+RUN mkdir -p /etc/wicket /tmp/wicket/tls && \
+    chown -R wicket:wicket /etc/wicket /tmp/wicket
+
+# Copy binary from builder
+COPY --from=builder /build/target/release/wicket-controller /usr/local/bin/wicket-controller
+
+# Use non-root user
+USER wicket
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget -q --spider http://localhost:8081/healthz || exit 1
+
+# Default command
+ENTRYPOINT ["/usr/local/bin/wicket-controller"]
+
+# Expose metrics port
+EXPOSE 8081
+
+# Labels
+LABEL org.opencontainers.image.title="Wicket Gateway API Controller"
+LABEL org.opencontainers.image.description="Kubernetes Gateway API controller for Wicket"
+LABEL org.opencontainers.image.source="https://github.com/geverding/wicket"
