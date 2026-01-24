@@ -2,18 +2,22 @@
 //!
 //! Each reconciler is responsible for watching and reconciling a specific resource type.
 
-mod gateway_class;
-mod gateway;
-mod httproute;
-mod service;
-mod secret;
 mod config_generator;
 mod context;
+mod gateway;
+mod gateway_class;
+mod httproute;
+mod secret;
+mod service;
+mod tcproute;
+mod tlsroute;
 
-pub use gateway_class::*;
-pub use gateway::*;
-pub use httproute::*;
-pub use service::*;
-pub use secret::*;
 pub use config_generator::*;
 pub use context::*;
+pub use gateway::*;
+pub use gateway_class::*;
+pub use httproute::*;
+pub use secret::*;
+pub use service::*;
+pub use tcproute::*;
+pub use tlsroute::*;
