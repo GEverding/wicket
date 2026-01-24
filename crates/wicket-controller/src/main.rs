@@ -15,7 +15,7 @@ use wicket_controller::{
     metrics::{register_metrics, serve_metrics, CONTROLLER_IS_LEADER, CONTROLLER_UPTIME_SECONDS},
     reconcilers::{
         run_endpoints_controller, run_gateway_class_controller, run_gateway_controller,
-        run_httproute_controller, Context,
+        run_httproute_controller, run_secret_controller, Context,
     },
 };
 
@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let gw_ctx = ctx.clone();
     let route_ctx = ctx.clone();
     let endpoints_ctx = ctx.clone();
+    let secret_ctx = ctx.clone();
 
     tokio::select! {
         result = run_gateway_class_controller(gc_ctx) => {
@@ -137,6 +138,11 @@ async fn main() -> anyhow::Result<()> {
         result = run_endpoints_controller(endpoints_ctx) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "Endpoints controller failed");
+            }
+        }
+        result = run_secret_controller(secret_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "Secret controller failed");
             }
         }
         _ = shutdown_signal() => {

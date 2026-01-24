@@ -6,6 +6,7 @@ mod gateway_class;
 mod gateway;
 mod httproute;
 mod service;
+mod secret;
 mod config_generator;
 mod context;
 
@@ -13,5 +14,6 @@ pub use gateway_class::*;
 pub use gateway::*;
 pub use httproute::*;
 pub use service::*;
+pub use secret::*;
 pub use config_generator::*;
 pub use context::*;
