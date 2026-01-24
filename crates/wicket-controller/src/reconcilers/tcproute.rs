@@ -17,7 +17,7 @@ use crate::crds::{
     Condition, Gateway, GatewayClass, ParentReference, RouteParentStatus, TCPRoute,
     TCPRouteStatus, WICKET_CONTROLLER_NAME,
 };
-use crate::metrics::{ReconcileMetrics, TCPROUTES_TOTAL};
+use crate::metrics::{ReconcileMetrics, TCPROUTES_TOTAL, ROUTES_ACCEPTED, ROUTES_REJECTED_TOTAL};
 
 use super::config_generator::GatewayState;
 use super::context::Context;
@@ -145,8 +145,29 @@ pub async fn reconcile_tcproute(
     if has_valid_parent {
         trigger_config_update(&ctx).await?;
         tracing::info!(namespace = %namespace, name = %name, "TCPRoute accepted");
+
+        // Update route acceptance metrics for each valid parent
+        for parent_status in &status.parents {
+            let gw_name = &parent_status.parent_ref.name;
+            if parent_status.conditions.iter().any(|c| c.type_ == "Accepted" && c.status == "True") {
+                ROUTES_ACCEPTED
+                    .with_label_values(&[&namespace, "TCPRoute", gw_name])
+                    .set(1);
+            }
+        }
     } else {
         tracing::warn!(namespace = %namespace, name = %name, "TCPRoute has no valid Wicket parents");
+
+        // Track rejection reasons
+        for parent_status in &status.parents {
+            for condition in &parent_status.conditions {
+                if condition.type_ == "Accepted" && condition.status == "False" {
+                    ROUTES_REJECTED_TOTAL
+                        .with_label_values(&[&namespace, "TCPRoute", &condition.reason])
+                        .inc();
+                }
+            }
+        }
     }
 
     metrics.record_success();
