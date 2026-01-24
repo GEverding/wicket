@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "L4 TCP stream proxying for Wicket"
 
+[features]
+default = []
+ebpf = ["volt-sockmap"]
+
 [dependencies]
 # Workspace crates
 wicket-config = { path = "../wicket-config" }
@@ -20,6 +24,7 @@ socket2 = { version = "0.5", features = ["all"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+volt-sockmap = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }
