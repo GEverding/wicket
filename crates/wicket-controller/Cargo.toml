@@ -48,5 +48,11 @@ clap = { workspace = true, features = ["env"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 
+# Hostname lookup for leader election
+hostname = "0.4"
+
+# X.509 certificate parsing
+x509-parser = "0.16"
+
 [dev-dependencies]
 tokio-test = "0.4"

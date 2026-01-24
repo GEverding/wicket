@@ -286,13 +286,42 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
 
     info!(
         address = %config.server.listen,
-        "Proxy listening"
+        "HTTP proxy listening"
     );
 
-    // TODO: Add HTTPS listener if TLS is enabled
-    // This requires understanding Pingora's TLS listener API
-    // The CertManager implements rustls::server::ResolvesServerCert
-    // and can be passed to rustls ServerConfig for HTTPS support
+    // Add HTTPS listener if TLS is enabled with file-based certificates
+    if let Some(ref tls_config) = config.tls {
+        if let Some(ref file_config) = tls_config.file {
+            // Use the first certificate as the default for the HTTPS listener
+            if let Some(first_cert) = file_config.certs.first() {
+                // HTTPS listens on port 443 by default, or calculate from HTTP port
+                let https_port = if config.server.listen.port() == 80 {
+                    443
+                } else {
+                    config.server.listen.port() + 363 // e.g., 8080 -> 8443
+                };
+                let https_addr = format!("{}:{}", config.server.listen.ip(), https_port);
+
+                let cert_path = first_cert.cert.to_str().unwrap_or("");
+                let key_path = first_cert.key.to_str().unwrap_or("");
+
+                // add_tls uses TlsSettings::intermediate internally
+                if let Err(e) = proxy_service.add_tls(&https_addr, cert_path, key_path) {
+                    error!(
+                        error = %e,
+                        cert = %first_cert.cert.display(),
+                        "Failed to configure TLS listener, HTTPS disabled"
+                    );
+                } else {
+                    info!(
+                        address = %https_addr,
+                        cert = %first_cert.cert.display(),
+                        "HTTPS proxy listening"
+                    );
+                }
+            }
+        }
+    }
 
     // Add service to server
     server.add_service(proxy_service);
