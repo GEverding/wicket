@@ -224,6 +224,10 @@ pub struct RouteMatchConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
 
+    /// Regular expression path match
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_regex: Option<String>,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<String>,
 
@@ -612,6 +616,7 @@ impl GatewayState {
                                 host: route.spec.hostnames.first().cloned(),
                                 path: None,
                                 path_prefix: Some("/".to_string()),
+                                path_regex: None,
                                 methods: vec![],
                                 headers: HashMap::new(),
                             },
@@ -622,21 +627,21 @@ impl GatewayState {
                         routes.push(route_config);
                     } else {
                         for (match_idx, route_match) in rule.matches.iter().enumerate() {
-                            let (path, path_prefix) = if let Some(ref path_match) = route_match.path {
+                            let (path, path_prefix, path_regex) = if let Some(ref path_match) = route_match.path {
                                 match path_match.type_ {
                                     crate::crds::PathMatchType::Exact => {
-                                        (Some(path_match.value.clone()), None)
+                                        (Some(path_match.value.clone()), None, None)
                                     }
                                     crate::crds::PathMatchType::PathPrefix => {
-                                        (None, Some(path_match.value.clone()))
+                                        (None, Some(path_match.value.clone()), None)
                                     }
                                     crate::crds::PathMatchType::RegularExpression => {
-                                        // TODO: Support regex paths
-                                        (None, Some(path_match.value.clone()))
+                                        // Support regex paths
+                                        (None, None, Some(path_match.value.clone()))
                                     }
                                 }
                             } else {
-                                (None, Some("/".to_string()))
+                                (None, Some("/".to_string()), None)
                             };
 
                             let methods: Vec<String> = route_match.method.iter()
@@ -657,6 +662,7 @@ impl GatewayState {
                                     host: route.spec.hostnames.first().cloned(),
                                     path,
                                     path_prefix,
+                                    path_regex,
                                     methods,
                                     headers,
                                 },

@@ -4,7 +4,9 @@
 //! and generates Wicket configuration.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use kube::Client;
@@ -12,6 +14,7 @@ use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use wicket_controller::{
+    leader_election::{LeaderElection, LeaderElectionConfig},
     metrics::{
         register_metrics, serve_metrics, CONTROLLER_IS_LEADER, CONTROLLER_UPTIME_SECONDS,
         CONFIG_SYNC_LAG_SECONDS,
@@ -19,7 +22,7 @@ use wicket_controller::{
     reconcilers::{
         run_endpoints_controller, run_gateway_class_controller, run_gateway_controller,
         run_httproute_controller, run_referencegrant_controller, run_secret_controller,
-        run_tcproute_controller, run_tlsroute_controller, Context,
+        run_service_controller, run_tcproute_controller, run_tlsroute_controller, Context,
     },
 };
 
@@ -104,8 +107,77 @@ async fn main() -> anyhow::Result<()> {
         config_configmap_namespace.clone(),
     ));
 
-    // Mark as leader (simplified - in production use proper leader election)
-    CONTROLLER_IS_LEADER.set(1);
+    // Set up leader election if enabled
+    let is_leader = Arc::new(AtomicBool::new(false));
+    let is_leader_clone = is_leader.clone();
+
+    if args.leader_election {
+        // Get pod name from environment (set by Kubernetes downward API)
+        let holder_id = std::env::var("POD_NAME").unwrap_or_else(|_| {
+            // Fallback to hostname if POD_NAME not set
+            hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| format!("wicket-controller-{}", std::process::id()))
+        });
+
+        tracing::info!(
+            lease_name = %args.leader_election_name,
+            holder_id = %holder_id,
+            namespace = %args.namespace,
+            "Starting leader election"
+        );
+
+        let config = LeaderElectionConfig {
+            lease_name: args.leader_election_name.clone(),
+            namespace: args.namespace.clone(),
+            holder_identity: holder_id,
+            lease_duration: Duration::from_secs(15),
+            retry_period: Duration::from_secs(2),
+            renew_deadline: Duration::from_secs(10),
+        };
+        let leader_election = LeaderElection::new(client.clone(), config);
+
+        // Spawn leader election task
+        let is_leader_election = is_leader.clone();
+        tokio::spawn(async move {
+            loop {
+                match leader_election.try_acquire_or_renew().await {
+                    Ok(state) => {
+                        let was_leader = is_leader_election.load(Ordering::Relaxed);
+                        let now_leader = state.is_leader;
+
+                        if now_leader && !was_leader {
+                            tracing::info!("Acquired leadership");
+                        } else if !now_leader && was_leader {
+                            tracing::warn!(
+                                current_holder = ?state.holder,
+                                "Lost leadership"
+                            );
+                        }
+
+                        is_leader_election.store(now_leader, Ordering::Relaxed);
+                        CONTROLLER_IS_LEADER.set(if now_leader { 1 } else { 0 });
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Leader election error");
+                        is_leader_election.store(false, Ordering::Relaxed);
+                        CONTROLLER_IS_LEADER.set(0);
+                    }
+                }
+                // Renew every 5 seconds (lease TTL is 15 seconds)
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        // Wait for initial leader election
+        tracing::info!("Waiting for leader election...");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    } else {
+        // Leader election disabled - act as leader
+        tracing::info!("Leader election disabled, acting as leader");
+        is_leader.store(true, Ordering::Relaxed);
+        CONTROLLER_IS_LEADER.set(1);
+    }
 
     // Track uptime and config sync lag
     let start_time = std::time::Instant::now();
@@ -149,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
     let tcp_route_ctx = ctx.clone();
     let tls_route_ctx = ctx.clone();
     let endpoints_ctx = ctx.clone();
+    let service_ctx = ctx.clone();
     let secret_ctx = ctx.clone();
     let refgrant_ctx = ctx.clone();
 
@@ -181,6 +254,11 @@ async fn main() -> anyhow::Result<()> {
         result = run_endpoints_controller(endpoints_ctx) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "Endpoints controller failed");
+            }
+        }
+        result = run_service_controller(service_ctx) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "Service controller failed");
             }
         }
         result = run_secret_controller(secret_ctx) => {
