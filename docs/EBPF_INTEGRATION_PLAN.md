@@ -37,25 +37,69 @@ cargo build --release --features ebpf
 
 ### 1. wicket-core (Pingora / K8s Gateway)
 
-After Pingora establishes upstream connection, register the socket pair for kernel-level data transfer.
+Pingora exposes socket FDs via:
+- **Client FD**: `session.as_downstream().stream().as_raw_fd()`
+- **Upstream FD**: Passed directly to `connected_to_upstream` callback
 
 ```rust
-// Pseudocode - actual integration depends on Pingora's FD access
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use std::os::unix::io::AsRawFd;
+
+// Add to WicketCtx
+pub struct WicketCtx {
+    // ... existing fields ...
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub ebpf_registered: bool,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub client_fd: Option<std::os::unix::io::RawFd>,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub upstream_fd: Option<std::os::unix::io::RawFd>,
+}
+
+#[async_trait]
 impl ProxyHttp for WicketProxy {
-    async fn connected_to_upstream(&self, session: &mut Session, ctx: &mut Ctx) {
-        if let (Some(client_fd), Some(upstream_fd)) = get_fds(session) {
-            ctx.ebpf_registered = self.sockmap.register_pair(client_fd, upstream_fd).is_ok();
+    // Pingora provides upstream_fd directly in this callback
+    async fn connected_to_upstream(
+        &self,
+        session: &mut Session,
+        _reused: bool,
+        _peer: &HttpPeer,
+        #[cfg(unix)] upstream_fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _upstream_fd: std::os::windows::io::RawSocket,
+        _digest: Option<&Digest>,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if let Some(ref sockmap) = self.sockmap {
+            // Get client FD from downstream session
+            if let Some(stream) = session.as_downstream().stream() {
+                let client_fd = stream.as_raw_fd();
+                if let Ok(mut sm) = sockmap.lock() {
+                    if sm.register_pair(client_fd, upstream_fd).is_ok() {
+                        ctx.ebpf_registered = true;
+                        ctx.client_fd = Some(client_fd);
+                        ctx.upstream_fd = Some(upstream_fd);
+                    }
+                }
+            }
         }
+        Ok(())
     }
 
-    async fn logging(&self, session: &Session, ctx: &mut Ctx) {
+    async fn logging(&self, _session: &mut Session, _error: Option<&Error>, ctx: &mut Self::CTX) {
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
         if ctx.ebpf_registered {
-            self.sockmap.unregister_pair(...);
+            if let (Some(client_fd), Some(upstream_fd)) = (ctx.client_fd, ctx.upstream_fd) {
+                if let Some(ref sockmap) = self.sockmap {
+                    let _ = sockmap.lock().map(|mut sm| sm.unregister_pair(client_fd, upstream_fd));
+                }
+            }
         }
+        // ... existing logging code ...
     }
 }
 ```
+
+**Note**: `stream()` returns `None` for HTTP/2 (multiplexed). Sockmap works for HTTP/1.1 and WebSocket.
 
 ### 2. wicket-stream (L4 TCP)
 
@@ -94,8 +138,7 @@ volt-sockmap = { path = "volt/crates/volt-sockmap" }
 
 ---
 
-## Open Questions
+## Notes
 
-1. **Pingora FD access** - Does `Session` expose raw FDs for client/upstream sockets?
-2. **HTTP/2** - Multiplexed streams may not benefit; focus on HTTP/1.1 and WebSocket initially
-3. **Connection lifecycle** - When exactly to register/unregister in Pingora's request flow
+- **HTTP/2**: `session.as_downstream().stream()` returns `None` for H2 (multiplexed). Sockmap only benefits HTTP/1.1 and WebSocket.
+- **Kernel**: Requires Linux 5.10+ with BPF sockmap support
