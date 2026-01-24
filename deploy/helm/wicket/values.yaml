@@ -96,6 +96,18 @@ proxy:
 
   replicaCount: 2
 
+  # Pod labels - added to all proxy pods
+  podLabels: {}
+  # Examples:
+  #   app.kubernetes.io/part-of: my-app
+  #   custom.io/team: platform
+
+  # Pod annotations - added to all proxy pods
+  podAnnotations: {}
+  # Examples:
+  #   prometheus.io/scrape: "true"
+  #   prometheus.io/port: "9090"
+
   # Resource limits and requests
   resources:
     limits:
@@ -122,6 +134,25 @@ proxy:
     # service.beta.kubernetes.io/aws-load-balancer-type: external
     # service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
     # service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    #
+    # For OCI (Oracle Cloud Infrastructure):
+    # oci.oraclecloud.com/load-balancer-type: nlb
+    # oci-network-load-balancer.oraclecloud.com/security-list-management-mode: None
+    # oci-network-load-balancer.oraclecloud.com/internal: "false"
+    # oci-network-load-balancer.oraclecloud.com/subnet: "ocid1.subnet.oc1..."
+    # oci-network-load-balancer.oraclecloud.com/is-preserve-source: "true"
+    # oci-network-load-balancer.oraclecloud.com/backend-set-is-preserve-source: "true"
+    #
+    # For OCI Flexible Load Balancer:
+    # service.beta.kubernetes.io/oci-load-balancer-shape: flexible
+    # service.beta.kubernetes.io/oci-load-balancer-shape-flex-min: "10"
+    # service.beta.kubernetes.io/oci-load-balancer-shape-flex-max: "100"
+    # service.beta.kubernetes.io/oci-load-balancer-internal: "false"
+    # service.beta.kubernetes.io/oci-load-balancer-subnet1: "ocid1.subnet.oc1..."
+    #
+    # For GKE:
+    # cloud.google.com/load-balancer-type: External
+    # networking.gke.io/load-balancer-type: External
     ports:
       - name: http
         port: 80
@@ -145,14 +176,56 @@ proxy:
     enabled: true
     minAvailable: 1
 
-  # Node selector
+  # Node selector - schedule proxy on specific nodes
+  # Examples:
+  #   node-role.kubernetes.io/edge: ""
+  #   topology.kubernetes.io/zone: us-east-1a
+  #   node.kubernetes.io/instance-type: c5.xlarge
   nodeSelector: {}
 
-  # Tolerations
+  # Tolerations - allow scheduling on tainted nodes
+  # Examples for edge nodes:
+  # tolerations:
+  #   - key: "node-role.kubernetes.io/edge"
+  #     operator: "Exists"
+  #     effect: "NoSchedule"
+  #   - key: "dedicated"
+  #     operator: "Equal"
+  #     value: "edge-proxy"
+  #     effect: "NoSchedule"
   tolerations: []
 
-  # Affinity - spread across nodes
+  # Affinity - control pod placement with node and pod affinity rules
+  # Default: spread across nodes for HA
   affinity:
+    # Node affinity examples (uncomment to use):
+    # nodeAffinity:
+    #   # Required: must run on edge nodes
+    #   requiredDuringSchedulingIgnoredDuringExecution:
+    #     nodeSelectorTerms:
+    #       - matchExpressions:
+    #           - key: node-role.kubernetes.io/edge
+    #             operator: Exists
+    #   # Preferred: prefer high-memory nodes
+    #   preferredDuringSchedulingIgnoredDuringExecution:
+    #     - weight: 100
+    #       preference:
+    #         matchExpressions:
+    #           - key: node.kubernetes.io/instance-type
+    #             operator: In
+    #             values:
+    #               - c5.xlarge
+    #               - c5.2xlarge
+    #               - m5.xlarge
+    #     - weight: 50
+    #       preference:
+    #         matchExpressions:
+    #           - key: topology.kubernetes.io/zone
+    #             operator: In
+    #             values:
+    #               - us-east-1a
+    #               - us-east-1b
+    # Pod anti-affinity: spread across nodes
     podAntiAffinity:
       preferredDuringSchedulingIgnoredDuringExecution:
         - weight: 100
@@ -164,6 +237,36 @@ proxy:
                   values:
                     - wicket-proxy
             topologyKey: kubernetes.io/hostname
+
+  # Topology spread constraints - distribute across zones/nodes
+  # Examples:
+  # topologySpreadConstraints:
+  #   - maxSkew: 1
+  #     topologyKey: topology.kubernetes.io/zone
+  #     whenUnsatisfiable: ScheduleAnyway
+  #     labelSelector:
+  #       matchLabels:
+  #         app.kubernetes.io/name: wicket-proxy
+  #   - maxSkew: 1
+  #     topologyKey: kubernetes.io/hostname
+  #     whenUnsatisfiable: DoNotSchedule
+  #     labelSelector:
+  #       matchLabels:
+  #         app.kubernetes.io/name: wicket-proxy
+  topologySpreadConstraints: []
+
+  # Priority class name for pod scheduling priority
+  # Create a PriorityClass first, e.g.:
+  #   apiVersion: scheduling.k8s.io/v1
+  #   kind: PriorityClass
+  #   metadata:
+  #     name: edge-proxy-high
+  #   value: 1000000
+  #   globalDefault: false
+  priorityClassName: ""
+
+  # Termination grace period (seconds) for graceful shutdown
+  terminationGracePeriodSeconds: 30
 
   # Security context
   securityContext:
