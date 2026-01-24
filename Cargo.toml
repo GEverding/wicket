@@ -8,6 +8,7 @@ members = [
     "crates/wicket-stream",
     "crates/wicket-tls",
 ]
+exclude = ["volt"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,6 +20,9 @@ repository = "https://github.com/GEverding/wicket"
 # Internal crates
 wicket-config = { path = "crates/wicket-config" }
 wicket-core = { path = "crates/wicket-core" }
+
+# eBPF sockmap (optional, Linux only)
+volt-sockmap = { path = "volt/crates/volt-sockmap" }
 
 # Pingora framework
 pingora = { version = "0.6", features = ["lb"] }
