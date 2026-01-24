@@ -12,12 +12,14 @@ use foundations::telemetry::{self};
 use foundations::{service_info, BootstrapResult};
 use pingora_core::prelude::*;
 use pingora_core::server::configuration::ServerConf;
+use pingora_core::services::listening::Service as ListeningService;
 use pingora_proxy::http_proxy_service;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info};
 use wicket_config::Config;
 use wicket_core::{
+    register_metrics as register_proxy_metrics,
     wicket_tls::{AcmeConfig, AcmeProvider, CertManager, FileWatcher, TlsMode},
     WicketProxy,
 };
@@ -47,6 +49,10 @@ struct Args {
     /// Print the parsed configuration and exit
     #[arg(long)]
     dump_config: bool,
+
+    /// Prometheus metrics server address
+    #[arg(long, default_value = "0.0.0.0:9090")]
+    metrics_addr: String,
 }
 
 fn main() {
@@ -250,6 +256,18 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     );
 
     server.bootstrap();
+
+    // Register custom proxy metrics with Prometheus
+    // These will automatically appear at the /metrics endpoint
+    if let Err(e) = register_proxy_metrics() {
+        error!(error = %e, "Failed to register proxy metrics");
+    }
+
+    // Add Pingora's built-in Prometheus metrics server
+    let mut prometheus_service = ListeningService::prometheus_http_service();
+    prometheus_service.add_tcp(&args.metrics_addr);
+    server.add_service(prometheus_service);
+    info!(address = %args.metrics_addr, "Prometheus metrics server enabled");
 
     // Create the proxy service
     let mut wicket_proxy = WicketProxy::new(&config).context("Failed to create proxy service")?;
