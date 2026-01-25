@@ -45,6 +45,7 @@ impl Upstream {
 }
 
 /// Main L4 stream proxy.
+#[derive(Debug)]
 pub struct StreamProxy {
     pub(crate) router: SniRouter,
     pub(crate) upstreams: HashMap<String, Arc<Upstream>>,

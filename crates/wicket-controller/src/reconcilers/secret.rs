@@ -50,8 +50,8 @@ pub enum SecretError {
     ConfigError(String),
 }
 
-/// Directory where extracted TLS certificates are written.
-const TLS_CERT_DIR: &str = "/tmp/wicket/tls";
+// TLS certificate directory is now configurable via Context.tls_cert_dir
+// Default is /var/run/wicket/tls (see context.rs)
 
 /// Reconcile a Secret resource.
 ///
@@ -136,8 +136,8 @@ pub async fn reconcile_secret(
     let cert_data = data.get("tls.crt").ok_or(SecretError::MissingTlsData)?;
     let key_data = data.get("tls.key").ok_or(SecretError::MissingTlsData)?;
 
-    let cert_path = write_tls_file(&namespace, &name, "crt", &cert_data.0).await?;
-    let key_path = write_tls_file(&namespace, &name, "key", &key_data.0).await?;
+    let cert_path = write_tls_file(&ctx.tls_cert_dir, &namespace, &name, "crt", &cert_data.0).await?;
+    let key_path = write_tls_file(&ctx.tls_cert_dir, &namespace, &name, "key", &key_data.0).await?;
 
     // Record extraction metrics
     let extraction_duration = extraction_start.elapsed().as_secs_f64();
@@ -298,39 +298,112 @@ async fn validate_reference_grant(
     Ok(false)
 }
 
-/// Write TLS certificate or key to a file.
+/// Sanitize a string for use in a filename using allowlist approach.
+/// Only allows alphanumeric characters and hyphens. All other characters
+/// are replaced with hyphens. Consecutive hyphens are collapsed.
+/// Maximum length is enforced to prevent filesystem issues.
+fn sanitize_filename_component(s: &str) -> String {
+    const MAX_COMPONENT_LEN: usize = 63; // DNS label max length
+
+    let sanitized: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    // Collapse consecutive hyphens and trim hyphens from edges
+    let mut result = String::with_capacity(sanitized.len());
+    let mut prev_hyphen = true; // Start true to trim leading hyphens
+    for c in sanitized.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                result.push(c);
+                prev_hyphen = true;
+            }
+        } else {
+            result.push(c);
+            prev_hyphen = false;
+        }
+    }
+
+    // Trim trailing hyphen
+    if result.ends_with('-') {
+        result.pop();
+    }
+
+    // Enforce max length
+    if result.len() > MAX_COMPONENT_LEN {
+        result.truncate(MAX_COMPONENT_LEN);
+        // Don't end with hyphen after truncation
+        while result.ends_with('-') {
+            result.pop();
+        }
+    }
+
+    // Ensure we have something valid
+    if result.is_empty() {
+        result = "unnamed".to_string();
+    }
+
+    result
+}
+
+/// Write TLS certificate or key to a file using atomic replacement.
 async fn write_tls_file(
+    tls_cert_dir: &str,
     namespace: &str,
     name: &str,
     extension: &str,
     data: &[u8],
 ) -> Result<PathBuf, SecretError> {
-    // Ensure directory exists
-    let dir = PathBuf::from(TLS_CERT_DIR);
+    // Ensure directory exists with secure permissions
+    let dir = PathBuf::from(tls_cert_dir);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| SecretError::WriteFile(format!("Failed to create dir: {}", e)))?;
 
-    // Sanitize names for filesystem
-    let safe_ns = namespace.replace(['/', '\\', '.'], "-");
-    let safe_name = name.replace(['/', '\\', '.'], "-");
+    // Set directory permissions to 0700 (owner only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir_perms = std::fs::Permissions::from_mode(0o700);
+        let _ = tokio::fs::set_permissions(&dir, dir_perms).await;
+    }
+
+    // Sanitize names using allowlist approach (M-4 fix)
+    let safe_ns = sanitize_filename_component(namespace);
+    let safe_name = sanitize_filename_component(name);
     let filename = format!("{}-{}.{}", safe_ns, safe_name, extension);
     let path = dir.join(&filename);
 
-    // Write file with restrictive permissions
-    tokio::fs::write(&path, data)
+    // Atomic write: write to temp file then rename (M-5 fix)
+    let temp_filename = format!(".{}.tmp.{}", filename, std::process::id());
+    let temp_path = dir.join(&temp_filename);
+
+    // Write to temp file with restrictive permissions
+    tokio::fs::write(&temp_path, data)
         .await
-        .map_err(|e| SecretError::WriteFile(format!("Failed to write {}: {}", path.display(), e)))?;
+        .map_err(|e| SecretError::WriteFile(format!("Failed to write temp file: {}", e)))?;
 
     // Set file permissions to 0600 (owner read/write only)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        tokio::fs::set_permissions(&path, perms)
+        tokio::fs::set_permissions(&temp_path, perms)
             .await
             .map_err(|e| SecretError::WriteFile(format!("Failed to set permissions: {}", e)))?;
     }
+
+    // Atomic rename
+    tokio::fs::rename(&temp_path, &path)
+        .await
+        .map_err(|e| SecretError::WriteFile(format!("Failed to rename temp file: {}", e)))?;
 
     Ok(path)
 }
@@ -359,7 +432,7 @@ async fn trigger_config_update(
     );
 
     // Load all other TLS secrets that have been extracted
-    load_existing_tls_secrets(&mut state).await;
+    load_existing_tls_secrets(&ctx.tls_cert_dir, &mut state).await;
 
     // Load all Gateways (only Wicket-managed ones)
     let gw_api: Api<Gateway> = Api::all(ctx.client.clone());
@@ -458,8 +531,8 @@ fn parse_certificate_expiry(cert_data: &[u8]) -> Option<i64> {
 }
 
 /// Load existing TLS secrets from the certificate directory.
-async fn load_existing_tls_secrets(state: &mut GatewayState) {
-    let dir = PathBuf::from(TLS_CERT_DIR);
+async fn load_existing_tls_secrets(tls_cert_dir: &str, state: &mut GatewayState) {
+    let dir = PathBuf::from(tls_cert_dir);
 
     let mut entries = match tokio::fs::read_dir(&dir).await {
         Ok(e) => e,

@@ -23,6 +23,10 @@ const EXT_SERVER_NAME: u16 = 0x0000;
 /// Server name type for hostname.
 const NAME_TYPE_HOSTNAME: u8 = 0;
 
+/// Maximum allowed hostname length per DNS specifications (RFC 1035).
+/// A fully qualified domain name can be at most 253 ASCII characters.
+const MAX_HOSTNAME_LEN: usize = 253;
+
 /// Check if buffer looks like a TLS handshake.
 ///
 /// Returns true if the buffer starts with a TLS handshake record header.
@@ -115,6 +119,16 @@ pub fn extract_sni(buf: &[u8]) -> Option<String> {
                 let name_len = read_u16(&mut cursor)? as usize;
 
                 if name_type == NAME_TYPE_HOSTNAME {
+                    // Validate hostname length (M-3 security fix)
+                    if name_len > MAX_HOSTNAME_LEN {
+                        tracing::warn!(
+                            name_len = name_len,
+                            max = MAX_HOSTNAME_LEN,
+                            "SNI hostname exceeds maximum DNS length, rejecting"
+                        );
+                        return None;
+                    }
+
                     let name_start = cursor.position() as usize;
                     let name_end = name_start + name_len;
                     if name_end > buf.len() {
