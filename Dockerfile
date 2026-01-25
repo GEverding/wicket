@@ -1,11 +1,23 @@
 # Builder stage
 FROM rust:1.85-bookworm AS builder
 
+# Build argument to enable eBPF sockmap support (Linux x86_64 only)
+ARG ENABLE_EBPF=false
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
+
+# Install eBPF build dependencies if enabled
+RUN if [ "$ENABLE_EBPF" = "true" ]; then \
+    apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        llvm \
+        libelf-dev \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 WORKDIR /build
 
@@ -13,17 +25,39 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
 
-# Build release binary
-RUN cargo build --release -p wicket
+# Copy volt submodule for eBPF support
+COPY volt ./volt
+
+# Build BPF bytecode if eBPF is enabled
+RUN if [ "$ENABLE_EBPF" = "true" ] && [ -f "volt/Makefile" ]; then \
+    cd volt && make bpf; \
+    fi
+
+# Build release binary (with or without eBPF feature)
+RUN if [ "$ENABLE_EBPF" = "true" ]; then \
+    cargo build --release -p wicket --features ebpf; \
+    else \
+    cargo build --release -p wicket; \
+    fi
 
 # Final stage
 FROM debian:bookworm-slim
+
+# Inherit build arg for conditional runtime deps
+ARG ENABLE_EBPF=false
 
 # Install minimal runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
+
+# Install libelf for eBPF runtime if enabled (needed for BPF loading)
+RUN if [ "$ENABLE_EBPF" = "true" ]; then \
+    apt-get update && apt-get install -y --no-install-recommends \
+        libelf1 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Create non-root user
 RUN useradd -m -u 1000 wicket
