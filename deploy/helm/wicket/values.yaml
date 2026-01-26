@@ -1,311 +1,57 @@
-# Default values for Wicket Gateway API Controller and Proxy
+# Default values for Wicket Gateway API Controller
 
-# Global settings
-global:
-  # Image pull secrets for private registries
-  imagePullSecrets: []
-
-# Controller settings
+# Controller deployment
 controller:
-  enabled: true
-
   image:
     repository: ghcr.io/geverding/wicket-controller
-    pullPolicy: IfNotPresent
     tag: ""  # Defaults to Chart appVersion
+    pullPolicy: IfNotPresent
 
-  replicaCount: 2
+  replicas: 1
 
-  # Resource limits and requests
   resources:
     limits:
-      cpu: 500m
-      memory: 256Mi
+      memory: 1024Mi
     requests:
       cpu: 100m
-      memory: 128Mi
-
-  # Controller arguments
-  args:
-    logLevel: info
-    jsonLogs: true
-    watchAllNamespaces: true
-    leaderElection: true
-
-  # Metrics configuration
-  metrics:
-    enabled: true
-    port: 8081
-    serviceMonitor:
-      enabled: false
-      interval: 30s
-      scrapeTimeout: 10s
-
-  # Pod disruption budget
-  podDisruptionBudget:
-    enabled: true
-    minAvailable: 1
-
-  # Node selector
-  nodeSelector: {}
-
-  # Tolerations
-  tolerations: []
-
-  # Affinity
-  affinity:
-    podAntiAffinity:
-      preferredDuringSchedulingIgnoredDuringExecution:
-        - weight: 100
-          podAffinityTerm:
-            labelSelector:
-              matchExpressions:
-                - key: app.kubernetes.io/name
-                  operator: In
-                  values:
-                    - wicket-controller
-            topologyKey: kubernetes.io/hostname
-
-  # Security context
-  securityContext:
-    runAsNonRoot: true
-    runAsUser: 65532
-    fsGroup: 65532
-
-  containerSecurityContext:
-    allowPrivilegeEscalation: false
-    readOnlyRootFilesystem: true
-    capabilities:
-      drop:
-        - ALL
-
-  # Service account
-  serviceAccount:
-    create: true
-    name: ""
-    annotations: {}
-
-# Proxy settings (data plane)
-proxy:
-  enabled: true
-
-  image:
-    repository: ghcr.io/geverding/wicket
-    pullPolicy: IfNotPresent
-    tag: ""  # Defaults to Chart appVersion
-
-  replicaCount: 2
-
-  # Pod labels - added to all proxy pods
-  podLabels: {}
-  # Examples:
-  #   app.kubernetes.io/part-of: my-app
-  #   custom.io/team: platform
-
-  # Pod annotations - added to all proxy pods
-  podAnnotations: {}
-  # Examples:
-  #   prometheus.io/scrape: "true"
-  #   prometheus.io/port: "9090"
-
-  # Resource limits and requests
-  resources:
-    limits:
-      cpu: 2
-      memory: 1Gi
-    requests:
-      cpu: 500m
       memory: 256Mi
 
-  # Proxy configuration
-  config:
-    # Server settings
-    listen: "0.0.0.0:8080"
-    workers: 0  # 0 = auto-detect CPU count
-    jsonLogs: true
-    logLevel: info
-    shutdownTimeout: 30
-
-  # Service configuration
-  service:
-    type: LoadBalancer
-    annotations: {}
-    # For AWS NLB:
-    # service.beta.kubernetes.io/aws-load-balancer-type: external
-    # service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
-    # service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
-    #
-    # For OCI (Oracle Cloud Infrastructure):
-    # oci.oraclecloud.com/load-balancer-type: nlb
-    # oci-network-load-balancer.oraclecloud.com/security-list-management-mode: None
-    # oci-network-load-balancer.oraclecloud.com/internal: "false"
-    # oci-network-load-balancer.oraclecloud.com/subnet: "ocid1.subnet.oc1..."
-    # oci-network-load-balancer.oraclecloud.com/is-preserve-source: "true"
-    # oci-network-load-balancer.oraclecloud.com/backend-set-is-preserve-source: "true"
-    #
-    # For OCI Flexible Load Balancer:
-    # service.beta.kubernetes.io/oci-load-balancer-shape: flexible
-    # service.beta.kubernetes.io/oci-load-balancer-shape-flex-min: "10"
-    # service.beta.kubernetes.io/oci-load-balancer-shape-flex-max: "100"
-    # service.beta.kubernetes.io/oci-load-balancer-internal: "false"
-    # service.beta.kubernetes.io/oci-load-balancer-subnet1: "ocid1.subnet.oc1..."
-    #
-    # For GKE:
-    # cloud.google.com/load-balancer-type: External
-    # networking.gke.io/load-balancer-type: External
-    ports:
-      - name: http
-        port: 80
-        targetPort: 8080
-        protocol: TCP
-      - name: https
-        port: 443
-        targetPort: 8443
-        protocol: TCP
-
-  # Horizontal Pod Autoscaler
-  autoscaling:
-    enabled: false
-    minReplicas: 2
-    maxReplicas: 10
-    targetCPUUtilizationPercentage: 80
-    targetMemoryUtilizationPercentage: 80
-
-  # Pod disruption budget
-  podDisruptionBudget:
-    enabled: true
-    minAvailable: 1
-
-  # Node selector - schedule proxy on specific nodes
-  # Examples:
-  #   node-role.kubernetes.io/edge: ""
-  #   topology.kubernetes.io/zone: us-east-1a
-  #   node.kubernetes.io/instance-type: c5.xlarge
-  nodeSelector: {}
-
-  # Tolerations - allow scheduling on tainted nodes
-  # Examples for edge nodes:
-  # tolerations:
-  #   - key: "node-role.kubernetes.io/edge"
-  #     operator: "Exists"
-  #     effect: "NoSchedule"
-  #   - key: "dedicated"
-  #     operator: "Equal"
-  #     value: "edge-proxy"
-  #     effect: "NoSchedule"
-  tolerations: []
-
-  # Affinity - control pod placement with node and pod affinity rules
-  # Default: spread across nodes for HA
-  affinity:
-    # Node affinity examples (uncomment to use):
-    # nodeAffinity:
-    #   # Required: must run on edge nodes
-    #   requiredDuringSchedulingIgnoredDuringExecution:
-    #     nodeSelectorTerms:
-    #       - matchExpressions:
-    #           - key: node-role.kubernetes.io/edge
-    #             operator: Exists
-    #   # Preferred: prefer high-memory nodes
-    #   preferredDuringSchedulingIgnoredDuringExecution:
-    #     - weight: 100
-    #       preference:
-    #         matchExpressions:
-    #           - key: node.kubernetes.io/instance-type
-    #             operator: In
-    #             values:
-    #               - c5.xlarge
-    #               - c5.2xlarge
-    #               - m5.xlarge
-    #     - weight: 50
-    #       preference:
-    #         matchExpressions:
-    #           - key: topology.kubernetes.io/zone
-    #             operator: In
-    #             values:
-    #               - us-east-1a
-    #               - us-east-1b
-    # Pod anti-affinity: spread across nodes
-    podAntiAffinity:
-      preferredDuringSchedulingIgnoredDuringExecution:
-        - weight: 100
-          podAffinityTerm:
-            labelSelector:
-              matchExpressions:
-                - key: app.kubernetes.io/name
-                  operator: In
-                  values:
-                    - wicket-proxy
-            topologyKey: kubernetes.io/hostname
-
-  # Topology spread constraints - distribute across zones/nodes
-  # Examples:
-  # topologySpreadConstraints:
-  #   - maxSkew: 1
-  #     topologyKey: topology.kubernetes.io/zone
-  #     whenUnsatisfiable: ScheduleAnyway
-  #     labelSelector:
-  #       matchLabels:
-  #         app.kubernetes.io/name: wicket-proxy
-  #   - maxSkew: 1
-  #     topologyKey: kubernetes.io/hostname
-  #     whenUnsatisfiable: DoNotSchedule
-  #     labelSelector:
-  #       matchLabels:
-  #         app.kubernetes.io/name: wicket-proxy
-  topologySpreadConstraints: []
-
-  # Priority class name for pod scheduling priority
-  # Create a PriorityClass first, e.g.:
-  #   apiVersion: scheduling.k8s.io/v1
-  #   kind: PriorityClass
-  #   metadata:
-  #     name: edge-proxy-high
-  #   value: 1000000
-  #   globalDefault: false
-  priorityClassName: ""
-
-  # Termination grace period (seconds) for graceful shutdown
-  terminationGracePeriodSeconds: 30
-
-  # Security context
   securityContext:
-    runAsNonRoot: true
-    runAsUser: 1000
-    fsGroup: 1000
-
-  containerSecurityContext:
     allowPrivilegeEscalation: false
-    readOnlyRootFilesystem: true
-    capabilities:
-      drop:
-        - ALL
-      add:
-        - NET_BIND_SERVICE
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
 
-  # Service account
-  serviceAccount:
-    create: true
-    name: ""
+  pod:
     annotations: {}
+    labels: {}
+    affinity: {}
+    tolerations: []
+    nodeSelector: {}
 
-# GatewayClass settings
-gatewayClass:
-  # Create a GatewayClass resource
-  create: true
-  name: wicket
-  description: "Wicket Gateway API implementation"
+# Controller config
+config:
+  controllerName: gateway.wicket.dev/gatewayclass-controller
+  logging:
+    level: info
 
-# CRDs
+# Service for controller (metrics, health)
+service:
+  type: ClusterIP
+  annotations: {}
+  ports:
+    - name: metrics
+      port: 8081
+      targetPort: 8081
+
+# Install Gateway API CRDs
 crds:
-  # Install Gateway API CRDs
   install: true
 
-# RBAC settings
+# RBAC
 rbac:
   create: true
 
-# Namespace
-namespace:
-  create: false
-  name: wicket-system
+createNamespace: false
