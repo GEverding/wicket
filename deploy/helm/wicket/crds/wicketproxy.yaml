@@ -1,0 +1,389 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: wicketproxies.gateway.wicket.dev
+  namespace: wicket-system
+spec:
+  group: gateway.wicket.dev
+  names:
+    kind: WicketProxy
+    plural: wicketproxies
+    singular: wicketproxy
+    shortNames:
+      - wp
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: "WicketProxy defines the configuration for Wicket proxy deployments and is referenced via GatewayClass.spec.parametersRef."
+          properties:
+            apiVersion:
+              type: string
+              description: "API version of this resource"
+            kind:
+              type: string
+              description: "Kind is always WicketProxy"
+            metadata:
+              type: object
+              properties:
+                name:
+                  type: string
+                  maxLength: 253
+                namespace:
+                  type: string
+                  maxLength: 63
+            spec:
+              type: object
+              description: "Spec defines the desired state of the WicketProxy"
+              required:
+                - provider
+              properties:
+                provider:
+                  type: object
+                  description: "Provider defines the infrastructure provider settings"
+                  required:
+                    - type
+                  properties:
+                    type:
+                      type: string
+                      enum:
+                        - Kubernetes
+                      description: "Type of provider (currently only Kubernetes supported)"
+                    kubernetes:
+                      type: object
+                      description: "Kubernetes-specific provider configuration"
+                      properties:
+                        deployment:
+                          type: object
+                          description: "Deployment configuration for proxy pods"
+                          properties:
+                            replicas:
+                              type: integer
+                              minimum: 1
+                              maximum: 1000
+                              default: 2
+                              description: "Number of proxy pod replicas"
+                            podTemplate:
+                              type: object
+                              description: "Pod template specification"
+                              properties:
+                                metadata:
+                                  type: object
+                                  description: "Pod metadata (labels, annotations)"
+                                  properties:
+                                    labels:
+                                      type: object
+                                      additionalProperties:
+                                        type: string
+                                      description: "Labels to apply to proxy pods"
+                                    annotations:
+                                      type: object
+                                      additionalProperties:
+                                        type: string
+                                      description: "Annotations to apply to proxy pods"
+                                spec:
+                                  type: object
+                                  description: "Pod specification"
+                                  properties:
+                                    affinity:
+                                      type: object
+                                      description: "Pod affinity rules"
+                                    tolerations:
+                                      type: array
+                                      description: "Pod tolerations for node taints"
+                                      items:
+                                        type: object
+                                    nodeSelector:
+                                      type: object
+                                      additionalProperties:
+                                        type: string
+                                      description: "Node selector for pod placement"
+                                    priorityClassName:
+                                      type: string
+                                      description: "Priority class name for pod scheduling"
+                                    securityContext:
+                                      type: object
+                                      description: "Pod-level security context"
+                            container:
+                              type: object
+                              description: "Container configuration for proxy"
+                              properties:
+                                image:
+                                  type: string
+                                  description: "Container image URI (e.g., wicket:v1.0.0)"
+                                imagePullPolicy:
+                                  type: string
+                                  enum:
+                                    - Always
+                                    - Never
+                                    - IfNotPresent
+                                  default: IfNotPresent
+                                  description: "Image pull policy"
+                                resources:
+                                  type: object
+                                  description: "Resource requests and limits"
+                                  properties:
+                                    requests:
+                                      type: object
+                                      properties:
+                                        cpu:
+                                          type: string
+                                          description: "CPU request (e.g., 100m, 1)"
+                                        memory:
+                                          type: string
+                                          description: "Memory request (e.g., 128Mi, 1Gi)"
+                                    limits:
+                                      type: object
+                                      properties:
+                                        cpu:
+                                          type: string
+                                          description: "CPU limit"
+                                        memory:
+                                          type: string
+                                          description: "Memory limit"
+                                env:
+                                  type: array
+                                  description: "Environment variables for proxy container"
+                                  items:
+                                    type: object
+                                    properties:
+                                      name:
+                                        type: string
+                                      value:
+                                        type: string
+                                      valueFrom:
+                                        type: object
+                                        description: "Source for environment variable value"
+                                volumeMounts:
+                                  type: array
+                                  description: "Volume mounts for proxy container"
+                                  items:
+                                    type: object
+                                    properties:
+                                      name:
+                                        type: string
+                                      mountPath:
+                                        type: string
+                                      readOnly:
+                                        type: boolean
+                                securityContext:
+                                  type: object
+                                  description: "Container-level security context"
+                        service:
+                          type: object
+                          description: "Service configuration for proxy"
+                          properties:
+                            type:
+                              type: string
+                              enum:
+                                - ClusterIP
+                                - NodePort
+                                - LoadBalancer
+                                - ExternalName
+                              default: LoadBalancer
+                              description: "Service type"
+                            annotations:
+                              type: object
+                              additionalProperties:
+                                type: string
+                              description: "Service annotations (e.g., for cloud provider configuration)"
+                            externalTrafficPolicy:
+                              type: string
+                              enum:
+                                - Cluster
+                                - Local
+                              description: "External traffic policy for LoadBalancer/NodePort services"
+                            ports:
+                              type: array
+                              description: "Service ports"
+                              items:
+                                type: object
+                                properties:
+                                  name:
+                                    type: string
+                                    description: "Port name (e.g., http, https)"
+                                  port:
+                                    type: integer
+                                    minimum: 1
+                                    maximum: 65535
+                                    description: "Service port number"
+                                  targetPort:
+                                    type: integer
+                                    minimum: 1
+                                    maximum: 65535
+                                    description: "Container port number"
+                                  protocol:
+                                    type: string
+                                    enum:
+                                      - TCP
+                                      - UDP
+                                    default: TCP
+                                    description: "Protocol for the port"
+                        hpa:
+                          type: object
+                          description: "Horizontal Pod Autoscaler configuration"
+                          properties:
+                            minReplicas:
+                              type: integer
+                              minimum: 1
+                              default: 2
+                              description: "Minimum number of replicas"
+                            maxReplicas:
+                              type: integer
+                              minimum: 1
+                              maximum: 1000
+                              default: 10
+                              description: "Maximum number of replicas"
+                            targetCPUUtilizationPercentage:
+                              type: integer
+                              minimum: 1
+                              maximum: 100
+                              description: "Target CPU utilization percentage for scaling"
+                            targetMemoryUtilizationPercentage:
+                              type: integer
+                              minimum: 1
+                              maximum: 100
+                              description: "Target memory utilization percentage for scaling"
+                            metrics:
+                              type: array
+                              description: "Custom metrics for autoscaling"
+                              items:
+                                type: object
+                                properties:
+                                  type:
+                                    type: string
+                                    description: "Metric type (Resource, Pods, Object)"
+                                  resource:
+                                    type: object
+                                    description: "Resource metric specification"
+                telemetry:
+                  type: object
+                  description: "Telemetry configuration for logging and metrics"
+                  properties:
+                    logging:
+                      type: object
+                      description: "Logging configuration"
+                      properties:
+                        level:
+                          type: string
+                          enum:
+                            - trace
+                            - debug
+                            - info
+                            - warn
+                            - error
+                          default: info
+                          description: "Log level"
+                        format:
+                          type: string
+                          enum:
+                            - json
+                            - text
+                          default: json
+                          description: "Log format"
+                        outputs:
+                          type: array
+                          description: "Log output destinations"
+                          items:
+                            type: string
+                            enum:
+                              - stdout
+                              - stderr
+                              - file
+                        file:
+                          type: object
+                          description: "File logging configuration"
+                          properties:
+                            path:
+                              type: string
+                              description: "Path to log file"
+                            maxSize:
+                              type: string
+                              description: "Maximum log file size (e.g., 100Mi)"
+                            maxBackups:
+                              type: integer
+                              minimum: 0
+                              description: "Number of backup log files to retain"
+                            maxAge:
+                              type: integer
+                              minimum: 0
+                              description: "Maximum age of log files in days"
+                    metrics:
+                      type: object
+                      description: "Metrics configuration"
+                      properties:
+                        enabled:
+                          type: boolean
+                          default: true
+                          description: "Enable metrics collection"
+                        port:
+                          type: integer
+                          minimum: 1
+                          maximum: 65535
+                          default: 8080
+                          description: "Metrics endpoint port"
+                        path:
+                          type: string
+                          default: /metrics
+                          description: "Metrics endpoint path"
+                        interval:
+                          type: string
+                          default: 30s
+                          description: "Metrics collection interval (e.g., 30s, 1m)"
+                    traces:
+                      type: object
+                      description: "Distributed tracing configuration"
+                      properties:
+                        enabled:
+                          type: boolean
+                          default: false
+                          description: "Enable distributed tracing"
+                        samplingRate:
+                          type: number
+                          minimum: 0
+                          maximum: 1
+                          default: 0.1
+                          description: "Sampling rate for traces (0.0-1.0)"
+                        exporter:
+                          type: string
+                          enum:
+                            - jaeger
+                            - otlp
+                            - zipkin
+                          description: "Trace exporter backend"
+                        endpoint:
+                          type: string
+                          description: "Trace exporter endpoint URL"
+                shutdown:
+                  type: object
+                  description: "Graceful shutdown configuration"
+                  properties:
+                    drainTimeout:
+                      type: string
+                      default: 30s
+                      description: "Time to wait for existing connections to drain (e.g., 30s, 1m)"
+                    terminationGracePeriodSeconds:
+                      type: integer
+                      minimum: 1
+                      default: 30
+                      description: "Kubernetes termination grace period in seconds"
+                    healthCheckInterval:
+                      type: string
+                      default: 5s
+                      description: "Interval for health checks during shutdown"
+      additionalPrinterColumns:
+        - name: Provider
+          type: string
+          description: "Infrastructure provider type"
+          jsonPath: .spec.provider.type
+        - name: Replicas
+          type: integer
+          description: "Number of proxy replicas"
+          jsonPath: .spec.provider.kubernetes.deployment.replicas
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
