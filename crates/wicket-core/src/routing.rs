@@ -3,7 +3,6 @@
 //! This module provides fast route matching based on host, path, method, and headers.
 
 use anyhow::Result;
-use regex::Regex;
 use std::collections::HashMap;
 use tracing::debug;
 use wicket_config::RouteConfig;
@@ -37,10 +36,17 @@ struct CompiledRoute {
 }
 
 /// Host matching with wildcard support.
+///
+/// Uses simple string matching instead of regex to prevent ReDoS attacks.
 #[derive(Debug, Clone)]
 enum HostMatcher {
+    /// Exact host match (case-insensitive)
     Exact(String),
-    Wildcard(Regex),
+    /// Wildcard prefix match: *.example.com matches foo.example.com but not foo.bar.example.com
+    WildcardPrefix {
+        /// The suffix after the wildcard (e.g., ".example.com" for "*.example.com")
+        suffix: String,
+    },
 }
 
 /// Path matching strategies.
@@ -188,19 +194,23 @@ impl HostMatcher {
     /// Compile a host pattern into a matcher.
     ///
     /// Supports wildcards like "*.example.com".
+    ///
+    /// Uses simple string matching instead of regex to prevent ReDoS attacks.
+    /// Only `*` at the beginning (e.g., `*.example.com`) is supported.
     fn compile(pattern: &str) -> Result<Self> {
         if let Some(suffix) = pattern.strip_prefix("*.") {
-            // Convert wildcard pattern to regex
-            let regex_pattern = format!(r"^[^.]+\.{}$", regex::escape(suffix));
-            let regex = Regex::new(&regex_pattern)
-                .map_err(|e| anyhow::anyhow!("Invalid host pattern '{}': {}", pattern, e))?;
-            Ok(HostMatcher::Wildcard(regex))
+            // Wildcard prefix pattern: *.example.com
+            // Store the suffix with the leading dot for matching
+            Ok(HostMatcher::WildcardPrefix {
+                suffix: format!(".{}", suffix.to_lowercase()),
+            })
         } else if pattern.contains('*') {
-            // General wildcard pattern
-            let regex_pattern = format!("^{}$", pattern.replace('.', r"\.").replace('*', "[^.]+"));
-            let regex = Regex::new(&regex_pattern)
-                .map_err(|e| anyhow::anyhow!("Invalid host pattern '{}': {}", pattern, e))?;
-            Ok(HostMatcher::Wildcard(regex))
+            // Reject other wildcard patterns (e.g., foo.*.com) to prevent complexity
+            // and potential matching issues
+            anyhow::bail!(
+                "Invalid host pattern '{}': only prefix wildcards (*.example.com) are supported",
+                pattern
+            );
         } else {
             Ok(HostMatcher::Exact(pattern.to_lowercase()))
         }
@@ -213,7 +223,25 @@ impl HostMatcher {
 
         match self {
             HostMatcher::Exact(expected) => host_without_port == expected,
-            HostMatcher::Wildcard(regex) => regex.is_match(host_without_port),
+            HostMatcher::WildcardPrefix { suffix } => {
+                // Must end with the suffix (e.g., ".example.com")
+                if !host_without_port.ends_with(suffix) {
+                    return false;
+                }
+
+                // Get the prefix part (before the suffix)
+                let prefix_len = host_without_port.len() - suffix.len();
+                if prefix_len == 0 {
+                    // Host is exactly the suffix without the leading dot, no wildcard match
+                    return false;
+                }
+
+                let prefix = &host_without_port[..prefix_len];
+
+                // Wildcard should match exactly one label (no dots in prefix)
+                // This matches RFC 6125 behavior for wildcard certificates
+                !prefix.contains('.')
+            }
         }
     }
 }
@@ -254,6 +282,8 @@ mod tests {
                 headers: HashMap::new(),
             },
             tls: None,
+            filters: None,
+            timeout: None,
         }
     }
 

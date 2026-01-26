@@ -33,7 +33,14 @@ pub struct Context {
 
     /// Namespace of the ConfigMap to update.
     pub config_configmap_namespace: String,
+
+    /// Directory for storing TLS certificates extracted from Kubernetes secrets.
+    /// Defaults to /var/run/wicket/tls for security (not world-readable /tmp).
+    pub tls_cert_dir: String,
 }
+
+/// Default directory for TLS certificates (more secure than /tmp).
+pub const DEFAULT_TLS_CERT_DIR: &str = "/var/run/wicket/tls";
 
 impl Context {
     pub fn new(
@@ -43,6 +50,24 @@ impl Context {
         config_configmap_name: String,
         config_configmap_namespace: String,
     ) -> Self {
+        Self::with_tls_dir(
+            client,
+            controller_namespace,
+            watch_all_namespaces,
+            config_configmap_name,
+            config_configmap_namespace,
+            DEFAULT_TLS_CERT_DIR.to_string(),
+        )
+    }
+
+    pub fn with_tls_dir(
+        client: Client,
+        controller_namespace: String,
+        watch_all_namespaces: bool,
+        config_configmap_name: String,
+        config_configmap_namespace: String,
+        tls_cert_dir: String,
+    ) -> Self {
         Self {
             client,
             config: Arc::new(RwLock::new(WicketConfig::default())),
@@ -51,6 +76,7 @@ impl Context {
             watch_all_namespaces,
             config_configmap_name,
             config_configmap_namespace,
+            tls_cert_dir,
         }
     }
 

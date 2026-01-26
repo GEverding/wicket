@@ -150,10 +150,49 @@ pub struct DnsProviderConfig {
     /// Provider name: "cloudflare"
     pub provider: String,
     /// API token (supports ${ENV_VAR} syntax for environment variable substitution)
+    /// Note: Prefer `api_token_file` for production as env vars are visible in /proc.
+    #[serde(default)]
     pub api_token: String,
+    /// Path to file containing API token (more secure than environment variables).
+    /// If specified, this takes precedence over `api_token`.
+    /// The file should contain just the token, optionally with a trailing newline.
+    #[serde(default)]
+    pub api_token_file: Option<PathBuf>,
     /// Zone ID (optional, auto-detected if not specified)
     #[serde(default)]
     pub zone_id: Option<String>,
+}
+
+impl DnsProviderConfig {
+    /// Get the resolved API token, preferring file-based token if configured.
+    ///
+    /// Order of precedence:
+    /// 1. api_token_file (reads from file)
+    /// 2. api_token with ${ENV_VAR} substitution
+    ///
+    /// Returns an error if neither is available or if file reading fails.
+    pub fn resolve_api_token(&self) -> Result<String, String> {
+        // Prefer file-based token (more secure)
+        if let Some(ref token_file) = self.api_token_file {
+            return std::fs::read_to_string(token_file)
+                .map(|s| s.trim().to_string())
+                .map_err(|e| format!("Failed to read token from {}: {}", token_file.display(), e));
+        }
+
+        // Fall back to api_token field with env var substitution
+        if self.api_token.is_empty() {
+            return Err("No api_token or api_token_file configured".to_string());
+        }
+
+        // Check for ${ENV_VAR} syntax and substitute
+        if self.api_token.starts_with("${") && self.api_token.ends_with('}') {
+            let var_name = &self.api_token[2..self.api_token.len() - 1];
+            return std::env::var(var_name)
+                .map_err(|_| format!("Environment variable {} not set", var_name));
+        }
+
+        Ok(self.api_token.clone())
+    }
 }
 
 /// File-based certificate configuration.
@@ -389,12 +428,14 @@ mod tests {
                 dns: DnsProviderConfig {
                     provider: "cloudflare".to_string(),
                     api_token: "explicit-token".to_string(),
+                    api_token_file: None,
                     zone_id: None,
                 },
             }],
             default_dns: Some(DnsProviderConfig {
                 provider: "cloudflare".to_string(),
                 api_token: "default-token".to_string(),
+                api_token_file: None,
                 zone_id: None,
             }),
             dns_providers: [
@@ -403,6 +444,7 @@ mod tests {
                     DnsProviderConfig {
                         provider: "cloudflare".to_string(),
                         api_token: "acme-corp-token".to_string(),
+                        api_token_file: None,
                         zone_id: Some("zone-acme".to_string()),
                     },
                 ),
@@ -411,6 +453,7 @@ mod tests {
                     DnsProviderConfig {
                         provider: "cloudflare".to_string(),
                         api_token: "other-token".to_string(),
+                        api_token_file: None,
                         zone_id: None,
                     },
                 ),

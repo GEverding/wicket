@@ -22,6 +22,9 @@ pub enum CloudflareError {
 
     #[error("invalid API token format")]
     InvalidApiToken,
+
+    #[error("failed to read token from file: {0}")]
+    TokenFileRead(String),
 }
 
 /// Cloudflare DNS API client.
@@ -33,12 +36,54 @@ pub struct CloudflareClient {
 impl CloudflareClient {
     /// Create a new Cloudflare client with the given API token.
     pub fn new(api_token: String) -> Result<Self, CloudflareError> {
-        let auth_header = HeaderValue::from_str(&format!("Bearer {}", api_token))
+        // Trim whitespace (common issue with file-read tokens)
+        let token = api_token.trim();
+        let auth_header = HeaderValue::from_str(&format!("Bearer {}", token))
             .map_err(|_| CloudflareError::InvalidApiToken)?;
         Ok(Self {
             client: reqwest::Client::new(),
             auth_header,
         })
+    }
+
+    /// Create a new Cloudflare client by reading the API token from a file.
+    ///
+    /// This is the preferred method for production use as it keeps secrets
+    /// out of environment variables and process listings.
+    ///
+    /// The file should contain just the token, optionally with a trailing newline.
+    pub fn from_token_file(path: &std::path::Path) -> Result<Self, CloudflareError> {
+        let token = std::fs::read_to_string(path)
+            .map_err(|e| CloudflareError::TokenFileRead(format!("{}: {}", path.display(), e)))?;
+        Self::new(token)
+    }
+
+    /// Create a new Cloudflare client from the CF_API_TOKEN environment variable.
+    ///
+    /// Note: Environment variables are visible in /proc and process listings.
+    /// Prefer `from_token_file` for production deployments.
+    pub fn from_env() -> Result<Self, CloudflareError> {
+        let token = std::env::var("CF_API_TOKEN")
+            .map_err(|_| CloudflareError::TokenFileRead("CF_API_TOKEN environment variable not set".to_string()))?;
+        Self::new(token)
+    }
+
+    /// Create a Cloudflare client, preferring file-based token if available.
+    ///
+    /// Checks in order:
+    /// 1. CF_API_TOKEN_FILE environment variable (path to token file)
+    /// 2. CF_API_TOKEN environment variable (direct token value)
+    ///
+    /// This allows secure deployments to use file-based tokens while
+    /// maintaining backwards compatibility with environment variables.
+    pub fn from_env_or_file() -> Result<Self, CloudflareError> {
+        // First try file-based token (more secure)
+        if let Ok(token_file) = std::env::var("CF_API_TOKEN_FILE") {
+            return Self::from_token_file(std::path::Path::new(&token_file));
+        }
+
+        // Fall back to environment variable
+        Self::from_env()
     }
 
     /// Get the zone ID for a domain.
