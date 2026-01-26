@@ -26,7 +26,7 @@ use crate::metrics::{
 };
 
 use super::config_generator::GatewayState;
-use super::context::Context;
+use super::context::{trigger_config_update as shared_trigger_config_update, Context};
 
 /// Error type for Secret reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -136,7 +136,8 @@ pub async fn reconcile_secret(
     let cert_data = data.get("tls.crt").ok_or(SecretError::MissingTlsData)?;
     let key_data = data.get("tls.key").ok_or(SecretError::MissingTlsData)?;
 
-    let cert_path = write_tls_file(&ctx.tls_cert_dir, &namespace, &name, "crt", &cert_data.0).await?;
+    let cert_path =
+        write_tls_file(&ctx.tls_cert_dir, &namespace, &name, "crt", &cert_data.0).await?;
     let key_path = write_tls_file(&ctx.tls_cert_dir, &namespace, &name, "key", &key_data.0).await?;
 
     // Record extraction metrics
@@ -176,18 +177,16 @@ pub async fn reconcile_secret(
     );
 
     // Trigger configuration regeneration
-    trigger_config_update(&ctx, &namespace, &name, cert_path, key_path).await?;
+    trigger_config_update(&ctx, &namespace, &name, cert_path, key_path)
+        .await
+        .map_err(|e| SecretError::ConfigError(e.to_string()))?;
 
     metrics.record_success();
     Ok(Action::requeue(Duration::from_secs(300))) // Recheck every 5 minutes
 }
 
 /// Handle errors during Secret reconciliation.
-pub fn error_policy_secret(
-    secret: Arc<Secret>,
-    error: &SecretError,
-    _ctx: Arc<Context>,
-) -> Action {
+pub fn error_policy_secret(secret: Arc<Secret>, error: &SecretError, _ctx: Arc<Context>) -> Action {
     let namespace = secret.namespace().unwrap_or_default();
     let name = secret.name_any();
 
@@ -199,7 +198,10 @@ pub fn error_policy_secret(
     );
 
     // Track extraction failures for TLS-related errors
-    if matches!(error, SecretError::MissingTlsData | SecretError::WriteFile(_) | SecretError::Base64Decode(_)) {
+    if matches!(
+        error,
+        SecretError::MissingTlsData | SecretError::WriteFile(_) | SecretError::Base64Decode(_)
+    ) {
         TLS_SECRET_EXTRACTIONS_TOTAL
             .with_label_values(&[&namespace, "failure"])
             .inc();
@@ -265,7 +267,7 @@ async fn validate_reference_grant(
     gateway_ns: &str,  // Namespace of the Gateway making the reference
     secret_name: &str, // Name of the secret being referenced
 ) -> Result<bool, SecretError> {
-    use crate::metrics::{REFERENCE_GRANT_VALIDATIONS_TOTAL, CROSS_NAMESPACE_BLOCKED_TOTAL};
+    use crate::metrics::{CROSS_NAMESPACE_BLOCKED_TOTAL, REFERENCE_GRANT_VALIDATIONS_TOTAL};
 
     // ReferenceGrant must exist in the target namespace (secret's namespace)
     let grant_api: Api<ReferenceGrant> = Api::namespaced(client.clone(), secret_ns);
@@ -409,6 +411,8 @@ async fn write_tls_file(
 }
 
 /// Trigger a full configuration update with the new TLS secret.
+///
+/// This wraps the shared trigger_config_update but adds the TLS secret to the state first.
 async fn trigger_config_update(
     ctx: &Context,
     secret_ns: &str,
@@ -416,9 +420,7 @@ async fn trigger_config_update(
     cert_path: PathBuf,
     key_path: PathBuf,
 ) -> Result<(), SecretError> {
-    use super::service::load_all_service_endpoints;
-    use crate::crds::{HTTPRoute, TCPRoute, TLSRoute};
-
+    // First, add this TLS secret to the state by updating the config
     let mut state = GatewayState::default();
 
     // Add this TLS secret to state
@@ -433,6 +435,11 @@ async fn trigger_config_update(
 
     // Load all other TLS secrets that have been extracted
     load_existing_tls_secrets(&ctx.tls_cert_dir, &mut state).await;
+
+    // Now use the shared function to load all resources and update config
+    // We need to manually do this since the shared function doesn't handle TLS secrets
+    use super::service::load_all_service_endpoints;
+    use crate::crds::{HTTPRoute, TCPRoute, TLSRoute};
 
     // Load all Gateways (only Wicket-managed ones)
     let gw_api: Api<Gateway> = Api::all(ctx.client.clone());
@@ -572,7 +579,7 @@ async fn load_existing_tls_secrets(tls_cert_dir: &str, state: &mut GatewayState)
 
 /// Create the Secret controller for watching TLS secret changes.
 pub async fn run_secret_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
-    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL, WATCH_EVENTS_TOTAL};
 
     let api: Api<Secret> = if ctx.watch_all_namespaces {
         Api::all(ctx.client.clone())
@@ -583,7 +590,9 @@ pub async fn run_secret_controller(ctx: Arc<Context>) -> Result<(), kube::Error>
     // Only watch TLS-type secrets
     let config = Config::default();
 
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Secret"]).set(1);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["Secret"])
+        .set(1);
 
     Controller::new(api, config)
         .run(reconcile_secret, error_policy_secret, ctx)
@@ -612,7 +621,9 @@ pub async fn run_secret_controller(ctx: Arc<Context>) -> Result<(), kube::Error>
         })
         .await;
 
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Secret"]).set(0);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["Secret"])
+        .set(0);
 
     Ok(())
 }

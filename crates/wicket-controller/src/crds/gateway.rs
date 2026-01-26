@@ -306,21 +306,25 @@ pub struct ListenerStatus {
 impl Gateway {
     /// Get all HTTP/HTTPS listeners.
     pub fn http_listeners(&self) -> impl Iterator<Item = &Listener> {
-        self.spec.listeners.iter().filter(|l| {
-            matches!(l.protocol, ProtocolType::HTTP | ProtocolType::HTTPS)
-        })
+        self.spec
+            .listeners
+            .iter()
+            .filter(|l| matches!(l.protocol, ProtocolType::HTTP | ProtocolType::HTTPS))
     }
 
     /// Get all TCP listeners.
     pub fn tcp_listeners(&self) -> impl Iterator<Item = &Listener> {
-        self.spec.listeners.iter().filter(|l| {
-            matches!(l.protocol, ProtocolType::TCP | ProtocolType::TLS)
-        })
+        self.spec
+            .listeners
+            .iter()
+            .filter(|l| matches!(l.protocol, ProtocolType::TCP | ProtocolType::TLS))
     }
 
     /// Check if TLS is configured for a listener.
     pub fn listener_has_tls(&self, listener_name: &str) -> bool {
-        self.spec.listeners.iter()
+        self.spec
+            .listeners
+            .iter()
             .find(|l| l.name == listener_name)
             .map(|l| l.tls.is_some())
             .unwrap_or(false)
@@ -333,42 +337,45 @@ mod tests {
 
     #[test]
     fn test_gateway_http_listeners() {
-        let gw = Gateway::new("test", GatewaySpec {
-            gateway_class_name: "wicket".to_string(),
-            listeners: vec![
-                Listener {
-                    name: "http".to_string(),
-                    hostname: None,
-                    port: 80,
-                    protocol: ProtocolType::HTTP,
-                    tls: None,
-                    allowed_routes: None,
-                },
-                Listener {
-                    name: "https".to_string(),
-                    hostname: None,
-                    port: 443,
-                    protocol: ProtocolType::HTTPS,
-                    tls: Some(GatewayTLSConfig {
-                        mode: TLSModeType::Terminate,
-                        certificate_refs: vec![],
-                        options: None,
-                        frontend_validation: None,
-                    }),
-                    allowed_routes: None,
-                },
-                Listener {
-                    name: "tcp".to_string(),
-                    hostname: None,
-                    port: 5432,
-                    protocol: ProtocolType::TCP,
-                    tls: None,
-                    allowed_routes: None,
-                },
-            ],
-            addresses: vec![],
-            infrastructure: None,
-        });
+        let gw = Gateway::new(
+            "test",
+            GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![
+                    Listener {
+                        name: "http".to_string(),
+                        hostname: None,
+                        port: 80,
+                        protocol: ProtocolType::HTTP,
+                        tls: None,
+                        allowed_routes: None,
+                    },
+                    Listener {
+                        name: "https".to_string(),
+                        hostname: None,
+                        port: 443,
+                        protocol: ProtocolType::HTTPS,
+                        tls: Some(GatewayTLSConfig {
+                            mode: TLSModeType::Terminate,
+                            certificate_refs: vec![],
+                            options: None,
+                            frontend_validation: None,
+                        }),
+                        allowed_routes: None,
+                    },
+                    Listener {
+                        name: "tcp".to_string(),
+                        hostname: None,
+                        port: 5432,
+                        protocol: ProtocolType::TCP,
+                        tls: None,
+                        allowed_routes: None,
+                    },
+                ],
+                addresses: vec![],
+                infrastructure: None,
+            },
+        );
 
         assert_eq!(gw.http_listeners().count(), 2);
         assert_eq!(gw.tcp_listeners().count(), 1);

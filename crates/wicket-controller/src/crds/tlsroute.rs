@@ -60,7 +60,9 @@ pub struct TLSRouteStatus {
 impl TLSRoute {
     /// Get all backend service references from this route.
     pub fn backend_refs(&self) -> Vec<&BackendRef> {
-        self.spec.rules.iter()
+        self.spec
+            .rules
+            .iter()
             .flat_map(|rule| rule.backend_refs.iter())
             .collect()
     }
@@ -91,11 +93,14 @@ mod tests {
 
     #[test]
     fn test_sni_matching() {
-        let route = TLSRoute::new("test", TLSRouteSpec {
-            parent_refs: vec![],
-            hostnames: vec!["db.example.com".to_string(), "*.internal.com".to_string()],
-            rules: vec![],
-        });
+        let route = TLSRoute::new(
+            "test",
+            TLSRouteSpec {
+                parent_refs: vec![],
+                hostnames: vec!["db.example.com".to_string(), "*.internal.com".to_string()],
+                rules: vec![],
+            },
+        );
 
         assert!(route.matches_sni("db.example.com"));
         assert!(route.matches_sni("postgres.internal.com"));

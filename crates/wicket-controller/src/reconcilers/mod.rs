@@ -14,7 +14,7 @@ mod tcproute;
 mod tlsroute;
 
 pub use config_generator::*;
-pub use context::*;
+pub use context::{trigger_config_update, *};
 pub use gateway::*;
 pub use gateway_class::*;
 pub use httproute::*;

@@ -6,7 +6,9 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::common::{BackendRef, Condition, Duration, Hostname, ParentReference, RouteParentStatus};
+use super::common::{
+    BackendRef, Condition, Duration, Hostname, ParentReference, RouteParentStatus,
+};
 
 /// HTTPRouteSpec defines the desired state of HTTPRoute.
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -372,7 +374,9 @@ pub struct HTTPRouteStatus {
 impl HTTPRoute {
     /// Get all backend service references from this route.
     pub fn backend_refs(&self) -> Vec<&BackendRef> {
-        self.spec.rules.iter()
+        self.spec
+            .rules
+            .iter()
             .flat_map(|rule| rule.backend_refs.iter())
             .map(|br| &br.backend_ref)
             .collect()
@@ -404,11 +408,14 @@ mod tests {
 
     #[test]
     fn test_hostname_matching() {
-        let route = HTTPRoute::new("test", HTTPRouteSpec {
-            parent_refs: vec![],
-            hostnames: vec!["example.com".to_string(), "*.test.com".to_string()],
-            rules: vec![],
-        });
+        let route = HTTPRoute::new(
+            "test",
+            HTTPRouteSpec {
+                parent_refs: vec![],
+                hostnames: vec!["example.com".to_string(), "*.test.com".to_string()],
+                rules: vec![],
+            },
+        );
 
         assert!(route.matches_hostname("example.com"));
         assert!(route.matches_hostname("api.test.com"));
@@ -418,11 +425,14 @@ mod tests {
 
     #[test]
     fn test_empty_hostnames_matches_all() {
-        let route = HTTPRoute::new("test", HTTPRouteSpec {
-            parent_refs: vec![],
-            hostnames: vec![],
-            rules: vec![],
-        });
+        let route = HTTPRoute::new(
+            "test",
+            HTTPRouteSpec {
+                parent_refs: vec![],
+                hostnames: vec![],
+                rules: vec![],
+            },
+        );
 
         assert!(route.matches_hostname("anything.com"));
     }

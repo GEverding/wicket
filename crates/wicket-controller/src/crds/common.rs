@@ -174,11 +174,21 @@ impl Condition {
     }
 
     pub fn programmed() -> Self {
-        Self::new("Programmed", true, "Programmed", "Resource has been programmed")
+        Self::new(
+            "Programmed",
+            true,
+            "Programmed",
+            "Resource has been programmed",
+        )
     }
 
     pub fn resolved_refs() -> Self {
-        Self::new("ResolvedRefs", true, "ResolvedRefs", "All references resolved")
+        Self::new(
+            "ResolvedRefs",
+            true,
+            "ResolvedRefs",
+            "All references resolved",
+        )
     }
 
     pub fn invalid(message: &str) -> Self {

@@ -60,10 +60,12 @@ RUN if [ "$ENABLE_EBPF" = "true" ]; then \
     fi
 
 # Create non-root user
-RUN useradd -m -u 1000 wicket
+RUN groupadd -g 65532 wicket && \
+    useradd -u 65532 -g wicket -s /sbin/nologin wicket
 
-# Create config directory
-RUN mkdir -p /etc/wicket && chown -R wicket:wicket /etc/wicket
+# Create directories for TLS certificates and config
+RUN mkdir -p /etc/wicket /var/run/wicket/tls && \
+    chown -R wicket:wicket /etc/wicket /var/run/wicket
 
 # Copy binary from builder
 COPY --from=builder /build/target/release/wicket /usr/local/bin/wicket

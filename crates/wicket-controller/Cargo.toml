@@ -47,6 +47,7 @@ thiserror = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
+regex = { workspace = true }
 
 # Hostname lookup for leader election
 hostname = "0.4"

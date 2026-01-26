@@ -56,7 +56,9 @@ pub struct TCPRouteStatus {
 impl TCPRoute {
     /// Get all backend service references from this route.
     pub fn backend_refs(&self) -> Vec<&BackendRef> {
-        self.spec.rules.iter()
+        self.spec
+            .rules
+            .iter()
             .flat_map(|rule| rule.backend_refs.iter())
             .collect()
     }
@@ -68,24 +70,23 @@ mod tests {
 
     #[test]
     fn test_tcp_route_backend_refs() {
-        let route = TCPRoute::new("test", TCPRouteSpec {
-            parent_refs: vec![],
-            rules: vec![
-                TCPRouteRule {
+        let route = TCPRoute::new(
+            "test",
+            TCPRouteSpec {
+                parent_refs: vec![],
+                rules: vec![TCPRouteRule {
                     name: Some("rule1".to_string()),
-                    backend_refs: vec![
-                        BackendRef {
-                            group: "".to_string(),
-                            kind: "Service".to_string(),
-                            name: "backend-1".to_string(),
-                            namespace: None,
-                            port: Some(5432),
-                            weight: 1,
-                        },
-                    ],
-                },
-            ],
-        });
+                    backend_refs: vec![BackendRef {
+                        group: "".to_string(),
+                        kind: "Service".to_string(),
+                        name: "backend-1".to_string(),
+                        namespace: None,
+                        port: Some(5432),
+                        weight: 1,
+                    }],
+                }],
+            },
+        );
 
         assert_eq!(route.backend_refs().len(), 1);
         assert_eq!(route.backend_refs()[0].name, "backend-1");

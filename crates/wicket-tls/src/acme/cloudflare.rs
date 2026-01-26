@@ -63,8 +63,9 @@ impl CloudflareClient {
     /// Note: Environment variables are visible in /proc and process listings.
     /// Prefer `from_token_file` for production deployments.
     pub fn from_env() -> Result<Self, CloudflareError> {
-        let token = std::env::var("CF_API_TOKEN")
-            .map_err(|_| CloudflareError::TokenFileRead("CF_API_TOKEN environment variable not set".to_string()))?;
+        let token = std::env::var("CF_API_TOKEN").map_err(|_| {
+            CloudflareError::TokenFileRead("CF_API_TOKEN environment variable not set".to_string())
+        })?;
         Self::new(token)
     }
 

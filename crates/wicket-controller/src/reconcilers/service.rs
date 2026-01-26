@@ -356,7 +356,7 @@ pub async fn load_all_service_endpoints(client: &Client, state: &mut GatewayStat
 
 /// Create the Endpoints controller for watching service changes.
 pub async fn run_endpoints_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
-    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL, WATCH_EVENTS_TOTAL};
 
     let api: Api<Endpoints> = if ctx.watch_all_namespaces {
         Api::all(ctx.client.clone())
@@ -364,7 +364,9 @@ pub async fn run_endpoints_controller(ctx: Arc<Context>) -> Result<(), kube::Err
         Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
     };
 
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Endpoints"]).set(1);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["Endpoints"])
+        .set(1);
 
     Controller::new(api, Config::default())
         .run(reconcile_endpoints, error_policy_endpoints, ctx)
@@ -393,7 +395,9 @@ pub async fn run_endpoints_controller(ctx: Arc<Context>) -> Result<(), kube::Err
         })
         .await;
 
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Endpoints"]).set(0);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["Endpoints"])
+        .set(0);
 
     Ok(())
 }
@@ -479,7 +483,7 @@ pub fn error_policy_service(
 
 /// Create the Service controller for watching service spec changes.
 pub async fn run_service_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
-    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL, WATCH_EVENTS_TOTAL};
 
     let api: Api<Service> = if ctx.watch_all_namespaces {
         Api::all(ctx.client.clone())
@@ -487,7 +491,9 @@ pub async fn run_service_controller(ctx: Arc<Context>) -> Result<(), kube::Error
         Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
     };
 
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Service"]).set(1);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["Service"])
+        .set(1);
 
     Controller::new(api, Config::default())
         .run(reconcile_service, error_policy_service, ctx)
@@ -516,7 +522,9 @@ pub async fn run_service_controller(ctx: Arc<Context>) -> Result<(), kube::Error
         })
         .await;
 
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Service"]).set(0);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["Service"])
+        .set(0);
 
     Ok(())
 }

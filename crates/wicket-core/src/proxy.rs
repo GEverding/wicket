@@ -564,7 +564,9 @@ impl ProxyHttp for WicketProxy {
         if let Some(resp) = session.response_written() {
             if let Some(cl) = resp.headers.get("content-length") {
                 if let Ok(bytes) = cl.to_str().unwrap_or("0").parse::<u64>() {
-                    BYTES_SENT_TOTAL.with_label_values(&[route_label]).inc_by(bytes);
+                    BYTES_SENT_TOTAL
+                        .with_label_values(&[route_label])
+                        .inc_by(bytes);
                 }
             }
         }

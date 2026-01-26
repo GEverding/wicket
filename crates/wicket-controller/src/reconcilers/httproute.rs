@@ -14,13 +14,13 @@ use kube::{
 };
 
 use crate::crds::{
-    Gateway, GatewayClass, HTTPRoute, HTTPRouteStatus, RouteParentStatus,
-    Condition, ParentReference, WICKET_CONTROLLER_NAME,
+    Condition, Gateway, GatewayClass, HTTPRoute, HTTPRouteStatus, ParentReference,
+    RouteParentStatus, WICKET_CONTROLLER_NAME,
 };
 use crate::metrics::{ReconcileMetrics, HTTPROUTES_TOTAL, ROUTES_ACCEPTED, ROUTES_REJECTED_TOTAL};
 
 use super::config_generator::GatewayState;
-use super::context::Context;
+use super::context::{trigger_config_update, Context};
 
 /// Error type for HTTPRoute reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -73,10 +73,7 @@ pub async fn reconcile_httproute(
                     parent_statuses.push(RouteParentStatus {
                         parent_ref: parent_ref.clone(),
                         controller_name: ctx.controller_name.clone(),
-                        conditions: vec![
-                            Condition::accepted(),
-                            Condition::resolved_refs(),
-                        ],
+                        conditions: vec![Condition::accepted(), Condition::resolved_refs()],
                     });
                 } else {
                     parent_statuses.push(RouteParentStatus {
@@ -125,13 +122,19 @@ pub async fn reconcile_httproute(
 
     // If we have a valid parent, trigger configuration update
     if has_valid_parent {
-        trigger_config_update(&ctx).await?;
+        trigger_config_update(&ctx, "HTTPRoute reconciled")
+            .await
+            .map_err(|e| HTTPRouteError::ConfigError(e.to_string()))?;
         tracing::info!(namespace = %namespace, name = %name, "HTTPRoute accepted");
 
         // Update route acceptance metrics for each valid parent
         for parent_status in &status.parents {
             let gw_name = &parent_status.parent_ref.name;
-            if parent_status.conditions.iter().any(|c| c.type_ == "Accepted" && c.status == "True") {
+            if parent_status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == "Accepted" && c.status == "True")
+            {
                 ROUTES_ACCEPTED
                     .with_label_values(&[&namespace, "HTTPRoute", gw_name])
                     .set(1);
@@ -208,83 +211,9 @@ async fn update_httproute_metrics(client: &Client) {
     }
 }
 
-/// Trigger a full configuration update.
-async fn trigger_config_update(ctx: &Context) -> Result<(), HTTPRouteError> {
-    let mut state = GatewayState::default();
-
-    // Load all Gateways
-    let gw_api: Api<Gateway> = Api::all(ctx.client.clone());
-    if let Ok(gateways) = gw_api.list(&Default::default()).await {
-        for gateway in gateways.items {
-            // Only include Wicket-managed gateways
-            let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
-            let is_wicket = gc_api
-                .get(&gateway.spec.gateway_class_name)
-                .await
-                .map(|gc| gc.is_wicket_managed())
-                .unwrap_or(false);
-
-            if is_wicket {
-                let gw_key = GatewayState::key(
-                    gateway.namespace().as_deref().unwrap_or("default"),
-                    &gateway.name_any(),
-                );
-                state.gateways.insert(gw_key, gateway);
-            }
-        }
-    }
-
-    // Load all HTTPRoutes
-    let route_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.http_routes.insert(route_key, route);
-        }
-    }
-
-    // Load all TCPRoutes
-    let tcp_route_api: Api<crate::crds::TCPRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = tcp_route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.tcp_routes.insert(route_key, route);
-        }
-    }
-
-    // Load all TLSRoutes
-    let tls_route_api: Api<crate::crds::TLSRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = tls_route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.tls_routes.insert(route_key, route);
-        }
-    }
-
-    // Load service endpoints
-    super::gateway::load_service_endpoints(&ctx.client, &mut state).await;
-
-    // Generate and update config
-    let config = state.generate_config();
-    ctx.update_config(config)
-        .await
-        .map_err(|e| HTTPRouteError::ConfigError(e.to_string()))?;
-
-    Ok(())
-}
-
 /// Create the HTTPRoute controller.
 pub async fn run_httproute_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
-    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL, WATCH_EVENTS_TOTAL};
 
     let api: Api<HTTPRoute> = if ctx.watch_all_namespaces {
         Api::all(ctx.client.clone())
@@ -292,7 +221,9 @@ pub async fn run_httproute_controller(ctx: Arc<Context>) -> Result<(), kube::Err
         Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
     };
 
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["HTTPRoute"]).set(1);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["HTTPRoute"])
+        .set(1);
 
     Controller::new(api, Config::default())
         .run(reconcile_httproute, error_policy_httproute, ctx)
@@ -321,7 +252,9 @@ pub async fn run_httproute_controller(ctx: Arc<Context>) -> Result<(), kube::Err
         })
         .await;
 
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["HTTPRoute"]).set(0);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["HTTPRoute"])
+        .set(0);
 
     Ok(())
 }
