@@ -233,7 +233,9 @@ impl AcmeProvider {
         let account = self.get_or_create_account().await?;
 
         // Create DNS client for challenges using resolved token (supports file-based secrets)
-        let api_token = cert_config.dns.resolve_api_token()
+        let api_token = cert_config
+            .dns
+            .resolve_api_token()
             .map_err(|e| AcmeError::Config(e))?;
         let dns_client = CloudflareClient::new(api_token)?;
 
@@ -356,11 +358,10 @@ impl AcmeProvider {
         }
 
         // Parse expiry from the actual certificate
-        let expiry = parse_certificate_expiry(&cert_pem)
-            .unwrap_or_else(|| {
-                warn!("Failed to parse certificate expiry, using 90 days from now");
-                Utc::now() + chrono::Duration::days(90)
-            });
+        let expiry = parse_certificate_expiry(&cert_pem).unwrap_or_else(|| {
+            warn!("Failed to parse certificate expiry, using 90 days from now");
+            Utc::now() + chrono::Duration::days(90)
+        });
 
         let stored = StoredCert {
             cert_pem,

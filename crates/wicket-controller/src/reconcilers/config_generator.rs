@@ -1,11 +1,13 @@
 //! Configuration generator that converts Gateway API resources to Wicket TOML config.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use tracing::warn;
 
 use crate::crds::{
-    Gateway, GatewaySpec, HTTPRoute, HTTPRouteRule, Listener, ProtocolType,
-    TCPRoute, TLSRoute, BackendRef,
+    BackendRef, Gateway, GatewaySpec, HTTPRoute, HTTPRouteRule, Listener, ProtocolType, TCPRoute,
+    TLSRoute,
 };
 
 /// Generated Wicket configuration that matches wicket-config format.
@@ -361,6 +363,51 @@ pub struct GatewayState {
     pub tls_secrets: HashMap<String, (String, String)>,
 }
 
+/// Validates a regex pattern for complexity and ReDoS vulnerability.
+///
+/// Checks:
+/// - Pattern length <= 1000 characters
+/// - Compiled regex size <= 100,000 bytes
+/// - Rejects patterns with nested quantifiers like `(a+)+` or `(a*)*`
+///
+/// Returns `Some(pattern)` if valid, `None` if invalid.
+fn validate_regex_pattern(pattern: &str) -> Option<String> {
+    const MAX_PATTERN_LEN: usize = 1000;
+    const MAX_COMPILED_SIZE: usize = 100_000;
+
+    // Check pattern length
+    if pattern.len() > MAX_PATTERN_LEN {
+        warn!(
+            pattern_len = pattern.len(),
+            max_len = MAX_PATTERN_LEN,
+            "Regex pattern exceeds maximum length"
+        );
+        return None;
+    }
+
+    // Check for nested quantifiers: (a+)+, (a*)*, (a+)*, (a*)+, etc.
+    // Look for )+, )*, )+?, )*? patterns which indicate quantifier after group
+    if pattern.contains(")+") || pattern.contains(")*") {
+        warn!("Regex pattern contains nested quantifiers");
+        return None;
+    }
+
+    // Try to compile with size limit
+    match RegexBuilder::new(pattern)
+        .size_limit(MAX_COMPILED_SIZE)
+        .build()
+    {
+        Ok(_) => Some(pattern.to_string()),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Failed to compile regex pattern or exceeded size limit"
+            );
+            None
+        }
+    }
+}
+
 impl GatewayState {
     /// Create a key from namespace and name.
     pub fn key(namespace: &str, name: &str) -> String {
@@ -415,18 +462,16 @@ impl GatewayState {
                 }
                 HTTPRouteFilterType::RequestRedirect => {
                     if let Some(ref redirect) = filter.request_redirect {
-                        let path = redirect.path.as_ref().map(|p| {
-                            match p.type_ {
-                                crate::crds::HTTPPathModifierType::ReplaceFullPath => {
-                                    PathModifier::ReplaceFullPath(
-                                        p.replace_full_path.clone().unwrap_or_default()
-                                    )
-                                }
-                                crate::crds::HTTPPathModifierType::ReplacePrefixMatch => {
-                                    PathModifier::ReplacePrefixMatch(
-                                        p.replace_prefix_match.clone().unwrap_or_default()
-                                    )
-                                }
+                        let path = redirect.path.as_ref().map(|p| match p.type_ {
+                            crate::crds::HTTPPathModifierType::ReplaceFullPath => {
+                                PathModifier::ReplaceFullPath(
+                                    p.replace_full_path.clone().unwrap_or_default(),
+                                )
+                            }
+                            crate::crds::HTTPPathModifierType::ReplacePrefixMatch => {
+                                PathModifier::ReplacePrefixMatch(
+                                    p.replace_prefix_match.clone().unwrap_or_default(),
+                                )
                             }
                         });
                         result.redirect = Some(RedirectFilter {
@@ -441,18 +486,16 @@ impl GatewayState {
                 }
                 HTTPRouteFilterType::URLRewrite => {
                     if let Some(ref rewrite) = filter.url_rewrite {
-                        let path = rewrite.path.as_ref().map(|p| {
-                            match p.type_ {
-                                crate::crds::HTTPPathModifierType::ReplaceFullPath => {
-                                    PathModifier::ReplaceFullPath(
-                                        p.replace_full_path.clone().unwrap_or_default()
-                                    )
-                                }
-                                crate::crds::HTTPPathModifierType::ReplacePrefixMatch => {
-                                    PathModifier::ReplacePrefixMatch(
-                                        p.replace_prefix_match.clone().unwrap_or_default()
-                                    )
-                                }
+                        let path = rewrite.path.as_ref().map(|p| match p.type_ {
+                            crate::crds::HTTPPathModifierType::ReplaceFullPath => {
+                                PathModifier::ReplaceFullPath(
+                                    p.replace_full_path.clone().unwrap_or_default(),
+                                )
+                            }
+                            crate::crds::HTTPPathModifierType::ReplacePrefixMatch => {
+                                PathModifier::ReplacePrefixMatch(
+                                    p.replace_prefix_match.clone().unwrap_or_default(),
+                                )
                             }
                         });
                         result.url_rewrite = Some(UrlRewriteFilter {
@@ -464,28 +507,32 @@ impl GatewayState {
                 }
                 HTTPRouteFilterType::RequestMirror => {
                     if let Some(ref mirror) = filter.request_mirror {
-                        let backend_ns = mirror.backend_ref.namespace.as_deref().unwrap_or(route_ns);
-                        let mirror_upstream_name = format!("mirror-{}-{}", backend_ns, mirror.backend_ref.name);
+                        let backend_ns =
+                            mirror.backend_ref.namespace.as_deref().unwrap_or(route_ns);
+                        let mirror_upstream_name =
+                            format!("mirror-{}-{}", backend_ns, mirror.backend_ref.name);
 
                         // Create upstream for mirror backend
                         let backend_key = Self::key(backend_ns, &mirror.backend_ref.name);
-                        let backends = if let Some(endpoints) = service_endpoints.get(&backend_key) {
+                        let backends = if let Some(endpoints) = service_endpoints.get(&backend_key)
+                        {
                             endpoints.endpoints.clone()
                         } else {
                             let port = mirror.backend_ref.port.unwrap_or(80);
                             vec![format!(
                                 "{}.{}.svc.cluster.local:{}",
-                                mirror.backend_ref.name,
-                                backend_ns,
-                                port
+                                mirror.backend_ref.name, backend_ns, port
                             )]
                         };
 
-                        upstreams.insert(mirror_upstream_name.clone(), UpstreamConfig {
-                            backends,
-                            strategy: "round_robin".to_string(),
-                            health_check: None,
-                        });
+                        upstreams.insert(
+                            mirror_upstream_name.clone(),
+                            UpstreamConfig {
+                                backends,
+                                strategy: "round_robin".to_string(),
+                                health_check: None,
+                            },
+                        );
 
                         result.mirror = Some(MirrorFilter {
                             upstream: mirror_upstream_name,
@@ -500,7 +547,11 @@ impl GatewayState {
             }
         }
 
-        if has_filters { Some(result) } else { None }
+        if has_filters {
+            Some(result)
+        } else {
+            None
+        }
     }
 
     /// Parse Duration string to seconds.
@@ -560,16 +611,15 @@ impl GatewayState {
 
             for (rule_idx, rule) in route.spec.rules.iter().enumerate() {
                 // Create upstream from backend refs
-                let upstream_name = format!(
-                    "{}-{}-rule{}",
-                    route_ns,
-                    route_name,
-                    rule_idx
-                );
+                let upstream_name = format!("{}-{}-rule{}", route_ns, route_name, rule_idx);
 
                 let mut backend_addrs = Vec::new();
                 for backend_ref in &rule.backend_refs {
-                    let backend_ns = backend_ref.backend_ref.namespace.as_deref().unwrap_or(route_ns);
+                    let backend_ns = backend_ref
+                        .backend_ref
+                        .namespace
+                        .as_deref()
+                        .unwrap_or(route_ns);
                     let backend_key = Self::key(backend_ns, &backend_ref.backend_ref.name);
 
                     if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
@@ -579,19 +629,20 @@ impl GatewayState {
                         let port = backend_ref.backend_ref.port.unwrap_or(80);
                         backend_addrs.push(format!(
                             "{}.{}.svc.cluster.local:{}",
-                            backend_ref.backend_ref.name,
-                            backend_ns,
-                            port
+                            backend_ref.backend_ref.name, backend_ns, port
                         ));
                     }
                 }
 
                 if !backend_addrs.is_empty() {
-                    upstreams.insert(upstream_name.clone(), UpstreamConfig {
-                        backends: backend_addrs,
-                        strategy: "round_robin".to_string(),
-                        health_check: None,
-                    });
+                    upstreams.insert(
+                        upstream_name.clone(),
+                        UpstreamConfig {
+                            backends: backend_addrs,
+                            strategy: "round_robin".to_string(),
+                            health_check: None,
+                        },
+                    );
 
                     // Convert filters from the rule
                     let filters = Self::convert_filters(
@@ -603,7 +654,9 @@ impl GatewayState {
 
                     // Parse timeout from rule
                     let timeout = rule.timeouts.as_ref().and_then(|t| {
-                        t.request.as_ref().and_then(|d| Self::parse_duration_to_secs(d))
+                        t.request
+                            .as_ref()
+                            .and_then(|d| Self::parse_duration_to_secs(d))
                     });
 
                     // Create routes from matches
@@ -627,7 +680,9 @@ impl GatewayState {
                         routes.push(route_config);
                     } else {
                         for (match_idx, route_match) in rule.matches.iter().enumerate() {
-                            let (path, path_prefix, path_regex) = if let Some(ref path_match) = route_match.path {
+                            let (path, path_prefix, path_regex) = if let Some(ref path_match) =
+                                route_match.path
+                            {
                                 match path_match.type_ {
                                     crate::crds::PathMatchType::Exact => {
                                         (Some(path_match.value.clone()), None, None)
@@ -636,19 +691,37 @@ impl GatewayState {
                                         (None, Some(path_match.value.clone()), None)
                                     }
                                     crate::crds::PathMatchType::RegularExpression => {
-                                        // Support regex paths
-                                        (None, None, Some(path_match.value.clone()))
+                                        // Validate regex pattern for ReDoS vulnerability
+                                        match validate_regex_pattern(&path_match.value) {
+                                            Some(validated_pattern) => {
+                                                (None, None, Some(validated_pattern))
+                                            }
+                                            None => {
+                                                warn!(
+                                                    route = %format!("{}/{}", route_ns, route_name),
+                                                    rule_idx = rule_idx,
+                                                    match_idx = match_idx,
+                                                    pattern = %path_match.value,
+                                                    "Skipping route match due to invalid regex pattern"
+                                                );
+                                                continue;
+                                            }
+                                        }
                                     }
                                 }
                             } else {
                                 (None, Some("/".to_string()), None)
                             };
 
-                            let methods: Vec<String> = route_match.method.iter()
+                            let methods: Vec<String> = route_match
+                                .method
+                                .iter()
                                 .map(|m| format!("{:?}", m))
                                 .collect();
 
-                            let headers: HashMap<String, String> = route_match.headers.iter()
+                            let headers: HashMap<String, String> = route_match
+                                .headers
+                                .iter()
                                 .map(|h| (h.name.clone(), h.value.clone()))
                                 .collect();
 
@@ -716,17 +789,16 @@ impl GatewayState {
                             let backend_ns = backend_ref.namespace.as_deref().unwrap_or(route_ns);
                             let backend_key = Self::key(backend_ns, &backend_ref.name);
 
-                            let servers = if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
-                                endpoints.endpoints.clone()
-                            } else {
-                                let port = backend_ref.port.unwrap_or(443);
-                                vec![format!(
-                                    "{}.{}.svc.cluster.local:{}",
-                                    backend_ref.name,
-                                    backend_ns,
-                                    port
-                                )]
-                            };
+                            let servers =
+                                if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
+                                    endpoints.endpoints.clone()
+                                } else {
+                                    let port = backend_ref.port.unwrap_or(443);
+                                    vec![format!(
+                                        "{}.{}.svc.cluster.local:{}",
+                                        backend_ref.name, backend_ns, port
+                                    )]
+                                };
 
                             stream_upstreams.push(StreamUpstreamConfig {
                                 name: upstream_name.clone(),
@@ -778,8 +850,8 @@ impl GatewayState {
 mod tests {
     use super::*;
     use crate::crds::{
-        GatewaySpec, HTTPRouteSpec, HTTPRouteRule, HTTPBackendRef,
-        Listener, ProtocolType, ParentReference,
+        GatewaySpec, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec, Listener, ParentReference,
+        ProtocolType,
     };
     use kube::core::ObjectMeta;
 
@@ -796,22 +868,22 @@ mod tests {
             },
             spec: GatewaySpec {
                 gateway_class_name: "wicket".to_string(),
-                listeners: vec![
-                    Listener {
-                        name: "http".to_string(),
-                        hostname: Some("*.example.com".to_string()),
-                        port: 8080,
-                        protocol: ProtocolType::HTTP,
-                        tls: None,
-                        allowed_routes: None,
-                    },
-                ],
+                listeners: vec![Listener {
+                    name: "http".to_string(),
+                    hostname: Some("*.example.com".to_string()),
+                    port: 8080,
+                    protocol: ProtocolType::HTTP,
+                    tls: None,
+                    allowed_routes: None,
+                }],
                 addresses: vec![],
                 infrastructure: None,
             },
             status: None,
         };
-        state.gateways.insert(GatewayState::key("default", "test-gateway"), gateway);
+        state
+            .gateways
+            .insert(GatewayState::key("default", "test-gateway"), gateway);
 
         // Add an HTTPRoute
         let route = HTTPRoute {
@@ -823,31 +895,29 @@ mod tests {
             spec: HTTPRouteSpec {
                 parent_refs: vec![],
                 hostnames: vec!["api.example.com".to_string()],
-                rules: vec![
-                    HTTPRouteRule {
-                        name: None,
-                        matches: vec![],
+                rules: vec![HTTPRouteRule {
+                    name: None,
+                    matches: vec![],
+                    filters: vec![],
+                    backend_refs: vec![HTTPBackendRef {
+                        backend_ref: crate::crds::BackendRef {
+                            group: "".to_string(),
+                            kind: "Service".to_string(),
+                            name: "api-svc".to_string(),
+                            namespace: None,
+                            port: Some(80),
+                            weight: 1,
+                        },
                         filters: vec![],
-                        backend_refs: vec![
-                            HTTPBackendRef {
-                                backend_ref: crate::crds::BackendRef {
-                                    group: "".to_string(),
-                                    kind: "Service".to_string(),
-                                    name: "api-svc".to_string(),
-                                    namespace: None,
-                                    port: Some(80),
-                                    weight: 1,
-                                },
-                                filters: vec![],
-                            },
-                        ],
-                        timeouts: None,
-                    },
-                ],
+                    }],
+                    timeouts: None,
+                }],
             },
             status: None,
         };
-        state.http_routes.insert(GatewayState::key("default", "test-route"), route);
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "test-route"), route);
 
         // Add service endpoints
         state.service_endpoints.insert(
@@ -869,5 +939,43 @@ mod tests {
         let upstream = config.upstreams.get("default-test-route-rule0").unwrap();
         assert_eq!(upstream.backends.len(), 2);
         assert!(upstream.backends.contains(&"10.0.0.1:80".to_string()));
+    }
+
+    #[test]
+    fn test_validate_regex_pattern_valid() {
+        // Valid simple patterns should pass
+        assert!(validate_regex_pattern("^/api/.*").is_some());
+        assert!(validate_regex_pattern("^/users/[0-9]+$").is_some());
+        assert!(validate_regex_pattern(".*\\.json$").is_some());
+    }
+
+    #[test]
+    fn test_validate_regex_pattern_nested_quantifiers() {
+        // Nested quantifiers should be rejected
+        assert!(validate_regex_pattern("(a+)+").is_none());
+        assert!(validate_regex_pattern("(a*)*").is_none());
+        assert!(validate_regex_pattern("(a+)*").is_none());
+        assert!(validate_regex_pattern("(a*)+").is_none());
+    }
+
+    #[test]
+    fn test_validate_regex_pattern_too_long() {
+        // Pattern exceeding max length should be rejected
+        let long_pattern = "a".repeat(1001);
+        assert!(validate_regex_pattern(&long_pattern).is_none());
+    }
+
+    #[test]
+    fn test_validate_regex_pattern_max_length_boundary() {
+        // Pattern at exactly max length should pass
+        let max_pattern = "a".repeat(1000);
+        assert!(validate_regex_pattern(&max_pattern).is_some());
+    }
+
+    #[test]
+    fn test_validate_regex_pattern_invalid_syntax() {
+        // Invalid regex syntax should be rejected
+        assert!(validate_regex_pattern("[invalid").is_none());
+        assert!(validate_regex_pattern("(?P<invalid").is_none());
     }
 }

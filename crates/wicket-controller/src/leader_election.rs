@@ -63,7 +63,11 @@ impl LeaderElection {
     /// Create a new leader election coordinator.
     pub fn new(client: Client, config: LeaderElectionConfig) -> Self {
         let api = Api::namespaced(client.clone(), &config.namespace);
-        Self { client, config, api }
+        Self {
+            client,
+            config,
+            api,
+        }
     }
 
     /// Try to acquire or renew the lease.
@@ -82,10 +86,7 @@ impl LeaderElection {
         };
 
         // Check if we already hold the lease
-        let current_holder = lease
-            .spec
-            .as_ref()
-            .and_then(|s| s.holder_identity.as_ref());
+        let current_holder = lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref());
         let is_current_holder = current_holder == Some(&self.config.holder_identity);
 
         // Check if the lease has expired
@@ -175,10 +176,7 @@ impl LeaderElection {
             .as_ref()
             .and_then(|s| s.lease_transitions)
             .unwrap_or(0);
-        let current_holder = lease
-            .spec
-            .as_ref()
-            .and_then(|s| s.holder_identity.as_ref());
+        let current_holder = lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref());
         let is_new_leader = current_holder != Some(&self.config.holder_identity);
 
         let patch = serde_json::json!({

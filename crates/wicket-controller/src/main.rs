@@ -16,8 +16,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use wicket_controller::{
     leader_election::{LeaderElection, LeaderElectionConfig},
     metrics::{
-        register_metrics, serve_metrics, CONTROLLER_IS_LEADER, CONTROLLER_UPTIME_SECONDS,
-        CONFIG_SYNC_LAG_SECONDS,
+        register_metrics, serve_metrics, CONFIG_SYNC_LAG_SECONDS, CONTROLLER_IS_LEADER,
+        CONTROLLER_UPTIME_SECONDS,
     },
     reconcilers::{
         run_endpoints_controller, run_gateway_class_controller, run_gateway_controller,
@@ -189,8 +189,7 @@ async fn main() -> anyhow::Result<()> {
             CONTROLLER_UPTIME_SECONDS.set(start_time.elapsed().as_secs() as i64);
 
             // Check if config has been updated by comparing generation
-            let current_generation =
-                wicket_controller::metrics::CONFIG_GENERATION.get();
+            let current_generation = wicket_controller::metrics::CONFIG_GENERATION.get();
             if current_generation != last_config_generation {
                 last_config_generation = current_generation;
                 last_config_update_time = std::time::Instant::now();
@@ -282,8 +281,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Initialize logging with the specified level and format.
 fn init_logging(level: &str, json: bool) -> anyhow::Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
     if json {
         tracing_subscriber::registry()

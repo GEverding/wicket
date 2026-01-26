@@ -71,9 +71,10 @@ impl ReferenceGrant {
         to_name: Option<&str>,
     ) -> bool {
         // Check if there's a matching "from" entry
-        let from_matches = self.spec.from.iter().any(|f| {
-            f.group == from_group && f.kind == from_kind && f.namespace == from_namespace
-        });
+        let from_matches =
+            self.spec.from.iter().any(|f| {
+                f.group == from_group && f.kind == from_kind && f.namespace == from_namespace
+            });
 
         if !from_matches {
             return false;

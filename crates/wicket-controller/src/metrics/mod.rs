@@ -383,7 +383,9 @@ impl ReconcileMetrics {
 }
 
 /// Serve Prometheus metrics on an HTTP endpoint.
-pub async fn serve_metrics(addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn serve_metrics(
+    addr: std::net::SocketAddr,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use axum::{routing::get, Router};
 
     async fn metrics_handler() -> String {

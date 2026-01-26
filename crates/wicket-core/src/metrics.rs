@@ -332,9 +332,7 @@ impl RequestMetrics {
         HTTP_REQUEST_DURATION_SECONDS
             .with_label_values(&[&self.method, &self.route])
             .observe(duration);
-        HTTP_REQUESTS_ACTIVE
-            .with_label_values(&[&self.route])
-            .dec();
+        HTTP_REQUESTS_ACTIVE.with_label_values(&[&self.route]).dec();
 
         BYTES_SENT_TOTAL
             .with_label_values(&[&self.route])
@@ -366,9 +364,7 @@ impl RequestMetrics {
         HTTP_REQUEST_DURATION_SECONDS
             .with_label_values(&[&self.method, &self.route])
             .observe(duration);
-        HTTP_REQUESTS_ACTIVE
-            .with_label_values(&[&self.route])
-            .dec();
+        HTTP_REQUESTS_ACTIVE.with_label_values(&[&self.route]).dec();
         REQUEST_TIMEOUTS_TOTAL
             .with_label_values(&[&self.route, timeout_type])
             .inc();
@@ -387,9 +383,7 @@ impl RequestMetrics {
         HTTP_REQUEST_DURATION_SECONDS
             .with_label_values(&[&self.method, &self.route])
             .observe(duration);
-        HTTP_REQUESTS_ACTIVE
-            .with_label_values(&[&self.route])
-            .dec();
+        HTTP_REQUESTS_ACTIVE.with_label_values(&[&self.route]).dec();
         UPSTREAM_ERRORS_TOTAL
             .with_label_values(&[upstream, error_type])
             .inc();

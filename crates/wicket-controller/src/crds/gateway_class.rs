@@ -88,18 +88,24 @@ mod tests {
 
     #[test]
     fn test_gateway_class_is_wicket_managed() {
-        let gc = GatewayClass::new("wicket", GatewayClassSpec {
-            controller_name: WICKET_CONTROLLER_NAME.to_string(),
-            description: Some("Wicket Gateway Class".to_string()),
-            parameters_ref: None,
-        });
+        let gc = GatewayClass::new(
+            "wicket",
+            GatewayClassSpec {
+                controller_name: WICKET_CONTROLLER_NAME.to_string(),
+                description: Some("Wicket Gateway Class".to_string()),
+                parameters_ref: None,
+            },
+        );
         assert!(gc.is_wicket_managed());
 
-        let gc = GatewayClass::new("other", GatewayClassSpec {
-            controller_name: "other-controller".to_string(),
-            description: None,
-            parameters_ref: None,
-        });
+        let gc = GatewayClass::new(
+            "other",
+            GatewayClassSpec {
+                controller_name: "other-controller".to_string(),
+                description: None,
+                parameters_ref: None,
+            },
+        );
         assert!(!gc.is_wicket_managed());
     }
 }

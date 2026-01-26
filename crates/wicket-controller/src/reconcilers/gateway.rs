@@ -15,14 +15,14 @@ use kube::{
 };
 
 use crate::crds::{
-    Gateway, GatewayClass, GatewayStatus, GatewayStatusAddress, AddressType,
-    Condition, ListenerStatus, RouteGroupKind,
+    AddressType, Condition, Gateway, GatewayClass, GatewayStatus, GatewayStatusAddress,
+    ListenerStatus, RouteGroupKind,
 };
 use crate::metrics::{
-    ReconcileMetrics, GATEWAYS_TOTAL, GATEWAY_PROGRAMMED, GATEWAY_LISTENER_ATTACHED_ROUTES,
+    ReconcileMetrics, GATEWAYS_TOTAL, GATEWAY_LISTENER_ATTACHED_ROUTES, GATEWAY_PROGRAMMED,
 };
 
-use super::context::Context;
+use super::context::{trigger_config_update, Context};
 
 /// Error type for Gateway reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -116,10 +116,7 @@ pub async fn reconcile_gateway(
     // Update Gateway status
     let status = GatewayStatus {
         addresses,
-        conditions: vec![
-            Condition::accepted(),
-            Condition::programmed(),
-        ],
+        conditions: vec![Condition::accepted(), Condition::programmed()],
         listeners: listener_statuses.clone(),
     };
 
@@ -155,7 +152,9 @@ pub async fn reconcile_gateway(
     update_gateway_metrics(&ctx.client).await;
 
     // Trigger configuration regeneration
-    trigger_config_update(&ctx, &gateway).await?;
+    trigger_config_update(&ctx, "Gateway reconciled")
+        .await
+        .map_err(|e| GatewayError::ConfigError(e.to_string()))?;
 
     Ok(Action::requeue(Duration::from_secs(60)))
 }
@@ -317,9 +316,7 @@ async fn update_gateway_metrics(client: &Client) {
             }
 
             for ((ns, class), count) in counts {
-                GATEWAYS_TOTAL
-                    .with_label_values(&[&ns, &class])
-                    .set(count);
+                GATEWAYS_TOTAL.with_label_values(&[&ns, &class]).set(count);
             }
         }
         Err(e) => {
@@ -328,82 +325,29 @@ async fn update_gateway_metrics(client: &Client) {
     }
 }
 
-/// Trigger a configuration update based on the current Gateway state.
-async fn trigger_config_update(ctx: &Context, gateway: &Gateway) -> Result<(), GatewayError> {
-    use super::config_generator::GatewayState;
-
-    let mut state = GatewayState::default();
-
-    // Add this gateway to state
-    let gw_key = GatewayState::key(
-        gateway.namespace().as_deref().unwrap_or("default"),
-        &gateway.name_any(),
-    );
-    state.gateways.insert(gw_key, (*gateway).clone());
-
-    // Load all HTTPRoutes
-    let route_api: Api<crate::crds::HTTPRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.http_routes.insert(route_key, route);
-        }
-    }
-
-    // Load all TCPRoutes
-    let tcp_route_api: Api<crate::crds::TCPRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = tcp_route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.tcp_routes.insert(route_key, route);
-        }
-    }
-
-    // Load all TLSRoutes
-    let tls_route_api: Api<crate::crds::TLSRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = tls_route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.tls_routes.insert(route_key, route);
-        }
-    }
-
-    // Load service endpoints
-    load_service_endpoints(&ctx.client, &mut state).await;
-
-    // Generate and update config
-    let config = state.generate_config();
-    ctx.update_config(config)
-        .await
-        .map_err(|e| GatewayError::ConfigError(e.to_string()))?;
-
-    Ok(())
-}
-
 /// Load service endpoints for all referenced services.
-pub async fn load_service_endpoints(client: &Client, state: &mut super::config_generator::GatewayState) {
-    use k8s_openapi::api::core::v1::Endpoints;
+pub async fn load_service_endpoints(
+    client: &Client,
+    state: &mut super::config_generator::GatewayState,
+) {
     use super::config_generator::ServiceEndpoints;
+    use k8s_openapi::api::core::v1::Endpoints;
 
     let endpoints_api: Api<Endpoints> = Api::all(client.clone());
 
     // Collect all referenced services
-    let mut referenced_services: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut referenced_services: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for route in state.http_routes.values() {
         let route_ns = route.namespace().unwrap_or_default();
         for rule in &route.spec.rules {
             for backend_ref in &rule.backend_refs {
-                let backend_ns = backend_ref.backend_ref.namespace.as_deref().unwrap_or(&route_ns);
+                let backend_ns = backend_ref
+                    .backend_ref
+                    .namespace
+                    .as_deref()
+                    .unwrap_or(&route_ns);
                 referenced_services.insert(super::config_generator::GatewayState::key(
                     backend_ns,
                     &backend_ref.backend_ref.name,
@@ -481,7 +425,7 @@ pub async fn load_service_endpoints(client: &Client, state: &mut super::config_g
 
 /// Create the Gateway controller.
 pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
-    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL, WATCH_EVENTS_TOTAL};
 
     let api: Api<Gateway> = if ctx.watch_all_namespaces {
         Api::all(ctx.client.clone())
@@ -490,7 +434,9 @@ pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error
     };
 
     // Track that we have an active watch connection
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Gateway"]).set(1);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["Gateway"])
+        .set(1);
 
     Controller::new(api, Config::default())
         .run(reconcile_gateway, error_policy_gateway, ctx)
@@ -520,7 +466,9 @@ pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error
         .await;
 
     // Watch ended
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["Gateway"]).set(0);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["Gateway"])
+        .set(0);
 
     Ok(())
 }

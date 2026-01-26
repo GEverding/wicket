@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::api::{Api, Patch, PatchParams};
-use kube::Client;
+use kube::{Client, ResourceExt};
 use tokio::sync::RwLock;
 
-use super::config_generator::WicketConfig;
+use super::config_generator::{GatewayState, WicketConfig};
+use crate::crds::{Gateway, GatewayClass, HTTPRoute, TCPRoute, TLSRoute};
 
 /// Shared context passed to all reconcilers.
 #[derive(Clone)]
@@ -140,4 +141,83 @@ pub enum ConfigUpdateError {
 
     #[error("Kubernetes API error: {0}")]
     KubeApi(String),
+}
+
+/// Trigger a full configuration update by loading all resources and regenerating config.
+///
+/// This is called by reconcilers when a resource changes. It loads all Gateways,
+/// Routes, and service endpoints, generates a new configuration, and updates it.
+pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), ConfigUpdateError> {
+    use super::service::load_all_service_endpoints;
+
+    tracing::debug!(reason = %reason, "Triggering configuration update");
+
+    let mut state = GatewayState::default();
+
+    // Load all Gateways (only Wicket-managed ones)
+    let gw_api: Api<Gateway> = Api::all(ctx.client.clone());
+    if let Ok(gateways) = gw_api.list(&Default::default()).await {
+        for gateway in gateways.items {
+            let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
+            let is_wicket = gc_api
+                .get(&gateway.spec.gateway_class_name)
+                .await
+                .map(|gc| gc.is_wicket_managed())
+                .unwrap_or(false);
+
+            if is_wicket {
+                let gw_key = GatewayState::key(
+                    gateway.namespace().as_deref().unwrap_or("default"),
+                    &gateway.name_any(),
+                );
+                state.gateways.insert(gw_key, gateway);
+            }
+        }
+    }
+
+    // Load all HTTPRoutes
+    let route_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
+    if let Ok(routes) = route_api.list(&Default::default()).await {
+        for route in routes.items {
+            let route_key = GatewayState::key(
+                route.namespace().as_deref().unwrap_or("default"),
+                &route.name_any(),
+            );
+            state.http_routes.insert(route_key, route);
+        }
+    }
+
+    // Load all TCPRoutes
+    let tcp_route_api: Api<TCPRoute> = Api::all(ctx.client.clone());
+    if let Ok(routes) = tcp_route_api.list(&Default::default()).await {
+        for route in routes.items {
+            let route_key = GatewayState::key(
+                route.namespace().as_deref().unwrap_or("default"),
+                &route.name_any(),
+            );
+            state.tcp_routes.insert(route_key, route);
+        }
+    }
+
+    // Load all TLSRoutes
+    let tls_route_api: Api<TLSRoute> = Api::all(ctx.client.clone());
+    if let Ok(routes) = tls_route_api.list(&Default::default()).await {
+        for route in routes.items {
+            let route_key = GatewayState::key(
+                route.namespace().as_deref().unwrap_or("default"),
+                &route.name_any(),
+            );
+            state.tls_routes.insert(route_key, route);
+        }
+    }
+
+    // Load service endpoints
+    load_all_service_endpoints(&ctx.client, &mut state).await;
+
+    // Generate and update config
+    let config = state.generate_config();
+    ctx.update_config(config).await?;
+
+    tracing::debug!(reason = %reason, "Configuration update completed");
+    Ok(())
 }

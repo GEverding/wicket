@@ -13,7 +13,7 @@ use kube::{
     Client, Resource, ResourceExt,
 };
 
-use crate::crds::{GatewayClass, GatewayClassStatus, WICKET_CONTROLLER_NAME, Condition};
+use crate::crds::{Condition, GatewayClass, GatewayClassStatus, WICKET_CONTROLLER_NAME};
 use crate::metrics::{ReconcileMetrics, GATEWAY_CLASSES_TOTAL};
 
 use super::context::Context;
@@ -130,11 +130,13 @@ async fn update_gateway_class_metrics(client: &Client) {
 
 /// Create the GatewayClass controller.
 pub async fn run_gateway_class_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
-    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL, WATCH_ERRORS_TOTAL};
+    use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL, WATCH_EVENTS_TOTAL};
 
     let api: Api<GatewayClass> = Api::all(ctx.client.clone());
 
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["GatewayClass"]).set(1);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["GatewayClass"])
+        .set(1);
 
     Controller::new(api, Config::default())
         .run(reconcile_gateway_class, error_policy_gateway_class, ctx)
@@ -159,7 +161,9 @@ pub async fn run_gateway_class_controller(ctx: Arc<Context>) -> Result<(), kube:
         })
         .await;
 
-    WATCH_CONNECTIONS_ACTIVE.with_label_values(&["GatewayClass"]).set(0);
+    WATCH_CONNECTIONS_ACTIVE
+        .with_label_values(&["GatewayClass"])
+        .set(0);
 
     Ok(())
 }

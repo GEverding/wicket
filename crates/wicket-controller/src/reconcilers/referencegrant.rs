@@ -17,8 +17,8 @@ use kube::{
 
 use crate::crds::ReferenceGrant;
 use crate::metrics::{
-    ReconcileMetrics, REFERENCE_GRANTS_TOTAL, WATCH_CONNECTIONS_ACTIVE, WATCH_EVENTS_TOTAL,
-    WATCH_ERRORS_TOTAL,
+    ReconcileMetrics, REFERENCE_GRANTS_TOTAL, WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL,
+    WATCH_EVENTS_TOTAL,
 };
 
 use super::context::Context;
