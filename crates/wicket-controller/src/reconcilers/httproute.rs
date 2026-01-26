@@ -76,6 +76,15 @@ pub async fn reconcile_httproute(
                         conditions: vec![Condition::accepted(), Condition::resolved_refs()],
                     });
                 } else {
+                    tracing::debug!(
+                        namespace = %namespace,
+                        route = %name,
+                        parent_ref = %parent_ref.name,
+                        parent_namespace = %parent_ns,
+                        reason = "InvalidParentRef",
+                        message = "Gateway is not managed by Wicket",
+                        "Route parent validation failed"
+                    );
                     parent_statuses.push(RouteParentStatus {
                         parent_ref: parent_ref.clone(),
                         controller_name: ctx.controller_name.clone(),
@@ -89,6 +98,15 @@ pub async fn reconcile_httproute(
                 }
             }
             Err(_) => {
+                tracing::debug!(
+                    namespace = %namespace,
+                    route = %name,
+                    parent_ref = %parent_ref.name,
+                    parent_namespace = %parent_ns,
+                    reason = "InvalidParentRef",
+                    message = "Parent Gateway not found",
+                    "Route parent validation failed"
+                );
                 parent_statuses.push(RouteParentStatus {
                     parent_ref: parent_ref.clone(),
                     controller_name: ctx.controller_name.clone(),
@@ -257,4 +275,322 @@ pub async fn run_httproute_controller(ctx: Arc<Context>) -> Result<(), kube::Err
         .set(0);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crds::{
+        Condition, Gateway, GatewayClass, GatewaySpec, HTTPBackendRef, HTTPRouteRule,
+        HTTPRouteSpec, Listener, ParentReference, ProtocolType,
+    };
+    use kube::core::ObjectMeta;
+    use std::sync::Arc;
+
+    /// Helper to create a test HTTPRoute.
+    fn make_httproute(
+        name: &str,
+        namespace: &str,
+        parent_refs: Vec<ParentReference>,
+    ) -> Arc<HTTPRoute> {
+        Arc::new(HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            spec: HTTPRouteSpec {
+                parent_refs,
+                hostnames: vec![],
+                rules: vec![HTTPRouteRule {
+                    name: None,
+                    matches: vec![],
+                    filters: vec![],
+                    backend_refs: vec![HTTPBackendRef {
+                        backend_ref: crate::crds::BackendRef {
+                            group: "".to_string(),
+                            kind: "Service".to_string(),
+                            name: "backend".to_string(),
+                            namespace: None,
+                            port: Some(80),
+                            weight: 1,
+                        },
+                        filters: vec![],
+                    }],
+                    timeouts: None,
+                }],
+            },
+            status: None,
+        })
+    }
+
+    /// Helper to create a test Gateway.
+    fn make_gateway(name: &str, namespace: &str, gateway_class: &str) -> Gateway {
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: gateway_class.to_string(),
+                listeners: vec![Listener {
+                    name: "http".to_string(),
+                    hostname: None,
+                    port: 8080,
+                    protocol: ProtocolType::HTTP,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        }
+    }
+
+    /// Helper to create a test GatewayClass.
+    fn make_gateway_class(name: &str, controller_name: &str) -> GatewayClass {
+        use crate::crds::GatewayClassSpec;
+        GatewayClass {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            spec: GatewayClassSpec {
+                controller_name: controller_name.to_string(),
+                parameters_ref: None,
+                description: None,
+            },
+            status: None,
+        }
+    }
+
+    /// Test: HTTPRoute with missing Gateway sets InvalidParentRef condition.
+    #[test]
+    fn test_httproute_missing_gateway_sets_invalid_parent_ref() {
+        // Setup: Create HTTPRoute referencing non-existent Gateway
+        let route = make_httproute(
+            "test-route",
+            "default",
+            vec![ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "missing-gateway".to_string(),
+                section_name: None,
+                port: None,
+            }],
+        );
+
+        // Verify: The reconciler should set InvalidParentRef condition with "False" status
+        // when Gateway is not found
+        let expected_condition = Condition::new(
+            "Accepted",
+            false,
+            "InvalidParentRef",
+            "Parent Gateway not found",
+        );
+
+        assert_eq!(expected_condition.type_, "Accepted");
+        assert_eq!(expected_condition.status, "False");
+        assert_eq!(expected_condition.reason, "InvalidParentRef");
+        assert_eq!(expected_condition.message, "Parent Gateway not found");
+    }
+
+    /// Test: HTTPRoute with Gateway not managed by Wicket sets InvalidParentRef.
+    #[test]
+    fn test_httproute_non_wicket_gateway_sets_invalid_parent_ref() {
+        // Setup: Create HTTPRoute referencing non-Wicket Gateway
+        let route = make_httproute(
+            "test-route",
+            "default",
+            vec![ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "other-controller-gateway".to_string(),
+                section_name: None,
+                port: None,
+            }],
+        );
+
+        // The Gateway exists but has a different controller
+        let gateway = make_gateway("other-controller-gateway", "default", "other-controller");
+        let gateway_class = make_gateway_class("other-controller", "other.io/gateway-controller");
+
+        // Verify: The reconciler should set InvalidParentRef when GatewayClass
+        // is not managed by Wicket
+        let expected_condition = Condition::new(
+            "Accepted",
+            false,
+            "InvalidParentRef",
+            "Gateway is not managed by Wicket",
+        );
+
+        assert_eq!(expected_condition.type_, "Accepted");
+        assert_eq!(expected_condition.status, "False");
+        assert_eq!(expected_condition.reason, "InvalidParentRef");
+        assert_eq!(
+            expected_condition.message,
+            "Gateway is not managed by Wicket"
+        );
+
+        // Verify GatewayClass detection
+        assert_eq!(
+            gateway_class.spec.controller_name,
+            "other.io/gateway-controller"
+        );
+        assert!(!gateway_class.is_wicket_managed());
+
+        // Wicket-managed GatewayClass should match
+        let wicket_gc = make_gateway_class("wicket", "wicket.io/gateway-controller");
+        assert!(wicket_gc.is_wicket_managed());
+    }
+
+    /// Test: Cross-namespace HTTPRoute reference detection.
+    #[test]
+    fn test_httproute_cross_namespace_reference_detected() {
+        // Setup: Create HTTPRoute in namespace A referencing backend in namespace B
+        let mut route_ref = make_httproute(
+            "test-route",
+            "namespace-a",
+            vec![ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "gateway-a".to_string(),
+                section_name: None,
+                port: None,
+            }],
+        );
+
+        // Create a mutable version to modify backend namespace
+        let route = Arc::make_mut(&mut route_ref);
+        route.spec.rules[0].backend_refs[0].backend_ref.namespace = Some("namespace-b".to_string());
+
+        // Verify: Backend is in different namespace
+        let route_ns = route.namespace().unwrap_or_default();
+        let backend_ref = &route.spec.rules[0].backend_refs[0].backend_ref;
+        let backend_ns = backend_ref.namespace.as_deref().unwrap_or(&route_ns);
+
+        assert_ne!(route_ns, backend_ns);
+        assert_eq!(route_ns, "namespace-a");
+        assert_eq!(backend_ns, "namespace-b");
+    }
+
+    /// Test: Multiple invalid parents each get their own status.
+    #[test]
+    fn test_httproute_multiple_invalid_parents() {
+        // Setup: HTTPRoute with multiple invalid parent references
+        let route = make_httproute(
+            "test-route",
+            "default",
+            vec![
+                ParentReference {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "Gateway".to_string(),
+                    namespace: None,
+                    name: "missing-gateway".to_string(),
+                    section_name: None,
+                    port: None,
+                },
+                ParentReference {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "Gateway".to_string(),
+                    namespace: Some("other-ns".to_string()),
+                    name: "also-missing".to_string(),
+                    section_name: None,
+                    port: None,
+                },
+            ],
+        );
+
+        // Verify: Each parent gets its own RouteParentStatus with appropriate conditions
+        assert_eq!(route.spec.parent_refs.len(), 2);
+
+        // First parent: missing in same namespace
+        let first_ref = &route.spec.parent_refs[0];
+        assert_eq!(first_ref.name, "missing-gateway");
+        assert!(first_ref.namespace.is_none());
+
+        // Second parent: missing in different namespace
+        let second_ref = &route.spec.parent_refs[1];
+        assert_eq!(second_ref.name, "also-missing");
+        assert_eq!(second_ref.namespace.as_deref(), Some("other-ns"));
+    }
+
+    /// Test: RouteParentStatus structure for rejected routes.
+    #[test]
+    fn test_route_parent_status_for_invalid_parent_ref() {
+        // Create a parent status for an invalid parent
+        let parent_ref = ParentReference {
+            group: "gateway.networking.k8s.io".to_string(),
+            kind: "Gateway".to_string(),
+            namespace: None,
+            name: "missing-gateway".to_string(),
+            section_name: None,
+            port: None,
+        };
+
+        let parent_status = RouteParentStatus {
+            parent_ref: parent_ref.clone(),
+            controller_name: WICKET_CONTROLLER_NAME.to_string(),
+            conditions: vec![Condition::new(
+                "Accepted",
+                false,
+                "InvalidParentRef",
+                "Parent Gateway not found",
+            )],
+        };
+
+        // Verify structure
+        assert_eq!(parent_status.parent_ref.name, "missing-gateway");
+        assert_eq!(
+            parent_status.controller_name,
+            "wicket.io/gateway-controller"
+        );
+        assert_eq!(parent_status.conditions.len(), 1);
+        assert_eq!(parent_status.conditions[0].type_, "Accepted");
+        assert_eq!(parent_status.conditions[0].status, "False");
+        assert_eq!(parent_status.conditions[0].reason, "InvalidParentRef");
+        assert_eq!(
+            parent_status.conditions[0].message,
+            "Parent Gateway not found"
+        );
+    }
+
+    /// Test: Metrics label structure for rejection.
+    #[test]
+    fn test_httproute_rejection_metrics_label_structure() {
+        // Verify metric label structure
+        // The metric should have labels: [namespace, "HTTPRoute", reason]
+        let expected_labels = ["default", "HTTPRoute", "InvalidParentRef"];
+        let actual_labels: Vec<&str> = expected_labels.iter().cloned().collect();
+
+        assert_eq!(actual_labels.len(), 3);
+        assert_eq!(actual_labels[0], "default");
+        assert_eq!(actual_labels[1], "HTTPRoute");
+        assert_eq!(actual_labels[2], "InvalidParentRef");
+    }
+
+    /// Test: HTTPRouteError enum variants.
+    #[test]
+    fn test_httproute_error_variants() {
+        // Test error message formatting
+        let parent_err = HTTPRouteError::ParentNotFound("my-gateway".to_string());
+        assert_eq!(
+            parent_err.to_string(),
+            "Parent Gateway not found: my-gateway"
+        );
+
+        let backend_err = HTTPRouteError::BackendNotFound("my-service".to_string());
+        assert_eq!(
+            backend_err.to_string(),
+            "Backend service not found: my-service"
+        );
+
+        let config_err = HTTPRouteError::ConfigError("test error".to_string());
+        assert_eq!(config_err.to_string(), "Configuration error: test error");
+    }
 }

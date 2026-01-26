@@ -978,4 +978,353 @@ mod tests {
         assert!(validate_regex_pattern("[invalid").is_none());
         assert!(validate_regex_pattern("(?P<invalid").is_none());
     }
+
+    /// Test: Config generation with valid Gateway + HTTPRoute + backends.
+    #[test]
+    fn test_config_generation_integration_with_valid_resources() {
+        let mut state = GatewayState::default();
+
+        // Add a Wicket-managed Gateway
+        let gateway = Gateway {
+            metadata: ObjectMeta {
+                name: Some("test-gateway".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![Listener {
+                    name: "http".to_string(),
+                    hostname: Some("*.example.com".to_string()),
+                    port: 8080,
+                    protocol: ProtocolType::HTTP,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        };
+        state
+            .gateways
+            .insert(GatewayState::key("default", "test-gateway"), gateway);
+
+        // Add an HTTPRoute
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("test-route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HTTPRouteSpec {
+                parent_refs: vec![ParentReference {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "Gateway".to_string(),
+                    name: "test-gateway".to_string(),
+                    namespace: None,
+                    section_name: None,
+                    port: None,
+                }],
+                hostnames: vec!["api.example.com".to_string()],
+                rules: vec![HTTPRouteRule {
+                    name: None,
+                    matches: vec![],
+                    filters: vec![],
+                    backend_refs: vec![HTTPBackendRef {
+                        backend_ref: crate::crds::BackendRef {
+                            group: "".to_string(),
+                            kind: "Service".to_string(),
+                            name: "api-svc".to_string(),
+                            namespace: None,
+                            port: Some(80),
+                            weight: 1,
+                        },
+                        filters: vec![],
+                    }],
+                    timeouts: None,
+                }],
+            },
+            status: None,
+        };
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "test-route"), route);
+
+        // Add service endpoints
+        state.service_endpoints.insert(
+            GatewayState::key("default", "api-svc"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "api-svc".to_string(),
+                port: 80,
+                endpoints: vec!["10.0.0.1:80".to_string(), "10.0.0.2:80".to_string()],
+            },
+        );
+
+        // Generate config
+        let config = state.generate_config();
+
+        // Verify server config from Gateway listener
+        assert_eq!(config.server.listen, "0.0.0.0:8080");
+
+        // Verify upstreams from HTTPRoute backend
+        assert_eq!(config.upstreams.len(), 1);
+        let upstream = config.upstreams.get("default-test-route-rule0").unwrap();
+        assert_eq!(upstream.backends.len(), 2);
+        assert!(upstream.backends.contains(&"10.0.0.1:80".to_string()));
+        assert!(upstream.backends.contains(&"10.0.0.2:80".to_string()));
+
+        // Verify routes from HTTPRoute
+        assert_eq!(config.routes.len(), 1);
+        let route_config = &config.routes[0];
+        assert_eq!(route_config.name, "default-test-route-rule0");
+        assert_eq!(route_config.upstream, "default-test-route-rule0");
+        assert_eq!(
+            route_config.route_match.host,
+            Some("api.example.com".to_string())
+        );
+        assert_eq!(route_config.route_match.path_prefix, Some("/".to_string()));
+    }
+
+    /// Test: Config generation with multiple routes and upstreams.
+    #[test]
+    fn test_config_generation_with_multiple_routes() {
+        let mut state = GatewayState::default();
+
+        // Add a Gateway
+        let gateway = Gateway {
+            metadata: ObjectMeta {
+                name: Some("test-gateway".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![Listener {
+                    name: "http".to_string(),
+                    hostname: None,
+                    port: 8080,
+                    protocol: ProtocolType::HTTP,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        };
+        state
+            .gateways
+            .insert(GatewayState::key("default", "test-gateway"), gateway);
+
+        // Add two HTTPRoutes with different backends
+        for (i, (route_name, backend_name)) in
+            [("frontend-route", "frontend-svc"), ("api-route", "api-svc")]
+                .iter()
+                .enumerate()
+        {
+            let route = HTTPRoute {
+                metadata: ObjectMeta {
+                    name: Some(route_name.to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                spec: HTTPRouteSpec {
+                    parent_refs: vec![ParentReference {
+                        group: "gateway.networking.k8s.io".to_string(),
+                        kind: "Gateway".to_string(),
+                        name: "test-gateway".to_string(),
+                        namespace: None,
+                        section_name: None,
+                        port: None,
+                    }],
+                    hostnames: vec![],
+                    rules: vec![HTTPRouteRule {
+                        name: None,
+                        matches: vec![],
+                        filters: vec![],
+                        backend_refs: vec![HTTPBackendRef {
+                            backend_ref: crate::crds::BackendRef {
+                                group: "".to_string(),
+                                kind: "Service".to_string(),
+                                name: backend_name.to_string(),
+                                namespace: None,
+                                port: Some(80),
+                                weight: 1,
+                            },
+                            filters: vec![],
+                        }],
+                        timeouts: None,
+                    }],
+                },
+                status: None,
+            };
+            state
+                .http_routes
+                .insert(GatewayState::key("default", route_name), route);
+
+            // Add service endpoints
+            state.service_endpoints.insert(
+                GatewayState::key("default", backend_name),
+                ServiceEndpoints {
+                    namespace: "default".to_string(),
+                    name: backend_name.to_string(),
+                    port: 80,
+                    endpoints: vec![format!("10.0.{}.1:80", i + 1)],
+                },
+            );
+        }
+
+        // Generate config
+        let config = state.generate_config();
+
+        // Verify multiple upstreams and routes
+        assert_eq!(config.upstreams.len(), 2);
+        assert_eq!(config.routes.len(), 2);
+    }
+
+    /// Test: Config generation with path match types.
+    #[test]
+    fn test_config_generation_with_path_matches() {
+        let mut state = GatewayState::default();
+
+        // Add minimal resources
+        let gateway = Gateway {
+            metadata: ObjectMeta {
+                name: Some("test-gateway".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![Listener {
+                    name: "http".to_string(),
+                    hostname: None,
+                    port: 8080,
+                    protocol: ProtocolType::HTTP,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        };
+        state
+            .gateways
+            .insert(GatewayState::key("default", "test-gateway"), gateway);
+
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("test-route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HTTPRouteSpec {
+                parent_refs: vec![ParentReference {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "Gateway".to_string(),
+                    name: "test-gateway".to_string(),
+                    namespace: None,
+                    section_name: None,
+                    port: None,
+                }],
+                hostnames: vec![],
+                rules: vec![
+                    // Exact path match
+                    HTTPRouteRule {
+                        name: None,
+                        matches: vec![crate::crds::HTTPRouteMatch {
+                            path: Some(crate::crds::HTTPPathMatch {
+                                type_: crate::crds::PathMatchType::Exact,
+                                value: "/health".to_string(),
+                            }),
+                            headers: vec![],
+                            query_params: vec![],
+                            method: Some(crate::crds::HTTPMethod::GET),
+                        }],
+                        filters: vec![],
+                        backend_refs: vec![HTTPBackendRef {
+                            backend_ref: crate::crds::BackendRef {
+                                group: "".to_string(),
+                                kind: "Service".to_string(),
+                                name: "backend".to_string(),
+                                namespace: None,
+                                port: Some(80),
+                                weight: 1,
+                            },
+                            filters: vec![],
+                        }],
+                        timeouts: None,
+                    },
+                    // Prefix path match
+                    HTTPRouteRule {
+                        name: None,
+                        matches: vec![crate::crds::HTTPRouteMatch {
+                            path: Some(crate::crds::HTTPPathMatch {
+                                type_: crate::crds::PathMatchType::PathPrefix,
+                                value: "/api".to_string(),
+                            }),
+                            headers: vec![],
+                            query_params: vec![],
+                            method: None,
+                        }],
+                        filters: vec![],
+                        backend_refs: vec![HTTPBackendRef {
+                            backend_ref: crate::crds::BackendRef {
+                                group: "".to_string(),
+                                kind: "Service".to_string(),
+                                name: "backend".to_string(),
+                                namespace: None,
+                                port: Some(80),
+                                weight: 1,
+                            },
+                            filters: vec![],
+                        }],
+                        timeouts: None,
+                    },
+                ],
+            },
+            status: None,
+        };
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "test-route"), route);
+
+        state.service_endpoints.insert(
+            GatewayState::key("default", "backend"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "backend".to_string(),
+                port: 80,
+                endpoints: vec!["10.0.0.1:80".to_string()],
+            },
+        );
+
+        // Generate config
+        let config = state.generate_config();
+
+        // Verify routes with different path match types
+        assert_eq!(config.routes.len(), 2);
+
+        // First route: exact path match
+        let exact_route = config
+            .routes
+            .iter()
+            .find(|r| r.route_match.path.as_deref() == Some("/health"))
+            .unwrap();
+        assert_eq!(exact_route.route_match.path, Some("/health".to_string()));
+
+        // Second route: path prefix match
+        let prefix_route = config
+            .routes
+            .iter()
+            .find(|r| r.route_match.path_prefix.as_deref() == Some("/api"))
+            .unwrap();
+        assert_eq!(
+            prefix_route.route_match.path_prefix,
+            Some("/api".to_string())
+        );
+    }
 }

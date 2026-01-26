@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::FileConfig;
 use crate::metrics::{tls_metrics, CertReloadStatus};
-use crate::pem::load_certified_key;
+use crate::pem::{extract_cert_expiry, load_certified_key};
 use crate::{CertManager, CertStore};
 
 /// File-based certificate watcher.
@@ -53,6 +53,31 @@ impl FileWatcher {
                         domains = ?cert_config.domains,
                         "loaded certificate"
                     );
+
+                    // Extract and emit certificate expiry metric
+                    if let Ok(cert_der) = key.end_entity_cert() {
+                        if let Some(expiry_timestamp) = extract_cert_expiry(cert_der) {
+                            // Emit metric for each domain
+                            for domain in &cert_config.domains {
+                                tls_metrics::certificate_expiry_timestamp_seconds(
+                                    cert_config.name.clone(),
+                                    domain.clone(),
+                                )
+                                .set(expiry_timestamp as u64);
+                            }
+                            debug!(
+                                name = %cert_config.name,
+                                expiry_timestamp = expiry_timestamp,
+                                "emitted certificate expiry metric"
+                            );
+                        } else {
+                            warn!(
+                                name = %cert_config.name,
+                                "failed to extract certificate expiry timestamp"
+                            );
+                        }
+                    }
+
                     store.insert(&cert_config.domains, key);
                 }
                 Err(e) => {
