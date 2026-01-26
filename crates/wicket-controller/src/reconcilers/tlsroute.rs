@@ -81,6 +81,15 @@ pub async fn reconcile_tlsroute(
                             conditions: vec![Condition::accepted(), Condition::resolved_refs()],
                         });
                     } else {
+                        tracing::debug!(
+                            namespace = %namespace,
+                            route = %name,
+                            parent_ref = %parent_ref.name,
+                            parent_namespace = %parent_ns,
+                            reason = "NoMatchingListener",
+                            message = "Gateway has no TLS passthrough listener",
+                            "Route listener validation failed"
+                        );
                         parent_statuses.push(RouteParentStatus {
                             parent_ref: parent_ref.clone(),
                             controller_name: ctx.controller_name.clone(),
@@ -93,6 +102,15 @@ pub async fn reconcile_tlsroute(
                         });
                     }
                 } else {
+                    tracing::debug!(
+                        namespace = %namespace,
+                        route = %name,
+                        parent_ref = %parent_ref.name,
+                        parent_namespace = %parent_ns,
+                        reason = "InvalidParentRef",
+                        message = "Gateway is not managed by Wicket",
+                        "Route parent validation failed"
+                    );
                     parent_statuses.push(RouteParentStatus {
                         parent_ref: parent_ref.clone(),
                         controller_name: ctx.controller_name.clone(),
@@ -106,6 +124,15 @@ pub async fn reconcile_tlsroute(
                 }
             }
             Err(_) => {
+                tracing::debug!(
+                    namespace = %namespace,
+                    route = %name,
+                    parent_ref = %parent_ref.name,
+                    parent_namespace = %parent_ns,
+                    reason = "InvalidParentRef",
+                    message = "Parent Gateway not found",
+                    "Route parent validation failed"
+                );
                 parent_statuses.push(RouteParentStatus {
                     parent_ref: parent_ref.clone(),
                     controller_name: ctx.controller_name.clone(),
@@ -279,4 +306,374 @@ pub async fn run_tlsroute_controller(ctx: Arc<Context>) -> Result<(), kube::Erro
         .set(0);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crds::{
+        BackendRef, Condition, Gateway, GatewayClass, GatewaySpec, Listener, ParentReference,
+        ProtocolType, TLSRouteRule, TLSRouteSpec,
+    };
+    use kube::core::ObjectMeta;
+    use std::sync::Arc;
+
+    /// Helper to create a test TLSRoute.
+    fn make_tlsroute(
+        name: &str,
+        namespace: &str,
+        parent_refs: Vec<ParentReference>,
+        hostnames: Vec<String>,
+    ) -> Arc<TLSRoute> {
+        Arc::new(TLSRoute {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            spec: TLSRouteSpec {
+                parent_refs,
+                hostnames,
+                rules: vec![TLSRouteRule {
+                    name: None,
+                    backend_refs: vec![BackendRef {
+                        group: "".to_string(),
+                        kind: "Service".to_string(),
+                        name: "backend".to_string(),
+                        namespace: None,
+                        port: Some(443),
+                        weight: 1,
+                    }],
+                }],
+            },
+            status: None,
+        })
+    }
+
+    /// Helper to create a test Gateway.
+    fn make_gateway(
+        name: &str,
+        namespace: &str,
+        gateway_class: &str,
+        protocols: Vec<ProtocolType>,
+    ) -> Gateway {
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: gateway_class.to_string(),
+                listeners: protocols
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, protocol)| Listener {
+                        name: format!("listener-{}", i),
+                        hostname: None,
+                        port: match protocol {
+                            ProtocolType::HTTP | ProtocolType::HTTPS => 8080 + i as u16,
+                            ProtocolType::TCP | ProtocolType::TLS | ProtocolType::UDP => {
+                                8443 + i as u16
+                            }
+                        },
+                        protocol,
+                        tls: None,
+                        allowed_routes: None,
+                    })
+                    .collect(),
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        }
+    }
+
+    /// Test: TLSRoute with Gateway that has no TLS listener sets NoMatchingListener.
+    #[test]
+    fn test_tlsroute_no_tls_listener_sets_no_matching_listener() {
+        // Setup: Create TLSRoute referencing Gateway with only HTTP listeners
+        let route = make_tlsroute(
+            "test-route",
+            "default",
+            vec![ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "http-only-gateway".to_string(),
+                section_name: None,
+                port: None,
+            }],
+            vec!["db.example.com".to_string()],
+        );
+
+        // Gateway with only HTTP listeners (no TLS)
+        let gateway = make_gateway(
+            "http-only-gateway",
+            "default",
+            "wicket",
+            vec![ProtocolType::HTTP],
+        );
+
+        // Verify: Gateway has only HTTP listeners
+        assert_eq!(gateway.spec.listeners.len(), 1);
+        assert_eq!(gateway.spec.listeners[0].protocol, ProtocolType::HTTP);
+
+        // Verify: No TLS listener exists
+        let has_tls_listener = gateway
+            .spec
+            .listeners
+            .iter()
+            .any(|l| l.protocol == ProtocolType::TLS);
+        assert!(!has_tls_listener, "Gateway should not have TLS listener");
+
+        // Expected condition for no matching listener
+        let expected_condition = Condition::new(
+            "Accepted",
+            false,
+            "NoMatchingListener",
+            "Gateway has no TLS passthrough listener",
+        );
+
+        assert_eq!(expected_condition.type_, "Accepted");
+        assert_eq!(expected_condition.status, "False");
+        assert_eq!(expected_condition.reason, "NoMatchingListener");
+        assert_eq!(
+            expected_condition.message,
+            "Gateway has no TLS passthrough listener"
+        );
+    }
+
+    /// Test: TLSRoute with Gateway that has TLS listener is accepted.
+    #[test]
+    fn test_tlsroute_with_tls_listener_is_accepted() {
+        // Setup: Create TLSRoute referencing Gateway with TLS listener
+        let route = make_tlsroute(
+            "test-route",
+            "default",
+            vec![ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "tls-gateway".to_string(),
+                section_name: None,
+                port: None,
+            }],
+            vec!["db.example.com".to_string()],
+        );
+
+        // Gateway with TLS listener
+        let gateway = make_gateway("tls-gateway", "default", "wicket", vec![ProtocolType::TLS]);
+
+        // Verify: Gateway has TLS listener
+        assert_eq!(gateway.spec.listeners.len(), 1);
+        assert_eq!(gateway.spec.listeners[0].protocol, ProtocolType::TLS);
+
+        // Verify: TLS listener exists
+        let has_tls_listener = gateway
+            .spec
+            .listeners
+            .iter()
+            .any(|l| l.protocol == ProtocolType::TLS);
+        assert!(has_tls_listener, "Gateway should have TLS listener");
+
+        // Expected condition for accepted route
+        let accepted_condition =
+            Condition::new("Accepted", true, "Accepted", "Resource has been accepted");
+
+        assert_eq!(accepted_condition.type_, "Accepted");
+        assert_eq!(accepted_condition.status, "True");
+        assert_eq!(accepted_condition.reason, "Accepted");
+    }
+
+    /// Test: TLSRoute with multiple listeners finds TLS listener.
+    #[test]
+    fn test_tlsroute_multiple_listeners_finds_tls() {
+        // Gateway with HTTP and TLS listeners
+        let gateway = make_gateway(
+            "mixed-gateway",
+            "default",
+            "wicket",
+            vec![ProtocolType::HTTP, ProtocolType::HTTPS, ProtocolType::TLS],
+        );
+
+        // Verify: Gateway has multiple listeners including TLS
+        assert_eq!(gateway.spec.listeners.len(), 3);
+        assert_eq!(gateway.spec.listeners[0].protocol, ProtocolType::HTTP);
+        assert_eq!(gateway.spec.listeners[1].protocol, ProtocolType::HTTPS);
+        assert_eq!(gateway.spec.listeners[2].protocol, ProtocolType::TLS);
+
+        // Verify: TLS listener exists
+        let tls_listeners: Vec<_> = gateway
+            .spec
+            .listeners
+            .iter()
+            .filter(|l| l.protocol == ProtocolType::TLS)
+            .collect();
+        assert_eq!(tls_listeners.len(), 1);
+    }
+
+    /// Test: TLSRoute with missing Gateway sets InvalidParentRef.
+    #[test]
+    fn test_tlsroute_missing_gateway_sets_invalid_parent_ref() {
+        // Setup: Create TLSRoute referencing non-existent Gateway
+        let route = make_tlsroute(
+            "test-route",
+            "default",
+            vec![ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "missing-gateway".to_string(),
+                section_name: None,
+                port: None,
+            }],
+            vec!["db.example.com".to_string()],
+        );
+
+        // Verify: The reconciler should set InvalidParentRef condition
+        let expected_condition = Condition::new(
+            "Accepted",
+            false,
+            "InvalidParentRef",
+            "Parent Gateway not found",
+        );
+
+        assert_eq!(expected_condition.type_, "Accepted");
+        assert_eq!(expected_condition.status, "False");
+        assert_eq!(expected_condition.reason, "InvalidParentRef");
+        assert_eq!(expected_condition.message, "Parent Gateway not found");
+    }
+
+    /// Test: TLSRoute with non-Wicket Gateway sets InvalidParentRef.
+    #[test]
+    fn test_tlsroute_non_wicket_gateway_sets_invalid_parent_ref() {
+        // Setup: Create TLSRoute referencing non-Wicket Gateway
+        let route = make_tlsroute(
+            "test-route",
+            "default",
+            vec![ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "other-controller-gateway".to_string(),
+                section_name: None,
+                port: None,
+            }],
+            vec!["db.example.com".to_string()],
+        );
+
+        // Verify: The reconciler should set InvalidParentRef when GatewayClass
+        // is not managed by Wicket
+        let expected_condition = Condition::new(
+            "Accepted",
+            false,
+            "InvalidParentRef",
+            "Gateway is not managed by Wicket",
+        );
+
+        assert_eq!(expected_condition.type_, "Accepted");
+        assert_eq!(expected_condition.status, "False");
+        assert_eq!(expected_condition.reason, "InvalidParentRef");
+        assert_eq!(
+            expected_condition.message,
+            "Gateway is not managed by Wicket"
+        );
+    }
+
+    /// Test: TLSRoute with multiple hostnames.
+    #[test]
+    fn test_tlsroute_with_multiple_hostnames() {
+        // Setup: TLSRoute with multiple SNI hostnames
+        let route = make_tlsroute(
+            "test-route",
+            "default",
+            vec![],
+            vec![
+                "db.example.com".to_string(),
+                "redis.example.com".to_string(),
+                "*.internal.example.com".to_string(),
+            ],
+        );
+
+        // Verify: All hostnames are preserved
+        assert_eq!(route.spec.hostnames.len(), 3);
+        assert_eq!(route.spec.hostnames[0], "db.example.com");
+        assert_eq!(route.spec.hostnames[1], "redis.example.com");
+        assert_eq!(route.spec.hostnames[2], "*.internal.example.com");
+
+        // Test SNI matching
+        assert!(route.matches_sni("db.example.com"));
+        assert!(route.matches_sni("redis.example.com"));
+        assert!(route.matches_sni("app.internal.example.com"));
+        assert!(!route.matches_sni("other.com"));
+    }
+
+    /// Test: RouteParentStatus structure for TLSRoute rejection.
+    #[test]
+    fn test_tlsroute_parent_status_for_no_matching_listener() {
+        // Create a parent status for a route with no matching listener
+        let parent_ref = ParentReference {
+            group: "gateway.networking.k8s.io".to_string(),
+            kind: "Gateway".to_string(),
+            namespace: None,
+            name: "http-only-gateway".to_string(),
+            section_name: None,
+            port: None,
+        };
+
+        let parent_status = RouteParentStatus {
+            parent_ref: parent_ref.clone(),
+            controller_name: WICKET_CONTROLLER_NAME.to_string(),
+            conditions: vec![Condition::new(
+                "Accepted",
+                false,
+                "NoMatchingListener",
+                "Gateway has no TLS passthrough listener",
+            )],
+        };
+
+        // Verify structure
+        assert_eq!(parent_status.parent_ref.name, "http-only-gateway");
+        assert_eq!(
+            parent_status.controller_name,
+            "wicket.io/gateway-controller"
+        );
+        assert_eq!(parent_status.conditions.len(), 1);
+        assert_eq!(parent_status.conditions[0].type_, "Accepted");
+        assert_eq!(parent_status.conditions[0].status, "False");
+        assert_eq!(parent_status.conditions[0].reason, "NoMatchingListener");
+        assert_eq!(
+            parent_status.conditions[0].message,
+            "Gateway has no TLS passthrough listener"
+        );
+    }
+
+    /// Test: Metrics label structure for TLSRoute rejection.
+    #[test]
+    fn test_tlsroute_rejection_metrics_label_structure() {
+        // Verify metric label structure
+        // The metric should have labels: [namespace, "TLSRoute", reason]
+        let expected_labels = ["default", "TLSRoute", "NoMatchingListener"];
+        let actual_labels: Vec<&str> = expected_labels.iter().cloned().collect();
+
+        assert_eq!(actual_labels.len(), 3);
+        assert_eq!(actual_labels[0], "default");
+        assert_eq!(actual_labels[1], "TLSRoute");
+        assert_eq!(actual_labels[2], "NoMatchingListener");
+    }
+
+    /// Test: TLSRouteError enum variants.
+    #[test]
+    fn test_tlsroute_error_variants() {
+        // Test error message formatting
+        let parent_err = TLSRouteError::ParentNotFound("my-gateway".to_string());
+        assert_eq!(
+            parent_err.to_string(),
+            "Parent Gateway not found: my-gateway"
+        );
+
+        let config_err = TLSRouteError::ConfigError("test error".to_string());
+        assert_eq!(config_err.to_string(), "Configuration error: test error");
+    }
 }

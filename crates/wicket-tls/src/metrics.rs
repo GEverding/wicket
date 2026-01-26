@@ -1,6 +1,6 @@
 //! TLS certificate metrics.
 
-use foundations::telemetry::metrics::{metrics, Counter};
+use foundations::telemetry::metrics::{metrics, Counter, Gauge};
 use serde::Serialize;
 
 #[metrics]
@@ -10,6 +10,9 @@ pub mod tls_metrics {
 
     /// ACME renewal attempts
     pub fn acme_renewal_total(status: AcmeRenewalStatus) -> Counter;
+
+    /// Certificate expiry timestamp in seconds since epoch
+    pub fn certificate_expiry_timestamp_seconds(name: String, domain: String) -> Gauge;
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize)]

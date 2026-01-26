@@ -82,6 +82,15 @@ pub async fn reconcile_tcproute(
                             conditions: vec![Condition::accepted(), Condition::resolved_refs()],
                         });
                     } else {
+                        tracing::debug!(
+                            namespace = %namespace,
+                            route = %name,
+                            parent_ref = %parent_ref.name,
+                            parent_namespace = %parent_ns,
+                            reason = "NoMatchingListener",
+                            message = "Gateway has no TCP/TLS listener",
+                            "Route listener validation failed"
+                        );
                         parent_statuses.push(RouteParentStatus {
                             parent_ref: parent_ref.clone(),
                             controller_name: ctx.controller_name.clone(),
@@ -94,6 +103,15 @@ pub async fn reconcile_tcproute(
                         });
                     }
                 } else {
+                    tracing::debug!(
+                        namespace = %namespace,
+                        route = %name,
+                        parent_ref = %parent_ref.name,
+                        parent_namespace = %parent_ns,
+                        reason = "InvalidParentRef",
+                        message = "Gateway is not managed by Wicket",
+                        "Route parent validation failed"
+                    );
                     parent_statuses.push(RouteParentStatus {
                         parent_ref: parent_ref.clone(),
                         controller_name: ctx.controller_name.clone(),
@@ -107,6 +125,15 @@ pub async fn reconcile_tcproute(
                 }
             }
             Err(_) => {
+                tracing::debug!(
+                    namespace = %namespace,
+                    route = %name,
+                    parent_ref = %parent_ref.name,
+                    parent_namespace = %parent_ns,
+                    reason = "InvalidParentRef",
+                    message = "Parent Gateway not found",
+                    "Route parent validation failed"
+                );
                 parent_statuses.push(RouteParentStatus {
                     parent_ref: parent_ref.clone(),
                     controller_name: ctx.controller_name.clone(),

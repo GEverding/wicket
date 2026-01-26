@@ -9,6 +9,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
 use rustls_pemfile::{certs, private_key};
 use thiserror::Error;
+use x509_parser::prelude::*;
 
 #[derive(Debug, Error)]
 pub enum PemError {
@@ -75,6 +76,18 @@ pub fn load_certified_key(
         .map_err(|_| PemError::UnsupportedKeyType)?;
 
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
+}
+
+/// Extract the certificate expiry timestamp (NotAfter) in seconds since epoch.
+///
+/// Returns the NotAfter field from the first certificate in the chain.
+pub fn extract_cert_expiry(cert_der: &CertificateDer<'_>) -> Option<i64> {
+    let parsed = parse_x509_certificate(cert_der).ok()?;
+    let cert = parsed.1;
+
+    // Get the NotAfter time and convert to Unix timestamp
+    let not_after = cert.validity().not_after;
+    Some(not_after.timestamp())
 }
 
 #[cfg(test)]
@@ -175,5 +188,30 @@ mod tests {
 
         let result = load_certified_key(cert_file.path(), key_file.path());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_extract_cert_expiry() {
+        let (cert_pem, _) = generate_test_cert_and_key();
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(cert_pem.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let certs = load_certs(file.path()).unwrap();
+        assert!(!certs.is_empty());
+
+        let expiry = extract_cert_expiry(&certs[0]);
+        assert!(expiry.is_some());
+
+        let timestamp = expiry.unwrap();
+        // Verify it's a reasonable timestamp (after now)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            timestamp > now,
+            "Certificate expiry should be in the future"
+        );
     }
 }

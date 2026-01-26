@@ -1,0 +1,88 @@
+name: Build and Push to OCIR
+
+# Controls when the workflow will run
+on: push
+
+env:
+  TENANCY_NAMESPACE: idpnox2k7qdd # Your Oracle Cloud tenancy namespace
+  REPO_NAME: rave/mercury          # The name of the repository within OCIR
+
+jobs:
+  build:
+    runs-on: blacksmith-16vcpu-ubuntu-2404-arm
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      SSH_KEY: ${{secrets.CI_SSH_KEY}}
+      REPSY_PASSWORD: ${{secrets.REPSY_PASSWORD}}
+
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+          ssh-key: ${{ env.SSH_KEY }}
+
+      # 2. Set up Docker Buildx
+      # This is a modern and recommended way to build Docker images.
+      - name: Set up Docker Buildx
+        uses: useblacksmith/setup-docker-builder@v1
+
+      # 3. Log in to Oracle Cloud Registries
+      # This step logs into each of the three specified OCIR regions.
+      # It uses secrets to securely store your credentials.
+      - name: Log in to OCIR - Ashburn (iad)
+        uses: docker/login-action@v3
+        with:
+          registry: iad.ocir.io
+          username: ${{ env.TENANCY_NAMESPACE }}/${{ env.OCI_CLI_USER }}
+          password: ${{ secrets.OCI_AUTH_TOKEN }}
+
+      - name: Log in to OCIR - Frankfurt (fra)
+        uses: docker/login-action@v3
+        with:
+          registry: fra.ocir.io
+          username: ${{ env.TENANCY_NAMESPACE }}/${{ env.OCI_CLI_USER }}
+          password: ${{ secrets.OCI_AUTH_TOKEN }}
+
+      - name: Log in to OCIR - Phoenix (phx)
+        uses: docker/login-action@v3
+        with:
+          registry: phx.ocir.io
+          username: ${{ env.TENANCY_NAMESPACE }}/${{ env.OCI_CLI_USER }}
+          password: ${{ secrets.OCI_AUTH_TOKEN }}
+
+      - name: Generate 8-character SHA
+        id: short-sha
+        run: echo "sha=$(echo ${{ github.sha }} | cut -c1-8)" >> $GITHUB_OUTPUT
+
+      # 4. Extract metadata and define tags
+      # This step prepares the image tags, replicating the logic from your buildspec.yml.
+      # iad.ocir.io/${{ env.TENANCY_NAMESPACE }}/${{ env.REPO_NAME }}
+      # fra.ocir.io/${{ env.TENANCY_NAMESPACE }}/${{ env.REPO_NAME }}
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            phx.ocir.io/${{ env.TENANCY_NAMESPACE }}/${{ env.REPO_NAME }}
+            fra.ocir.io/${{ env.TENANCY_NAMESPACE }}/${{ env.REPO_NAME }}
+            iad.ocir.io/${{ env.TENANCY_NAMESPACE }}/${{ env.REPO_NAME }}
+          tags: |
+            type=raw,value=${{ steps.short-sha.outputs.sha }}
+
+      # 5. Build and push the Docker image
+      # This single step builds the image once and pushes it to all three registries
+      # using the tags generated in the previous step.
+      - name: Build and push Docker image
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          push: true
+          platforms: linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
