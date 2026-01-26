@@ -1,13 +1,19 @@
 # Default values for Wicket Gateway API Controller
 
+# Global settings
+global:
+  imagePullSecrets: []
+
 # Controller deployment
 controller:
+  enabled: true
+
   image:
     repository: ghcr.io/geverding/wicket-controller
     tag: ""  # Defaults to Chart appVersion
     pullPolicy: IfNotPresent
 
-  replicas: 1
+  replicaCount: 1
 
   resources:
     limits:
@@ -16,26 +22,133 @@ controller:
       cpu: 100m
       memory: 256Mi
 
+  # Pod-level security context
   securityContext:
-    allowPrivilegeEscalation: false
     runAsNonRoot: true
     runAsUser: 65532
     runAsGroup: 65532
+    fsGroup: 65532
+
+  # Container-level security context
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    capabilities:
+      drop:
+        - ALL
     seccompProfile:
       type: RuntimeDefault
 
-  pod:
-    annotations: {}
-    labels: {}
-    affinity: {}
-    tolerations: []
-    nodeSelector: {}
+  # Lifecycle hooks for graceful shutdown
+  lifecycle:
+    # Time to sleep in preStop hook before SIGTERM.
+    # This gives Kubernetes time to update endpoints and remove
+    # this pod from Service load balancing before shutdown begins.
+    preStopSleepSeconds: 10
 
-# Controller config
-config:
-  controllerName: gateway.wicket.dev/gatewayclass-controller
-  logging:
-    level: info
+  # Total time Kubernetes waits before force-killing the pod.
+  # Should be > preStopSleepSeconds + time needed for cleanup.
+  terminationGracePeriodSeconds: 25
+
+  # Metrics server configuration
+  metrics:
+    port: 8081
+
+  # Controller arguments
+  args:
+    logLevel: info
+    jsonLogs: false
+    watchAllNamespaces: true
+    leaderElection: true
+
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Proxy deployment
+proxy:
+  enabled: true
+
+  image:
+    repository: ghcr.io/geverding/wicket
+    tag: ""  # Defaults to Chart appVersion
+    pullPolicy: IfNotPresent
+
+  replicaCount: 2
+
+  resources:
+    limits:
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # Pod-level security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+
+  # Container-level security context
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65532
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+
+  # Lifecycle hooks for graceful shutdown
+  lifecycle:
+    # Time to sleep in preStop hook before SIGTERM.
+    # This gives Kubernetes time to update endpoints and remove
+    # this pod from Service load balancing before shutdown begins.
+    # Should be slightly longer than the typical endpoint propagation time.
+    preStopSleepSeconds: 15
+
+  # Total time Kubernetes waits before force-killing the pod.
+  # Should be > preStopSleepSeconds + shutdownTimeout + buffer.
+  # Example: 15s (preStop) + 30s (shutdown) + 5s (buffer) = 50s
+  terminationGracePeriodSeconds: 50
+
+  # Proxy configuration
+  config:
+    logLevel: info
+    jsonLogs: false
+    # Graceful shutdown timeout in seconds.
+    # This is the time the proxy waits for active connections to drain.
+    shutdownTimeout: 30
+
+  # Autoscaling configuration
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+
+  podLabels: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  priorityClassName: ""
 
 # Service for controller (metrics, health)
 service:

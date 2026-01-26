@@ -13,7 +13,7 @@ mod sni;
 pub use listener::{create_listener, into_tokio_listener, ListenerConfig};
 pub use pool::SourceIpPool;
 pub use protocol::{ProxyProtocolEncoder, ProxyProtocolVersion};
-pub use proxy::{StreamProxy, Upstream};
+pub use proxy::{ConnectionTracker, StreamProxy, Upstream};
 pub use router::SniRouter;
 pub use sni::SniExtractor;
 

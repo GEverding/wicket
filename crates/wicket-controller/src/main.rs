@@ -16,8 +16,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use wicket_controller::{
     leader_election::{LeaderElection, LeaderElectionConfig},
     metrics::{
-        register_metrics, serve_metrics, CONFIG_SYNC_LAG_SECONDS, CONTROLLER_IS_LEADER,
-        CONTROLLER_UPTIME_SECONDS,
+        register_metrics, serve_metrics_with_health, HealthState, CONFIG_SYNC_LAG_SECONDS,
+        CONTROLLER_IS_LEADER, CONTROLLER_UPTIME_SECONDS,
     },
     reconcilers::{
         run_endpoints_controller, run_gateway_class_controller, run_gateway_controller,
@@ -202,10 +202,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Start metrics server
+    // Create health state for shutdown-aware probes
+    let health_state = HealthState::new();
+    let health_state_for_shutdown = health_state.clone();
+
+    // Start metrics server with health state
     let metrics_addr = args.metrics_addr;
     tokio::spawn(async move {
-        if let Err(e) = serve_metrics(metrics_addr).await {
+        if let Err(e) = serve_metrics_with_health(metrics_addr, health_state).await {
             tracing::error!(error = %e, "Metrics server failed");
         }
     });
@@ -274,6 +278,10 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Received shutdown signal");
         }
     }
+
+    // Mark as shutting down so readiness probe returns 503
+    // This helps Kubernetes remove us from Service endpoints faster
+    health_state_for_shutdown.begin_shutdown();
 
     tracing::info!("Wicket controller shutting down");
     Ok(())

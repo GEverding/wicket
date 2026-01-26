@@ -7,6 +7,8 @@ use prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter,
     IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 lazy_static! {
     /// Global Prometheus registry for controller metrics.
@@ -382,11 +384,73 @@ impl ReconcileMetrics {
     }
 }
 
+/// Shared state for shutdown-aware health checks.
+#[derive(Debug, Clone)]
+pub struct HealthState {
+    /// Whether the controller is shutting down.
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl Default for HealthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HealthState {
+    /// Create a new health state.
+    pub fn new() -> Self {
+        Self {
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Signal that shutdown has begun.
+    pub fn begin_shutdown(&self) {
+        tracing::info!("Health state: marking as shutting down");
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Check if the controller is shutting down.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    /// Check if the controller is ready to serve traffic.
+    ///
+    /// Returns false if:
+    /// - The controller is shutting down
+    /// - The controller is not the leader (optional, based on config)
+    pub fn is_ready(&self) -> bool {
+        !self.is_shutting_down()
+    }
+}
+
 /// Serve Prometheus metrics on an HTTP endpoint.
+///
+/// This version does not support shutdown-aware health checks.
+/// Use `serve_metrics_with_health` for shutdown-aware endpoints.
 pub async fn serve_metrics(
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use axum::{routing::get, Router};
+    serve_metrics_with_health(addr, HealthState::new()).await
+}
+
+/// Serve Prometheus metrics on an HTTP endpoint with shutdown-aware health checks.
+///
+/// The `/readyz` endpoint will return 503 Service Unavailable when the controller
+/// is shutting down, allowing Kubernetes to remove it from Service endpoints.
+pub async fn serve_metrics_with_health(
+    addr: std::net::SocketAddr,
+    health_state: HealthState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use axum::{
+        extract::State,
+        http::StatusCode,
+        response::IntoResponse,
+        routing::get,
+        Router,
+    };
 
     async fn metrics_handler() -> String {
         use prometheus::Encoder;
@@ -397,18 +461,32 @@ pub async fn serve_metrics(
         String::from_utf8(buffer).unwrap()
     }
 
+    /// Liveness probe - always returns OK unless the process is deadlocked.
     async fn health_handler() -> &'static str {
         "ok"
     }
 
-    async fn ready_handler() -> &'static str {
-        "ready"
+    /// Readiness probe - returns 503 when shutting down so Kubernetes
+    /// removes this pod from Service endpoints.
+    async fn ready_handler(State(state): State<HealthState>) -> impl IntoResponse {
+        if state.is_shutting_down() {
+            tracing::debug!("Readiness check: returning 503 (shutting down)");
+            return (StatusCode::SERVICE_UNAVAILABLE, "shutting down");
+        }
+
+        // Could also check leader election status here if desired:
+        // if CONTROLLER_IS_LEADER.get() == 0 {
+        //     return (StatusCode::SERVICE_UNAVAILABLE, "not leader");
+        // }
+
+        (StatusCode::OK, "ready")
     }
 
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(health_handler))
-        .route("/readyz", get(ready_handler));
+        .route("/readyz", get(ready_handler))
+        .with_state(health_state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Metrics server listening on {}", addr);

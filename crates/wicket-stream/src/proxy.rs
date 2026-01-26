@@ -2,10 +2,12 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 
 use crate::pool::SourceIpPool;
 use crate::protocol::{ProxyProtocolEncoder, ProxyProtocolVersion};
@@ -18,6 +20,55 @@ use std::sync::Mutex;
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 use volt_sockmap::SocketMap;
+
+/// Tracks active connections for graceful shutdown.
+#[derive(Debug, Default)]
+pub struct ConnectionTracker {
+    /// Number of active connections.
+    active_connections: AtomicUsize,
+}
+
+impl ConnectionTracker {
+    /// Create a new connection tracker.
+    pub fn new() -> Self {
+        Self {
+            active_connections: AtomicUsize::new(0),
+        }
+    }
+
+    /// Increment the active connection count.
+    pub fn increment(&self) {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement the active connection count.
+    pub fn decrement(&self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Get the current number of active connections.
+    pub fn active(&self) -> usize {
+        self.active_connections.load(Ordering::Relaxed)
+    }
+}
+
+/// RAII guard that tracks connection lifetime.
+pub struct ConnectionGuard<'a> {
+    tracker: &'a ConnectionTracker,
+}
+
+impl<'a> ConnectionGuard<'a> {
+    fn new(tracker: &'a ConnectionTracker) -> Self {
+        tracker.increment();
+        Self { tracker }
+    }
+}
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        self.tracker.decrement();
+    }
+}
 
 /// Upstream server configuration.
 #[derive(Debug)]
@@ -52,6 +103,10 @@ pub struct StreamProxy {
     pub(crate) source_ip_pool: Option<SourceIpPool>,
     pub(crate) proxy_protocol: Option<ProxyProtocolVersion>,
     pub(crate) local_addr: SocketAddr,
+    /// Tracks active connections for graceful shutdown.
+    pub(crate) connection_tracker: Arc<ConnectionTracker>,
+    /// Whether the proxy is shutting down (stops accepting new connections).
+    pub(crate) shutting_down: Arc<AtomicBool>,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     pub(crate) sockmap: Option<Arc<Mutex<SocketMap>>>,
 }
@@ -71,9 +126,26 @@ impl StreamProxy {
             source_ip_pool,
             proxy_protocol,
             local_addr,
+            connection_tracker: Arc::new(ConnectionTracker::new()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             sockmap: None,
         }
+    }
+
+    /// Check if the proxy is currently shutting down.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of active connections.
+    pub fn active_connections(&self) -> usize {
+        self.connection_tracker.active()
+    }
+
+    /// Signal the proxy to begin graceful shutdown.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
     }
 
     /// Set the eBPF sockmap for kernel-level proxying.
@@ -129,22 +201,148 @@ impl StreamProxy {
             source_ip_pool,
             proxy_protocol,
             local_addr,
+            connection_tracker: Arc::new(ConnectionTracker::new()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             sockmap: None,
         })
     }
 
     /// Run the proxy server.
+    ///
+    /// This method accepts connections until a shutdown signal is received.
+    /// Use [`run_until_shutdown`] for graceful shutdown support.
     pub async fn run(self: Arc<Self>, listener: TcpListener) -> Result<(), StreamError> {
         loop {
             let (client_stream, client_addr) = listener.accept().await?;
             let proxy = Arc::clone(&self);
+            let tracker = Arc::clone(&self.connection_tracker);
 
             tokio::spawn(async move {
+                let _guard = ConnectionGuard::new(&tracker);
                 if let Err(e) = proxy.handle_connection(client_stream, client_addr).await {
                     tracing::warn!(client = %client_addr, error = %e, "Connection failed");
                 }
             });
+        }
+    }
+
+    /// Run the proxy server with graceful shutdown support.
+    ///
+    /// When a shutdown signal is received:
+    /// 1. Stop accepting new connections
+    /// 2. Wait for existing connections to complete (up to `drain_timeout`)
+    /// 3. Return gracefully
+    ///
+    /// # Arguments
+    /// * `listener` - The TCP listener to accept connections on
+    /// * `shutdown_rx` - A watch receiver that signals when to begin shutdown
+    /// * `drain_timeout` - Maximum time to wait for connections to drain
+    pub async fn run_until_shutdown(
+        self: Arc<Self>,
+        listener: TcpListener,
+        mut shutdown_rx: watch::Receiver<bool>,
+        drain_timeout: Duration,
+    ) -> Result<(), StreamError> {
+        tracing::info!(
+            addr = %self.local_addr,
+            drain_timeout_secs = drain_timeout.as_secs(),
+            "Stream proxy starting with graceful shutdown support"
+        );
+
+        // Accept connections until shutdown signal
+        loop {
+            tokio::select! {
+                biased;
+
+                // Check for shutdown signal first
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        tracing::info!("Stream proxy received shutdown signal, stopping accept loop");
+                        break;
+                    }
+                }
+
+                // Accept new connections
+                accept_result = listener.accept() => {
+                    match accept_result {
+                        Ok((client_stream, client_addr)) => {
+                            let proxy = Arc::clone(&self);
+                            let tracker = Arc::clone(&self.connection_tracker);
+
+                            tokio::spawn(async move {
+                                let _guard = ConnectionGuard::new(&tracker);
+                                if let Err(e) = proxy.handle_connection(client_stream, client_addr).await {
+                                    tracing::warn!(client = %client_addr, error = %e, "Connection failed");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to accept connection");
+                            // Brief delay before retrying to avoid tight error loop
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Begin draining existing connections
+        self.begin_shutdown();
+        self.drain_connections(drain_timeout).await;
+
+        Ok(())
+    }
+
+    /// Wait for all active connections to complete or timeout.
+    async fn drain_connections(&self, timeout: Duration) {
+        let active = self.connection_tracker.active();
+        if active == 0 {
+            tracing::info!("No active connections to drain");
+            return;
+        }
+
+        tracing::info!(
+            active_connections = active,
+            timeout_secs = timeout.as_secs(),
+            "Draining active connections"
+        );
+
+        let start = std::time::Instant::now();
+        let check_interval = Duration::from_millis(100);
+
+        loop {
+            let active = self.connection_tracker.active();
+            let elapsed = start.elapsed();
+
+            if active == 0 {
+                tracing::info!(
+                    elapsed_ms = elapsed.as_millis(),
+                    "All connections drained successfully"
+                );
+                return;
+            }
+
+            if elapsed >= timeout {
+                tracing::warn!(
+                    remaining_connections = active,
+                    elapsed_secs = elapsed.as_secs(),
+                    "Drain timeout reached, forcing shutdown with active connections"
+                );
+                return;
+            }
+
+            // Log progress periodically
+            if elapsed.as_secs() % 5 == 0 && elapsed.as_millis() % 5000 < 100 {
+                tracing::info!(
+                    active_connections = active,
+                    elapsed_secs = elapsed.as_secs(),
+                    remaining_secs = (timeout - elapsed).as_secs(),
+                    "Still draining connections..."
+                );
+            }
+
+            tokio::time::sleep(check_interval).await;
         }
     }
 

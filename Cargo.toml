@@ -22,7 +22,8 @@ wicket-config = { path = "crates/wicket-config" }
 wicket-core = { path = "crates/wicket-core" }
 
 # eBPF sockmap (optional, Linux only)
-volt-sockmap = { path = "volt/crates/volt-sockmap", features = ["embedded-bpf"] }
+# Requires the volt submodule to be initialized: git submodule update --init
+# volt-sockmap = { path = "volt/crates/volt-sockmap", features = ["embedded-bpf"] }
 
 # Pingora framework
 pingora = { version = "0.6", features = ["lb"] }

@@ -7,7 +7,8 @@ description = "L4 TCP stream proxying for Wicket"
 
 [features]
 default = []
-ebpf = ["volt-sockmap"]
+# ebpf feature requires the volt submodule: git submodule update --init
+# ebpf = ["volt-sockmap"]
 
 [dependencies]
 # Workspace crates
@@ -24,7 +25,8 @@ socket2 = { version = "0.5", features = ["all"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-volt-sockmap = { workspace = true, optional = true }
+# Requires the volt submodule to be initialized: git submodule update --init
+# volt-sockmap = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }

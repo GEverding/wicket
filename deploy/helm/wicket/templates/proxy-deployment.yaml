@@ -68,6 +68,15 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Give time for endpoints to be removed from Service before shutting down.
+                # This ensures load balancers stop sending new traffic before we begin draining.
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep {{ .Values.proxy.lifecycle.preStopSleepSeconds | default 15 }}
           resources:
             {{- toYaml .Values.proxy.resources | nindent 12 }}
           securityContext:
@@ -108,7 +117,7 @@ spec:
       {{- if .Values.proxy.priorityClassName }}
       priorityClassName: {{ .Values.proxy.priorityClassName }}
       {{- end }}
-      {{- if .Values.proxy.terminationGracePeriodSeconds }}
-      terminationGracePeriodSeconds: {{ .Values.proxy.terminationGracePeriodSeconds }}
-      {{- end }}
+      # terminationGracePeriodSeconds should be > preStopSleepSeconds + shutdownTimeout
+      # Default: 15s (preStop) + 30s (shutdown) + 5s (buffer) = 50s
+      terminationGracePeriodSeconds: {{ .Values.proxy.terminationGracePeriodSeconds | default 50 }}
 {{- end }}

@@ -7,7 +7,8 @@ description = "Core proxy and routing logic for Wicket"
 
 [features]
 default = []
-ebpf = ["volt-sockmap"]
+# ebpf feature requires the volt submodule: git submodule update --init
+# ebpf = ["volt-sockmap"]
 
 [dependencies]
 wicket-config = { workspace = true }
@@ -34,5 +35,6 @@ prometheus = "0.13"
 lazy_static = "1.4"
 
 # eBPF sockmap (optional, Linux only)
-[target.'cfg(target_os = "linux")'.dependencies]
-volt-sockmap = { workspace = true, optional = true }
+# Requires the volt submodule to be initialized: git submodule update --init
+# [target.'cfg(target_os = "linux")'.dependencies]
+# volt-sockmap = { workspace = true, optional = true }
