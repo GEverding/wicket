@@ -1,13 +1,14 @@
 //! Configuration generator that converts Gateway API resources to Wicket TOML config.
 
-use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use tracing::warn;
 
-use crate::crds::{
-    BackendRef, Gateway, GatewaySpec, HTTPRoute, HTTPRouteRule, Listener, ProtocolType, TCPRoute,
-    TLSRoute,
+use crate::crds::{Gateway, HTTPRoute, Listener, ProtocolType, TCPRoute, TLSRoute};
+
+use wicket_config::{
+    HeaderModifier, MirrorFilter, PathModifier, RedirectFilter, RouteConfig, RouteFilters,
+    RouteMatch, UrlRewriteFilter,
 };
 
 /// Generated Wicket configuration that matches wicket-config format.
@@ -18,6 +19,7 @@ pub struct WicketConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub upstreams: HashMap<String, UpstreamConfig>,
 
+    /// Routes using the canonical wicket-config RouteConfig type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<RouteConfig>,
 
@@ -93,156 +95,6 @@ fn default_interval() -> u64 {
 
 fn default_unhealthy_threshold() -> u32 {
     3
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RouteConfig {
-    pub name: String,
-    pub upstream: String,
-
-    #[serde(rename = "match")]
-    pub route_match: RouteMatchConfig,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tls: Option<RouteTlsConfig>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub filters: Option<RouteFilters>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<u64>,
-}
-
-/// Filters that can be applied to requests and responses.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct RouteFilters {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_headers: Option<HeaderModifier>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_headers: Option<HeaderModifier>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub redirect: Option<RedirectFilter>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url_rewrite: Option<UrlRewriteFilter>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mirror: Option<MirrorFilter>,
-}
-
-impl RouteFilters {
-    pub fn is_empty(&self) -> bool {
-        self.request_headers.is_none()
-            && self.response_headers.is_none()
-            && self.redirect.is_none()
-            && self.url_rewrite.is_none()
-            && self.mirror.is_none()
-    }
-}
-
-/// Header modification filter.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct HeaderModifier {
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub add: HashMap<String, String>,
-
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub set: HashMap<String, String>,
-
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub remove: Vec<String>,
-}
-
-impl HeaderModifier {
-    pub fn is_empty(&self) -> bool {
-        self.add.is_empty() && self.set.is_empty() && self.remove.is_empty()
-    }
-}
-
-/// Redirect filter configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RedirectFilter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scheme: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathModifier>,
-
-    #[serde(default = "default_redirect_status")]
-    pub status_code: u16,
-}
-
-fn default_redirect_status() -> u16 {
-    302
-}
-
-/// Path modification for redirects and rewrites.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PathModifier {
-    ReplaceFullPath(String),
-    ReplacePrefixMatch(String),
-}
-
-/// URL rewrite filter configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct UrlRewriteFilter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathModifier>,
-}
-
-/// Request mirroring filter configuration.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MirrorFilter {
-    pub upstream: String,
-
-    #[serde(default = "default_mirror_percent")]
-    pub percent: u8,
-}
-
-fn default_mirror_percent() -> u8 {
-    100
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RouteMatchConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path_prefix: Option<String>,
-
-    /// Regular expression path match
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path_regex: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub methods: Vec<String>,
-
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub headers: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RouteTlsConfig {
-    Auto(String),
-    Off,
-    Cert { cert: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -363,58 +215,13 @@ pub struct GatewayState {
     pub tls_secrets: HashMap<String, (String, String)>,
 }
 
-/// Validates a regex pattern for complexity and ReDoS vulnerability.
-///
-/// Checks:
-/// - Pattern length <= 1000 characters
-/// - Compiled regex size <= 100,000 bytes
-/// - Rejects patterns with nested quantifiers like `(a+)+` or `(a*)*`
-///
-/// Returns `Some(pattern)` if valid, `None` if invalid.
-fn validate_regex_pattern(pattern: &str) -> Option<String> {
-    const MAX_PATTERN_LEN: usize = 1000;
-    const MAX_COMPILED_SIZE: usize = 100_000;
-
-    // Check pattern length
-    if pattern.len() > MAX_PATTERN_LEN {
-        warn!(
-            pattern_len = pattern.len(),
-            max_len = MAX_PATTERN_LEN,
-            "Regex pattern exceeds maximum length"
-        );
-        return None;
-    }
-
-    // Check for nested quantifiers: (a+)+, (a*)*, (a+)*, (a*)+, etc.
-    // Look for )+, )*, )+?, )*? patterns which indicate quantifier after group
-    if pattern.contains(")+") || pattern.contains(")*") {
-        warn!("Regex pattern contains nested quantifiers");
-        return None;
-    }
-
-    // Try to compile with size limit
-    match RegexBuilder::new(pattern)
-        .size_limit(MAX_COMPILED_SIZE)
-        .build()
-    {
-        Ok(_) => Some(pattern.to_string()),
-        Err(e) => {
-            warn!(
-                error = %e,
-                "Failed to compile regex pattern or exceeded size limit"
-            );
-            None
-        }
-    }
-}
-
 impl GatewayState {
     /// Create a key from namespace and name.
     pub fn key(namespace: &str, name: &str) -> String {
         format!("{}/{}", namespace, name)
     }
 
-    /// Convert HTTPRoute filters to RouteFilters.
+    /// Convert HTTPRoute filters to canonical RouteFilters.
     fn convert_filters(
         filters: &[crate::crds::HTTPRouteFilter],
         route_ns: &str,
@@ -438,7 +245,10 @@ impl GatewayState {
                             header_mod.set.insert(h.name.clone(), h.value.clone());
                         }
                         header_mod.remove = modifier.remove.clone();
-                        if !header_mod.is_empty() {
+                        if !header_mod.add.is_empty()
+                            || !header_mod.set.is_empty()
+                            || !header_mod.remove.is_empty()
+                        {
                             result.request_headers = Some(header_mod);
                             has_filters = true;
                         }
@@ -454,7 +264,10 @@ impl GatewayState {
                             header_mod.set.insert(h.name.clone(), h.value.clone());
                         }
                         header_mod.remove = modifier.remove.clone();
-                        if !header_mod.is_empty() {
+                        if !header_mod.add.is_empty()
+                            || !header_mod.set.is_empty()
+                            || !header_mod.remove.is_empty()
+                        {
                             result.response_headers = Some(header_mod);
                             has_filters = true;
                         }
@@ -663,13 +476,12 @@ impl GatewayState {
                     if rule.matches.is_empty() {
                         // Default match - all traffic
                         let route_config = RouteConfig {
-                            name: format!("{}-{}-rule{}", route_ns, route_name, rule_idx),
+                            name: Some(format!("{}-{}-rule{}", route_ns, route_name, rule_idx)),
                             upstream: upstream_name.clone(),
-                            route_match: RouteMatchConfig {
+                            match_rules: RouteMatch {
                                 host: route.spec.hostnames.first().cloned(),
                                 path: None,
                                 path_prefix: Some("/".to_string()),
-                                path_regex: None,
                                 methods: vec![],
                                 headers: HashMap::new(),
                             },
@@ -680,37 +492,32 @@ impl GatewayState {
                         routes.push(route_config);
                     } else {
                         for (match_idx, route_match) in rule.matches.iter().enumerate() {
-                            let (path, path_prefix, path_regex) = if let Some(ref path_match) =
-                                route_match.path
+                            let (path, path_prefix) = if let Some(ref path_match) = route_match.path
                             {
                                 match path_match.type_ {
                                     crate::crds::PathMatchType::Exact => {
-                                        (Some(path_match.value.clone()), None, None)
+                                        (Some(path_match.value.clone()), None)
                                     }
                                     crate::crds::PathMatchType::PathPrefix => {
-                                        (None, Some(path_match.value.clone()), None)
+                                        (None, Some(path_match.value.clone()))
                                     }
                                     crate::crds::PathMatchType::RegularExpression => {
-                                        // Validate regex pattern for ReDoS vulnerability
-                                        match validate_regex_pattern(&path_match.value) {
-                                            Some(validated_pattern) => {
-                                                (None, None, Some(validated_pattern))
-                                            }
-                                            None => {
-                                                warn!(
-                                                    route = %format!("{}/{}", route_ns, route_name),
-                                                    rule_idx = rule_idx,
-                                                    match_idx = match_idx,
-                                                    pattern = %path_match.value,
-                                                    "Skipping route match due to invalid regex pattern"
-                                                );
-                                                continue;
-                                            }
-                                        }
+                                        // path_regex is not supported in the canonical RouteMatch.
+                                        // Log a warning and skip this match entirely.
+                                        warn!(
+                                            route = %format!("{}/{}", route_ns, route_name),
+                                            rule_idx = rule_idx,
+                                            match_idx = match_idx,
+                                            pattern = %path_match.value,
+                                            "Skipping route match: RegularExpression path \
+                                             matching is not yet supported in wicket-config \
+                                             RouteMatch (tracked in bd-89m)"
+                                        );
+                                        continue;
                                     }
                                 }
                             } else {
-                                (None, Some("/".to_string()), None)
+                                (None, Some("/".to_string()))
                             };
 
                             let methods: Vec<String> = route_match
@@ -726,16 +533,15 @@ impl GatewayState {
                                 .collect();
 
                             let route_config = RouteConfig {
-                                name: format!(
+                                name: Some(format!(
                                     "{}-{}-rule{}-match{}",
                                     route_ns, route_name, rule_idx, match_idx
-                                ),
+                                )),
                                 upstream: upstream_name.clone(),
-                                route_match: RouteMatchConfig {
+                                match_rules: RouteMatch {
                                     host: route.spec.hostnames.first().cloned(),
                                     path,
                                     path_prefix,
-                                    path_regex,
                                     methods,
                                     headers,
                                 },
@@ -941,44 +747,6 @@ mod tests {
         assert!(upstream.backends.contains(&"10.0.0.1:80".to_string()));
     }
 
-    #[test]
-    fn test_validate_regex_pattern_valid() {
-        // Valid simple patterns should pass
-        assert!(validate_regex_pattern("^/api/.*").is_some());
-        assert!(validate_regex_pattern("^/users/[0-9]+$").is_some());
-        assert!(validate_regex_pattern(".*\\.json$").is_some());
-    }
-
-    #[test]
-    fn test_validate_regex_pattern_nested_quantifiers() {
-        // Nested quantifiers should be rejected
-        assert!(validate_regex_pattern("(a+)+").is_none());
-        assert!(validate_regex_pattern("(a*)*").is_none());
-        assert!(validate_regex_pattern("(a+)*").is_none());
-        assert!(validate_regex_pattern("(a*)+").is_none());
-    }
-
-    #[test]
-    fn test_validate_regex_pattern_too_long() {
-        // Pattern exceeding max length should be rejected
-        let long_pattern = "a".repeat(1001);
-        assert!(validate_regex_pattern(&long_pattern).is_none());
-    }
-
-    #[test]
-    fn test_validate_regex_pattern_max_length_boundary() {
-        // Pattern at exactly max length should pass
-        let max_pattern = "a".repeat(1000);
-        assert!(validate_regex_pattern(&max_pattern).is_some());
-    }
-
-    #[test]
-    fn test_validate_regex_pattern_invalid_syntax() {
-        // Invalid regex syntax should be rejected
-        assert!(validate_regex_pattern("[invalid").is_none());
-        assert!(validate_regex_pattern("(?P<invalid").is_none());
-    }
-
     /// Test: Config generation with valid Gateway + HTTPRoute + backends.
     #[test]
     fn test_config_generation_integration_with_valid_resources() {
@@ -1075,16 +843,19 @@ mod tests {
         assert!(upstream.backends.contains(&"10.0.0.1:80".to_string()));
         assert!(upstream.backends.contains(&"10.0.0.2:80".to_string()));
 
-        // Verify routes from HTTPRoute
+        // Verify routes from HTTPRoute — use canonical field names
         assert_eq!(config.routes.len(), 1);
         let route_config = &config.routes[0];
-        assert_eq!(route_config.name, "default-test-route-rule0");
+        assert_eq!(
+            route_config.name,
+            Some("default-test-route-rule0".to_string())
+        );
         assert_eq!(route_config.upstream, "default-test-route-rule0");
         assert_eq!(
-            route_config.route_match.host,
+            route_config.match_rules.host,
             Some("api.example.com".to_string())
         );
-        assert_eq!(route_config.route_match.path_prefix, Some("/".to_string()));
+        assert_eq!(route_config.match_rules.path_prefix, Some("/".to_string()));
     }
 
     /// Test: Config generation with multiple routes and upstreams.
@@ -1308,23 +1079,110 @@ mod tests {
         // Verify routes with different path match types
         assert_eq!(config.routes.len(), 2);
 
-        // First route: exact path match
+        // First route: exact path match — use canonical field name match_rules
         let exact_route = config
             .routes
             .iter()
-            .find(|r| r.route_match.path.as_deref() == Some("/health"))
+            .find(|r| r.match_rules.path.as_deref() == Some("/health"))
             .unwrap();
-        assert_eq!(exact_route.route_match.path, Some("/health".to_string()));
+        assert_eq!(exact_route.match_rules.path, Some("/health".to_string()));
 
         // Second route: path prefix match
         let prefix_route = config
             .routes
             .iter()
-            .find(|r| r.route_match.path_prefix.as_deref() == Some("/api"))
+            .find(|r| r.match_rules.path_prefix.as_deref() == Some("/api"))
             .unwrap();
         assert_eq!(
-            prefix_route.route_match.path_prefix,
+            prefix_route.match_rules.path_prefix,
             Some("/api".to_string())
         );
+    }
+
+    /// Test: RegularExpression path matches are skipped with a warning.
+    #[test]
+    fn test_regex_path_match_skipped() {
+        let mut state = GatewayState::default();
+
+        let gateway = Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![Listener {
+                    name: "http".to_string(),
+                    hostname: None,
+                    port: 8080,
+                    protocol: ProtocolType::HTTP,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        };
+        state
+            .gateways
+            .insert(GatewayState::key("default", "gw"), gateway);
+
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("regex-route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HTTPRouteSpec {
+                parent_refs: vec![],
+                hostnames: vec![],
+                rules: vec![HTTPRouteRule {
+                    name: None,
+                    matches: vec![crate::crds::HTTPRouteMatch {
+                        path: Some(crate::crds::HTTPPathMatch {
+                            type_: crate::crds::PathMatchType::RegularExpression,
+                            value: "^/api/.*".to_string(),
+                        }),
+                        headers: vec![],
+                        query_params: vec![],
+                        method: None,
+                    }],
+                    filters: vec![],
+                    backend_refs: vec![HTTPBackendRef {
+                        backend_ref: crate::crds::BackendRef {
+                            group: "".to_string(),
+                            kind: "Service".to_string(),
+                            name: "backend".to_string(),
+                            namespace: None,
+                            port: Some(80),
+                            weight: 1,
+                        },
+                        filters: vec![],
+                    }],
+                    timeouts: None,
+                }],
+            },
+            status: None,
+        };
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "regex-route"), route);
+
+        state.service_endpoints.insert(
+            GatewayState::key("default", "backend"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "backend".to_string(),
+                port: 80,
+                endpoints: vec!["10.0.0.1:80".to_string()],
+            },
+        );
+
+        let config = state.generate_config();
+
+        // Regex match must be skipped — no routes generated
+        assert_eq!(config.routes.len(), 0, "regex path match should be skipped");
     }
 }

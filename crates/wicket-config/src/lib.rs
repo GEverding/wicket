@@ -4,7 +4,7 @@
 //! upstreams, routes, server settings, and TLS configuration.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -98,7 +98,7 @@ pub struct HealthCheckConfig {
 }
 
 /// Route configuration for matching and proxying requests.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RouteConfig {
     /// Optional route name for logging
     pub name: Option<String>,
@@ -124,7 +124,7 @@ pub struct RouteConfig {
 }
 
 /// Filters that can be applied to requests and responses.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RouteFilters {
     /// Modify request headers
     #[serde(default)]
@@ -148,7 +148,7 @@ pub struct RouteFilters {
 }
 
 /// Header modification filter.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct HeaderModifier {
     /// Headers to add (appends to existing)
     #[serde(default)]
@@ -164,7 +164,7 @@ pub struct HeaderModifier {
 }
 
 /// Redirect filter configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RedirectFilter {
     /// Scheme to redirect to (http or https)
     #[serde(default)]
@@ -192,7 +192,7 @@ fn default_redirect_status() -> u16 {
 }
 
 /// Path modification for redirects and rewrites.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PathModifier {
     /// Replace the entire path
@@ -202,7 +202,7 @@ pub enum PathModifier {
 }
 
 /// URL rewrite filter configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UrlRewriteFilter {
     /// Hostname to rewrite to
     #[serde(default)]
@@ -214,7 +214,7 @@ pub struct UrlRewriteFilter {
 }
 
 /// Request mirroring filter configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MirrorFilter {
     /// Upstream to mirror traffic to
     pub upstream: String,
@@ -235,7 +235,7 @@ fn default_mirror_percent() -> u8 {
 /// - `tls = { auto = "provider-name" }` - Use a named DNS provider
 /// - `tls = { cert = "cert-name" }` - Use a specific certificate
 /// - `tls = "off"` - Disable TLS
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum RouteTlsConfig {
     /// Simple string variants: "auto" or "off"
@@ -253,7 +253,7 @@ pub enum RouteTlsConfig {
 }
 
 /// Simple TLS modes that can be specified as strings.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SimpleTlsMode {
     /// Auto-provision certificate via ACME using default_dns
@@ -294,7 +294,7 @@ impl RouteTlsConfig {
 }
 
 /// Matching rules for a route.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RouteMatch {
     /// Host header to match (supports wildcards like "*.example.com")
