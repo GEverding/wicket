@@ -295,6 +295,7 @@ impl RouteTlsConfig {
 
 /// Matching rules for a route.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RouteMatch {
     /// Host header to match (supports wildcards like "*.example.com")
     pub host: Option<String>,
@@ -432,6 +433,20 @@ impl Config {
                     "Route '{}' references undefined upstream '{}'",
                     route.name.as_deref().unwrap_or("<unnamed>"),
                     route.upstream
+                );
+            }
+
+            // Reject unsupported route fields
+            if route.filters.is_some() {
+                anyhow::bail!(
+                    "Route '{}' uses 'filters' which is not yet supported",
+                    route.name.as_deref().unwrap_or("<unnamed>")
+                );
+            }
+            if route.timeout.is_some() {
+                anyhow::bail!(
+                    "Route '{}' uses 'timeout' which is not yet supported",
+                    route.name.as_deref().unwrap_or("<unnamed>")
                 );
             }
 
@@ -1858,5 +1873,85 @@ path_prefix = "/"
 
         // Should parse successfully
         Config::parse(config).unwrap();
+    }
+
+    #[test]
+    fn test_route_match_unknown_field_rejected() {
+        // path_regex is not a supported field in RouteMatch
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "api"
+upstream = "backend"
+[routes.match]
+path_regex = "^/api/.*"
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // Check the full error chain (anyhow wraps the inner serde error)
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("path_regex") || msg.contains("unknown field"),
+            "expected error about unknown field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_route_filters_unsupported() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "api"
+upstream = "backend"
+[routes.match]
+path_prefix = "/api"
+[routes.filters]
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("filters") && msg.contains("not yet supported"),
+            "expected unsupported filters error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_route_timeout_unsupported() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "api"
+upstream = "backend"
+timeout = 30
+[routes.match]
+path_prefix = "/api"
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("timeout") && msg.contains("not yet supported"),
+            "expected unsupported timeout error, got: {msg}"
+        );
     }
 }

@@ -1,0 +1,256 @@
+schema_version: 1
+as_of_date: 2026-03-01
+legend:
+  GA: "Implemented and enforced in runtime path; expected stable behavior"
+  Beta: "Implemented partially or behavior still evolving"
+  Unsupported: "Not implemented in runtime path; must be validation-rejected or treated as roadmap"
+
+capabilities:
+  - area: http-routing
+    feature: exact_host_match
+    status: GA
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/routing.rs
+    notes: "Exact host matching is compiled in router and matched case-insensitively."
+
+  - area: http-routing
+    feature: wildcard_host_match_prefix_only
+    status: GA
+    owner_modules:
+      - crates/wicket-core/src/routing.rs
+    notes: "Supports *.example.com single-label wildcard semantics."
+
+  - area: http-routing
+    feature: path_exact_match
+    status: GA
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/routing.rs
+    notes: "Exact path matcher present in compiled route path matcher."
+
+  - area: http-routing
+    feature: path_prefix_match
+    status: GA
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/routing.rs
+    notes: "Prefix path matching is implemented in runtime router."
+
+  - area: http-routing
+    feature: method_match
+    status: GA
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/routing.rs
+    notes: "Methods are normalized to uppercase and matched exactly."
+
+  - area: http-routing
+    feature: header_exact_match
+    status: GA
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/routing.rs
+    notes: "Exact header key/value matching is implemented in compiled route."
+
+  - area: http-routing
+    feature: path_regex_match
+    status: Unsupported
+    owner_modules:
+      - crates/wicket-controller/src/reconcilers/config_generator.rs
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/routing.rs
+    notes: "Controller model includes path_regex but parser/runtime do not support it end-to-end."
+
+  - area: route-filters
+    feature: request_response_header_modifiers
+    status: Unsupported
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/proxy.rs
+    notes: "Filter schema exists but runtime execution pipeline is not wired."
+
+  - area: route-filters
+    feature: redirects
+    status: Unsupported
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/proxy.rs
+    notes: "Redirect filter types are defined in config model; runtime behavior missing."
+
+  - area: route-filters
+    feature: url_rewrite
+    status: Unsupported
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/proxy.rs
+    notes: "URL rewrite filter types are defined in config model; runtime behavior missing."
+
+  - area: route-filters
+    feature: request_mirroring
+    status: Unsupported
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/proxy.rs
+    notes: "Mirroring filter modeled in config; not executed by proxy runtime path."
+
+  - area: timeouts
+    feature: per_route_timeout
+    status: Unsupported
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/proxy.rs
+    notes: "Route timeout field exists in config model without runtime mapping."
+
+  - area: upstreams
+    feature: round_robin_load_balancing
+    status: GA
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/proxy.rs
+    notes: "Round-robin cluster selection is implemented in upstream cluster."
+
+  - area: upstreams
+    feature: consistent_hash_load_balancing
+    status: GA
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/proxy.rs
+    notes: "Ketama consistent hashing strategy is wired in runtime."
+
+  - area: upstreams
+    feature: active_health_checks
+    status: Beta
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-core/src/proxy.rs
+    notes: "TCP health checks are wired; HTTP path/threshold config is not fully honored."
+
+  - area: tls
+    feature: file_based_certs
+    status: Beta
+    owner_modules:
+      - crates/wicket-tls/src/config.rs
+      - crates/wicket/src/main.rs
+    notes: "Static cert files are served; runtime dynamic resolver path is not unified yet."
+
+  - area: tls
+    feature: acme_certificate_management
+    status: Beta
+    owner_modules:
+      - crates/wicket-tls/src/acme/mod.rs
+      - crates/wicket-tls/src/cert_manager.rs
+      - crates/wicket/src/main.rs
+    notes: "ACME manager exists; listener integration requires full runtime resolver wiring."
+
+  - area: tls
+    feature: mixed_mode_file_plus_acme
+    status: Beta
+    owner_modules:
+      - crates/wicket-tls/src/config.rs
+      - crates/wicket/src/main.rs
+    notes: "Config supports mixed mode; precedence and serving integration need hardening."
+
+  - area: tls
+    feature: route_level_tls_auto_provider_certref
+    status: Beta
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-controller/src/reconcilers/config_generator.rs
+      - crates/wicket-core/src/proxy.rs
+    notes: "Route model includes per-route TLS settings; runtime enforcement is partial."
+
+  - area: stream-l4
+    feature: tcp_proxying
+    status: GA
+    owner_modules:
+      - crates/wicket-stream/src/proxy.rs
+      - crates/wicket/src/main.rs
+    notes: "TCP stream accept/connect/proxy path is implemented."
+
+  - area: stream-l4
+    feature: sni_based_routing
+    status: Beta
+    owner_modules:
+      - crates/wicket-stream/src/sni.rs
+      - crates/wicket-stream/src/router.rs
+    notes: "SNI extraction and routing exist; normalization/semantic alignment work remains."
+
+  - area: stream-l4
+    feature: proxy_protocol_support
+    status: Beta
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-stream/src/proxy.rs
+    notes: "Config models PROXY protocol modes; runtime implementation is not fully complete."
+
+  - area: stream-l4
+    feature: source_ip_pool_for_ephemeral_ports
+    status: Beta
+    owner_modules:
+      - crates/wicket-config/src/lib.rs
+      - crates/wicket-stream/src/pool.rs
+    notes: "Source IP pool abstraction exists; production hardening and observability still needed."
+
+  - area: stream-l4
+    feature: ebpf_acceleration
+    status: Beta
+    owner_modules:
+      - crates/wicket-stream/src/ebpf.rs
+      - crates/wicket-stream/src/proxy.rs
+    notes: "eBPF integration exists with conditional path; capability fallback hardening pending."
+
+  - area: controller
+    feature: gateway_api_reconciliation
+    status: Beta
+    owner_modules:
+      - crates/wicket-controller/src/reconcilers
+      - crates/wicket-controller/src/main.rs
+    notes: "Controllers for Gateway/Routes/Services/Secrets exist; architecture still maturing."
+
+  - area: controller
+    feature: configmap_generation_and_publish
+    status: Beta
+    owner_modules:
+      - crates/wicket-controller/src/reconcilers/context.rs
+      - crates/wicket-controller/src/reconcilers/config_generator.rs
+    notes: "ConfigMap updates are implemented; dedup/debounce/single-synthesis path is pending."
+
+  - area: controller
+    feature: leader_election
+    status: Beta
+    owner_modules:
+      - crates/wicket-controller/src/leader_election.rs
+      - crates/wicket-controller/src/main.rs
+    notes: "Leader election state is present; mutating operation gating needs tightening."
+
+  - area: controller
+    feature: referencegrant_enforcement
+    status: Beta
+    owner_modules:
+      - crates/wicket-controller/src/reconcilers/referencegrant.rs
+      - crates/wicket-controller/src/reconcilers/secret.rs
+      - crates/wicket-controller/src/reconcilers/config_generator.rs
+    notes: "Validation exists in reconciler paths; synthesis-time enforcement needs closure."
+
+  - area: observability
+    feature: prometheus_metrics_data_plane
+    status: Beta
+    owner_modules:
+      - crates/wicket-core/src/metrics.rs
+    notes: "Metric surface is broad; several metrics are currently uninstrumented."
+
+  - area: observability
+    feature: prometheus_metrics_controller
+    status: Beta
+    owner_modules:
+      - crates/wicket-controller/src/metrics/mod.rs
+    notes: "Controller metrics endpoint and families exist; some metrics are not yet wired."
+
+  - area: observability
+    feature: request_id_and_structured_logs
+    status: GA
+    owner_modules:
+      - crates/wicket-core/src/proxy.rs
+      - crates/wicket/src/main.rs
+    notes: "Request IDs and structured logging are integrated into request path."
