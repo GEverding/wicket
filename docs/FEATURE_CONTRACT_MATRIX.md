@@ -75,6 +75,8 @@ This matrix defines the current feature contract for Wicket and maps each capabi
 | Controller Prometheus metrics | Beta | `wicket-controller/metrics/mod.rs` | Endpoint + families exist; wiring parity pending |
 | Request IDs + structured logs | GA | `wicket-core/proxy.rs`, `wicket/main.rs` | Runtime-integrated |
 
+- Architecture direction for the controller is captured in [ADR_KUBE_RS_CONTROLLER_STRATEGY.md](ADR_KUBE_RS_CONTROLLER_STRATEGY.md): deepen kube-rs usage via shared cache/index layer, single synthesis pipeline, and leader-enforced writes (epic `bd-e3g`).
+
 ## Contract Rules
 
 1. Capabilities marked **Unsupported** must fail validation before runtime.
