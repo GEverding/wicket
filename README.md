@@ -7,8 +7,9 @@ A Kubernetes Gateway API implementation and general-purpose reverse proxy built 
 - **Fast**: Built on Pingora, the framework powering Cloudflare's edge
 - **Config-driven**: Simple TOML configuration for routes and upstreams
 - **Observable**: Production-grade telemetry via [Cloudflare Foundations](https://github.com/cloudflare/foundations)
-- **Gateway API native**: Kubernetes Gateway API support (coming soon)
+- **Gateway API (beta)**: Kubernetes Gateway API reconciliation via `wicket-controller`; see [`docs/FEATURE_CONTRACT_MATRIX.md`](docs/FEATURE_CONTRACT_MATRIX.md) for per-capability status
 - **Single binary**: No runtime dependencies
+- **Explicit contracts**: Unsupported capabilities are validation-rejected, not silently ignored; see [`docs/FEATURE_CONTRACT_MATRIX.md`](docs/FEATURE_CONTRACT_MATRIX.md) for the authoritative feature support status
 
 ## Quick Start
 
@@ -132,28 +133,14 @@ crates/
 - **[Pingora](https://github.com/cloudflare/pingora)** - High-performance proxy framework
 - **[Foundations](https://github.com/cloudflare/foundations)** - Production telemetry, logging, and settings
 
-## Roadmap
+## Feature Status
 
-### Phase 1 (Current)
-- [x] TOML configuration parsing
-- [x] Path and host-based routing
-- [x] Round-robin and consistent-hash load balancing
-- [x] Structured JSON logging
-- [x] Request tracing with IDs
-- [x] Workspace structure with modular crates
-- [x] Foundations integration for telemetry
+The authoritative feature contract is documented in [`docs/FEATURE_CONTRACT_MATRIX.md`](docs/FEATURE_CONTRACT_MATRIX.md) and its YAML companion `docs/FEATURE_CONTRACT_MATRIX.yaml`. Each capability is marked **GA**, **Beta**, or **Unsupported**.
 
-### Phase 2
-- [ ] TLS termination
-- [ ] Health checks with circuit breaking
-- [ ] Request/response header transforms
-- [ ] Rate limiting
+- **Unsupported** capabilities are rejected at validation time and never silently ignored.
+- **Beta** capabilities are partially implemented; behavior may still evolve.
 
-### Phase 3
-- [ ] Kubernetes Gateway API controller (kube-rs)
-- [ ] Hot configuration reload (SIGHUP)
-- [ ] Prometheus metrics endpoint
-- [ ] OpenTelemetry integration
+Current focus areas: data-plane parity, TLS unification, and controller hardening.
 
 ## License
 
