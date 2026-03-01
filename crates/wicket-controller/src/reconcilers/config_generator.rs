@@ -6,10 +6,7 @@ use tracing::warn;
 
 use crate::crds::{Gateway, HTTPRoute, Listener, ProtocolType, TCPRoute, TLSRoute};
 
-use wicket_config::{
-    HeaderModifier, MirrorFilter, PathModifier, RedirectFilter, RouteConfig, RouteFilters,
-    RouteMatch, UrlRewriteFilter,
-};
+use wicket_config::{RouteConfig, RouteMatch};
 
 /// Generated Wicket configuration that matches wicket-config format.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -221,152 +218,6 @@ impl GatewayState {
         format!("{}/{}", namespace, name)
     }
 
-    /// Convert HTTPRoute filters to canonical RouteFilters.
-    fn convert_filters(
-        filters: &[crate::crds::HTTPRouteFilter],
-        route_ns: &str,
-        upstreams: &mut HashMap<String, UpstreamConfig>,
-        service_endpoints: &HashMap<String, ServiceEndpoints>,
-    ) -> Option<RouteFilters> {
-        use crate::crds::HTTPRouteFilterType;
-
-        let mut result = RouteFilters::default();
-        let mut has_filters = false;
-
-        for filter in filters {
-            match filter.type_ {
-                HTTPRouteFilterType::RequestHeaderModifier => {
-                    if let Some(ref modifier) = filter.request_header_modifier {
-                        let mut header_mod = HeaderModifier::default();
-                        for h in &modifier.add {
-                            header_mod.add.insert(h.name.clone(), h.value.clone());
-                        }
-                        for h in &modifier.set {
-                            header_mod.set.insert(h.name.clone(), h.value.clone());
-                        }
-                        header_mod.remove = modifier.remove.clone();
-                        if !header_mod.add.is_empty()
-                            || !header_mod.set.is_empty()
-                            || !header_mod.remove.is_empty()
-                        {
-                            result.request_headers = Some(header_mod);
-                            has_filters = true;
-                        }
-                    }
-                }
-                HTTPRouteFilterType::ResponseHeaderModifier => {
-                    if let Some(ref modifier) = filter.response_header_modifier {
-                        let mut header_mod = HeaderModifier::default();
-                        for h in &modifier.add {
-                            header_mod.add.insert(h.name.clone(), h.value.clone());
-                        }
-                        for h in &modifier.set {
-                            header_mod.set.insert(h.name.clone(), h.value.clone());
-                        }
-                        header_mod.remove = modifier.remove.clone();
-                        if !header_mod.add.is_empty()
-                            || !header_mod.set.is_empty()
-                            || !header_mod.remove.is_empty()
-                        {
-                            result.response_headers = Some(header_mod);
-                            has_filters = true;
-                        }
-                    }
-                }
-                HTTPRouteFilterType::RequestRedirect => {
-                    if let Some(ref redirect) = filter.request_redirect {
-                        let path = redirect.path.as_ref().map(|p| match p.type_ {
-                            crate::crds::HTTPPathModifierType::ReplaceFullPath => {
-                                PathModifier::ReplaceFullPath(
-                                    p.replace_full_path.clone().unwrap_or_default(),
-                                )
-                            }
-                            crate::crds::HTTPPathModifierType::ReplacePrefixMatch => {
-                                PathModifier::ReplacePrefixMatch(
-                                    p.replace_prefix_match.clone().unwrap_or_default(),
-                                )
-                            }
-                        });
-                        result.redirect = Some(RedirectFilter {
-                            scheme: redirect.scheme.clone(),
-                            hostname: redirect.hostname.clone(),
-                            port: redirect.port,
-                            path,
-                            status_code: redirect.status_code as u16,
-                        });
-                        has_filters = true;
-                    }
-                }
-                HTTPRouteFilterType::URLRewrite => {
-                    if let Some(ref rewrite) = filter.url_rewrite {
-                        let path = rewrite.path.as_ref().map(|p| match p.type_ {
-                            crate::crds::HTTPPathModifierType::ReplaceFullPath => {
-                                PathModifier::ReplaceFullPath(
-                                    p.replace_full_path.clone().unwrap_or_default(),
-                                )
-                            }
-                            crate::crds::HTTPPathModifierType::ReplacePrefixMatch => {
-                                PathModifier::ReplacePrefixMatch(
-                                    p.replace_prefix_match.clone().unwrap_or_default(),
-                                )
-                            }
-                        });
-                        result.url_rewrite = Some(UrlRewriteFilter {
-                            hostname: rewrite.hostname.clone(),
-                            path,
-                        });
-                        has_filters = true;
-                    }
-                }
-                HTTPRouteFilterType::RequestMirror => {
-                    if let Some(ref mirror) = filter.request_mirror {
-                        let backend_ns =
-                            mirror.backend_ref.namespace.as_deref().unwrap_or(route_ns);
-                        let mirror_upstream_name =
-                            format!("mirror-{}-{}", backend_ns, mirror.backend_ref.name);
-
-                        // Create upstream for mirror backend
-                        let backend_key = Self::key(backend_ns, &mirror.backend_ref.name);
-                        let backends = if let Some(endpoints) = service_endpoints.get(&backend_key)
-                        {
-                            endpoints.endpoints.clone()
-                        } else {
-                            let port = mirror.backend_ref.port.unwrap_or(80);
-                            vec![format!(
-                                "{}.{}.svc.cluster.local:{}",
-                                mirror.backend_ref.name, backend_ns, port
-                            )]
-                        };
-
-                        upstreams.insert(
-                            mirror_upstream_name.clone(),
-                            UpstreamConfig {
-                                backends,
-                                strategy: "round_robin".to_string(),
-                                health_check: None,
-                            },
-                        );
-
-                        result.mirror = Some(MirrorFilter {
-                            upstream: mirror_upstream_name,
-                            percent: mirror.percent.map(|p| p as u8).unwrap_or(100),
-                        });
-                        has_filters = true;
-                    }
-                }
-                HTTPRouteFilterType::ExtensionRef => {
-                    // Extension filters not supported yet
-                }
-            }
-        }
-
-        if has_filters {
-            Some(result)
-        } else {
-            None
-        }
-    }
-
     /// Parse Duration string to seconds.
     fn parse_duration_to_secs(duration: &str) -> Option<u64> {
         // Gateway API uses Go duration format like "10s", "1m", "1h"
@@ -457,13 +308,16 @@ impl GatewayState {
                         },
                     );
 
-                    // Convert filters from the rule
-                    let filters = Self::convert_filters(
-                        &rule.filters,
-                        route_ns,
-                        &mut upstreams,
-                        &self.service_endpoints,
-                    );
+                    // Filters are not yet supported; warn once per rule and skip.
+                    if !rule.filters.is_empty() {
+                        warn!(
+                            route = %format!("{}/{}", route_ns, route_name),
+                            rule_idx = rule_idx,
+                            filter_count = rule.filters.len(),
+                            "HTTPRoute rule has filters which are not yet supported and will be \
+                             skipped; generated route will have no filters applied"
+                        );
+                    }
 
                     // Parse timeout from rule
                     let timeout = rule.timeouts.as_ref().and_then(|t| {
@@ -486,7 +340,7 @@ impl GatewayState {
                                 headers: HashMap::new(),
                             },
                             tls: None,
-                            filters: filters.clone(),
+                            filters: None,
                             timeout,
                         };
                         routes.push(route_config);
@@ -546,7 +400,7 @@ impl GatewayState {
                                     headers,
                                 },
                                 tls: None,
-                                filters: filters.clone(),
+                                filters: None,
                                 timeout,
                             };
                             routes.push(route_config);
@@ -1184,5 +1038,175 @@ mod tests {
 
         // Regex match must be skipped — no routes generated
         assert_eq!(config.routes.len(), 0, "regex path match should be skipped");
+    }
+
+    /// Test: HTTPRoute rule filters are not emitted into generated RouteConfig.
+    #[test]
+    fn test_filters_not_emitted_into_generated_config() {
+        use crate::crds::{
+            HTTPHeader, HTTPHeaderFilter, HTTPPathModifier, HTTPPathModifierType,
+            HTTPRequestRedirectFilter, HTTPRouteFilter, HTTPRouteFilterType,
+        };
+
+        let mut state = GatewayState::default();
+
+        let gateway = Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![Listener {
+                    name: "http".to_string(),
+                    hostname: None,
+                    port: 8080,
+                    protocol: ProtocolType::HTTP,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        };
+        state
+            .gateways
+            .insert(GatewayState::key("default", "gw"), gateway);
+
+        // Route with a redirect filter and a header modifier filter
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("filter-route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HTTPRouteSpec {
+                parent_refs: vec![],
+                hostnames: vec!["example.com".to_string()],
+                rules: vec![
+                    // Rule with filters and no explicit matches (default match)
+                    HTTPRouteRule {
+                        name: None,
+                        matches: vec![],
+                        filters: vec![
+                            HTTPRouteFilter {
+                                type_: HTTPRouteFilterType::RequestRedirect,
+                                request_header_modifier: None,
+                                response_header_modifier: None,
+                                request_redirect: Some(HTTPRequestRedirectFilter {
+                                    scheme: Some("https".to_string()),
+                                    hostname: None,
+                                    port: None,
+                                    path: None,
+                                    status_code: 301,
+                                }),
+                                url_rewrite: None,
+                                request_mirror: None,
+                                extension_ref: None,
+                            },
+                            HTTPRouteFilter {
+                                type_: HTTPRouteFilterType::RequestHeaderModifier,
+                                request_header_modifier: Some(HTTPHeaderFilter {
+                                    add: vec![HTTPHeader {
+                                        name: "X-Custom".to_string(),
+                                        value: "value".to_string(),
+                                    }],
+                                    set: vec![],
+                                    remove: vec![],
+                                }),
+                                response_header_modifier: None,
+                                request_redirect: None,
+                                url_rewrite: None,
+                                request_mirror: None,
+                                extension_ref: None,
+                            },
+                        ],
+                        backend_refs: vec![HTTPBackendRef {
+                            backend_ref: crate::crds::BackendRef {
+                                group: "".to_string(),
+                                kind: "Service".to_string(),
+                                name: "backend".to_string(),
+                                namespace: None,
+                                port: Some(80),
+                                weight: 1,
+                            },
+                            filters: vec![],
+                        }],
+                        timeouts: None,
+                    },
+                    // Rule with explicit path match and a filter
+                    HTTPRouteRule {
+                        name: None,
+                        matches: vec![crate::crds::HTTPRouteMatch {
+                            path: Some(crate::crds::HTTPPathMatch {
+                                type_: crate::crds::PathMatchType::PathPrefix,
+                                value: "/api".to_string(),
+                            }),
+                            headers: vec![],
+                            query_params: vec![],
+                            method: None,
+                        }],
+                        filters: vec![HTTPRouteFilter {
+                            type_: HTTPRouteFilterType::URLRewrite,
+                            request_header_modifier: None,
+                            response_header_modifier: None,
+                            request_redirect: None,
+                            url_rewrite: Some(crate::crds::HTTPURLRewriteFilter {
+                                hostname: Some("internal.example.com".to_string()),
+                                path: Some(HTTPPathModifier {
+                                    type_: HTTPPathModifierType::ReplacePrefixMatch,
+                                    replace_full_path: None,
+                                    replace_prefix_match: Some("/".to_string()),
+                                }),
+                            }),
+                            request_mirror: None,
+                            extension_ref: None,
+                        }],
+                        backend_refs: vec![HTTPBackendRef {
+                            backend_ref: crate::crds::BackendRef {
+                                group: "".to_string(),
+                                kind: "Service".to_string(),
+                                name: "backend".to_string(),
+                                namespace: None,
+                                port: Some(80),
+                                weight: 1,
+                            },
+                            filters: vec![],
+                        }],
+                        timeouts: None,
+                    },
+                ],
+            },
+            status: None,
+        };
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "filter-route"), route);
+
+        state.service_endpoints.insert(
+            GatewayState::key("default", "backend"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "backend".to_string(),
+                port: 80,
+                endpoints: vec!["10.0.0.1:80".to_string()],
+            },
+        );
+
+        let config = state.generate_config();
+
+        // Both rules produce routes (one default match, one path match)
+        assert_eq!(config.routes.len(), 2, "expected 2 routes");
+
+        // Filters must NOT be emitted into any generated RouteConfig
+        for route_cfg in &config.routes {
+            assert!(
+                route_cfg.filters.is_none(),
+                "route '{}' must not have filters in generated config",
+                route_cfg.name.as_deref().unwrap_or("<unnamed>")
+            );
+        }
     }
 }
