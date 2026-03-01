@@ -76,6 +76,7 @@ This matrix defines the current feature contract for Wicket and maps each capabi
 | Request IDs + structured logs | GA | `wicket-core/proxy.rs`, `wicket/main.rs` | Runtime-integrated |
 
 - Architecture direction for the controller is captured in [ADR_KUBE_RS_CONTROLLER_STRATEGY.md](ADR_KUBE_RS_CONTROLLER_STRATEGY.md): deepen kube-rs usage via shared cache/index layer, single synthesis pipeline, and leader-enforced writes (epic `bd-e3g`).
+- TLS serving architecture, certificate source precedence policy (file > ACME > default), SNI selection behavior, and listener integration model are captured in [ADR_UNIFIED_TLS_SERVING.md](ADR_UNIFIED_TLS_SERVING.md) (issue `bd-xih`, epic `bd-baf`).
 
 ## Contract Rules
 
