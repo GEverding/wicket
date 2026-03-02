@@ -264,6 +264,9 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         error!(error = %e, "Failed to register proxy metrics");
     }
 
+    // Register stream proxy metrics (always safe to call; no-op if stream not configured)
+    wicket_stream::metrics::register_stream_metrics();
+
     // Add Pingora's built-in Prometheus metrics server
     let mut prometheus_service = ListeningService::prometheus_http_service();
     prometheus_service.add_tcp(&args.metrics_addr);

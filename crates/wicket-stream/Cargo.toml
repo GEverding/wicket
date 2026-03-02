@@ -21,6 +21,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 socket2 = { version = "0.5", features = ["all"] }
+prometheus = { workspace = true }
+lazy_static = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
