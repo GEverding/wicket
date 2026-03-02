@@ -46,6 +46,17 @@ pub async fn reconcile_tcproute(
 
     tracing::info!(namespace = %namespace, name = %name, "Reconciling TCPRoute");
 
+    // Handle deletion: remove from store and trigger config update.
+    if route.metadata.deletion_timestamp.is_some() {
+        let key = GatewayState::key(&namespace, &name);
+        ctx.store.remove_tcp_route(&key).await;
+        tracing::info!(namespace = %namespace, name = %name, "TCPRoute deleted, removed from store");
+        trigger_config_update(&ctx, "TCPRoute deleted")
+            .await
+            .map_err(|e| TCPRouteError::ConfigError(e.to_string()))?;
+        return Ok(Action::await_change());
+    }
+
     // Validate parent references and check if they're managed by Wicket
     let mut parent_statuses = Vec::new();
     let mut has_valid_parent = false;

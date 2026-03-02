@@ -64,6 +64,35 @@ pub async fn reconcile_secret(
     let namespace = secret.namespace().unwrap_or_default();
     let name = secret.name_any();
 
+    // Handle deletion: remove from store, clean up on-disk files, trigger config update.
+    if secret.metadata.deletion_timestamp.is_some() {
+        let secret_key = GatewayState::key(&namespace, &name);
+        ctx.store.remove_tls_secret(&secret_key).await;
+
+        // Best-effort: delete on-disk cert/key files.
+        let safe_ns = sanitize_filename_component(&namespace);
+        let safe_name = sanitize_filename_component(&name);
+        let dir = PathBuf::from(&ctx.tls_cert_dir);
+        for ext in &["crt", "key"] {
+            let path = dir.join(format!("{}-{}.{}", safe_ns, safe_name, ext));
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to delete TLS file on secret deletion"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(namespace = %namespace, name = %name, "Secret deleted, removed from store");
+        trigger_config_update(&ctx, "Secret deleted")
+            .await
+            .map_err(|e| SecretError::ConfigError(e.to_string()))?;
+        return Ok(Action::await_change());
+    }
+
     // Only process TLS secrets
     let secret_type = secret.type_.as_deref().unwrap_or("");
     if secret_type != "kubernetes.io/tls" && secret_type != "Opaque" {

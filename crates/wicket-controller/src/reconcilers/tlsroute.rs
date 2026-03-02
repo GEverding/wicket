@@ -46,6 +46,17 @@ pub async fn reconcile_tlsroute(
 
     tracing::info!(namespace = %namespace, name = %name, "Reconciling TLSRoute");
 
+    // Handle deletion: remove from store and trigger config update.
+    if route.metadata.deletion_timestamp.is_some() {
+        let key = GatewayState::key(&namespace, &name);
+        ctx.store.remove_tls_route(&key).await;
+        tracing::info!(namespace = %namespace, name = %name, "TLSRoute deleted, removed from store");
+        trigger_config_update(&ctx, "TLSRoute deleted")
+            .await
+            .map_err(|e| TLSRouteError::ConfigError(e.to_string()))?;
+        return Ok(Action::await_change());
+    }
+
     // Validate parent references and check if they're managed by Wicket
     let mut parent_statuses = Vec::new();
     let mut has_valid_parent = false;
