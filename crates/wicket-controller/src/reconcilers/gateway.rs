@@ -148,6 +148,10 @@ pub async fn reconcile_gateway(
 
     metrics.record_success();
 
+    // Upsert into shared store so the cache path reflects this Gateway.
+    let gw_key = super::config_generator::GatewayState::key(&namespace, &name);
+    ctx.store.upsert_gateway(gw_key, (*gateway).clone()).await;
+
     // Update metrics
     update_gateway_metrics(&ctx.client).await;
 

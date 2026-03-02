@@ -14,13 +14,13 @@ use kube::{
     Client, Resource, ResourceExt,
 };
 
-use crate::crds::{Gateway, GatewayClass, HTTPRoute, TCPRoute, TLSRoute};
+use crate::crds::{HTTPRoute, TCPRoute, TLSRoute};
 use crate::metrics::{
     ReconcileMetrics, BACKENDS_TOTAL, BACKEND_ENDPOINTS_HEALTHY, BACKEND_ENDPOINTS_UNHEALTHY,
 };
 
 use super::config_generator::{GatewayState, ServiceEndpoints};
-use super::context::Context;
+use super::context::{trigger_config_update, Context};
 
 /// Error type for Service/Endpoints reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -46,8 +46,7 @@ pub async fn reconcile_endpoints(
     tracing::debug!(namespace = %namespace, name = %name, "Reconciling Endpoints");
 
     // Check if this service is referenced by any route
-    let service_key = GatewayState::key(&namespace, &name);
-    let is_referenced = is_service_referenced(&ctx.client, &namespace, &name).await;
+    let is_referenced = is_service_referenced(&ctx, &namespace, &name).await;
 
     if !is_referenced {
         tracing::trace!(
@@ -102,8 +101,35 @@ pub async fn reconcile_endpoints(
         "Service endpoints updated"
     );
 
-    // Trigger configuration regeneration
-    trigger_config_update(&ctx).await?;
+    // Update the shared store so the cache path reflects this event.
+    // When endpoints are empty (scale-to-zero), remove the stale entry so
+    // config generation does not keep routing to non-existent backends.
+    let key = GatewayState::key(&namespace, &name);
+    if !endpoint_addrs.is_empty() {
+        ctx.store
+            .upsert_endpoints(
+                key,
+                ServiceEndpoints {
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    port: 80,
+                    endpoints: endpoint_addrs,
+                },
+            )
+            .await;
+    } else {
+        tracing::info!(
+            namespace = %namespace,
+            name = %name,
+            "Endpoints empty (scale-to-zero); removing stale entry from store"
+        );
+        ctx.store.remove_endpoints(&key).await;
+    }
+
+    // Trigger configuration regeneration via the shared path.
+    trigger_config_update(&ctx, "Endpoints reconciled")
+        .await
+        .map_err(|e| ServiceError::ConfigError(e.to_string()))?;
 
     metrics.record_success();
     Ok(Action::requeue(Duration::from_secs(30)))
@@ -133,7 +159,28 @@ pub fn error_policy_endpoints(
 }
 
 /// Check if a service is referenced by any Gateway API route.
-async fn is_service_referenced(client: &Client, namespace: &str, name: &str) -> bool {
+///
+/// ## Cache-first strategy
+///
+/// When the shared store is ready, we answer in O(1) from the pre-built
+/// reverse index.  When the store is not yet ready we fall back to the
+/// existing full-list API scan so we never silently skip a referenced
+/// service during startup.
+async fn is_service_referenced(ctx: &Context, namespace: &str, name: &str) -> bool {
+    // ── Cache path ────────────────────────────────────────────────────────────
+    if let Some(referenced) = ctx.store.is_service_referenced(namespace, name).await {
+        return referenced;
+    }
+
+    // ── Fallback: full API-list scan ──────────────────────────────────────────
+    tracing::debug!(
+        namespace = %namespace,
+        name = %name,
+        "Store not ready; falling back to API-list scan for is_service_referenced"
+    );
+
+    let client = &ctx.client;
+
     // Check HTTPRoutes
     let route_api: Api<HTTPRoute> = Api::all(client.clone());
     if let Ok(routes) = route_api.list(&Default::default()).await {
@@ -187,79 +234,6 @@ async fn is_service_referenced(client: &Client, namespace: &str, name: &str) -> 
     }
 
     false
-}
-
-/// Trigger a full configuration update.
-async fn trigger_config_update(ctx: &Context) -> Result<(), ServiceError> {
-    let mut state = GatewayState::default();
-
-    // Load all Gateways (only Wicket-managed ones)
-    let gw_api: Api<Gateway> = Api::all(ctx.client.clone());
-    if let Ok(gateways) = gw_api.list(&Default::default()).await {
-        for gateway in gateways.items {
-            let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
-            let is_wicket = gc_api
-                .get(&gateway.spec.gateway_class_name)
-                .await
-                .map(|gc| gc.is_wicket_managed())
-                .unwrap_or(false);
-
-            if is_wicket {
-                let gw_key = GatewayState::key(
-                    gateway.namespace().as_deref().unwrap_or("default"),
-                    &gateway.name_any(),
-                );
-                state.gateways.insert(gw_key, gateway);
-            }
-        }
-    }
-
-    // Load all HTTPRoutes
-    let route_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.http_routes.insert(route_key, route);
-        }
-    }
-
-    // Load all TCPRoutes
-    let tcp_route_api: Api<TCPRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = tcp_route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.tcp_routes.insert(route_key, route);
-        }
-    }
-
-    // Load all TLSRoutes
-    let tls_route_api: Api<TLSRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = tls_route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.tls_routes.insert(route_key, route);
-        }
-    }
-
-    // Load all service endpoints
-    load_all_service_endpoints(&ctx.client, &mut state).await;
-
-    // Generate and update config
-    let config = state.generate_config();
-    ctx.update_config(config)
-        .await
-        .map_err(|e| ServiceError::ConfigError(e.to_string()))?;
-
-    Ok(())
 }
 
 /// Load endpoints for all referenced services.
@@ -417,7 +391,7 @@ pub async fn reconcile_service(
     tracing::debug!(namespace = %namespace, name = %name, "Reconciling Service");
 
     // Check if this service is referenced by any route
-    let is_referenced = is_service_referenced(&ctx.client, &namespace, &name).await;
+    let is_referenced = is_service_referenced(&ctx, &namespace, &name).await;
 
     if !is_referenced {
         tracing::trace!(
@@ -451,8 +425,10 @@ pub async fn reconcile_service(
         );
     }
 
-    // Trigger configuration regeneration
-    trigger_config_update(&ctx).await?;
+    // Trigger configuration regeneration via the shared path.
+    trigger_config_update(&ctx, "Service reconciled")
+        .await
+        .map_err(|e| ServiceError::ConfigError(e.to_string()))?;
 
     metrics.record_success();
     Ok(Action::requeue(Duration::from_secs(300))) // Recheck every 5 minutes
@@ -527,4 +503,102 @@ pub async fn run_service_controller(ctx: Arc<Context>) -> Result<(), kube::Error
         .set(0);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reconcilers::store::SharedStore;
+
+    /// Verify that the service module no longer defines its own trigger_config_update.
+    ///
+    /// This is a compile-time assertion: if a local `trigger_config_update` existed
+    /// with the old single-argument signature it would shadow the import and this
+    /// module would fail to compile with the two-argument call sites above.
+    /// The test itself just confirms the store upsert path works in isolation.
+    #[tokio::test]
+    async fn test_endpoints_upsert_into_store() {
+        let store = SharedStore::new();
+        store.mark_ready().await;
+
+        // Simulate what reconcile_endpoints does after extracting addresses.
+        let key = GatewayState::key("default", "my-svc");
+        store
+            .upsert_endpoints(
+                key.clone(),
+                ServiceEndpoints {
+                    namespace: "default".to_string(),
+                    name: "my-svc".to_string(),
+                    port: 80,
+                    endpoints: vec!["10.0.0.1:80".to_string()],
+                },
+            )
+            .await;
+
+        let snap = store.snapshot().await.expect("store should be ready");
+        assert!(
+            snap.service_endpoints.contains_key(&key),
+            "endpoints should be present in store after upsert"
+        );
+    }
+
+    /// Verify that is_service_referenced returns Some(true) from the store
+    /// (cache path) when the store is ready and a route references the service.
+    #[tokio::test]
+    async fn test_is_service_referenced_uses_store_when_ready() {
+        use crate::crds::{
+            BackendRef, GatewaySpec, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec, Listener,
+            ProtocolType,
+        };
+        use crate::crds::{Gateway, GatewayClass, HTTPRoute};
+        use kube::core::ObjectMeta;
+
+        let store = SharedStore::new();
+
+        // Insert a route that references "default/target-svc".
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("r".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HTTPRouteSpec {
+                parent_refs: vec![],
+                hostnames: vec![],
+                rules: vec![HTTPRouteRule {
+                    name: None,
+                    matches: vec![],
+                    filters: vec![],
+                    backend_refs: vec![HTTPBackendRef {
+                        backend_ref: BackendRef {
+                            group: "".to_string(),
+                            kind: "Service".to_string(),
+                            name: "target-svc".to_string(),
+                            namespace: None,
+                            port: Some(80),
+                            weight: 1,
+                        },
+                        filters: vec![],
+                    }],
+                    timeouts: None,
+                }],
+            },
+            status: None,
+        };
+
+        store
+            .upsert_http_route("default/r".to_string(), route)
+            .await;
+        store.mark_ready().await;
+
+        // The store-backed check should return Some(true) without any API calls.
+        assert_eq!(
+            store.is_service_referenced("default", "target-svc").await,
+            Some(true)
+        );
+        assert_eq!(
+            store.is_service_referenced("default", "other-svc").await,
+            Some(false)
+        );
+    }
 }
