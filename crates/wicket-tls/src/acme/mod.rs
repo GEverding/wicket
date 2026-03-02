@@ -236,7 +236,7 @@ impl AcmeProvider {
         let api_token = cert_config
             .dns
             .resolve_api_token()
-            .map_err(|e| AcmeError::Config(e))?;
+            .map_err(AcmeError::Config)?;
         let dns_client = CloudflareClient::new(api_token)?;
 
         // Get zone ID

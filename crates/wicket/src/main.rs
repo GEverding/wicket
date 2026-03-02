@@ -14,9 +14,10 @@ use pingora_core::prelude::*;
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::services::listening::Service as ListeningService;
 use pingora_proxy::http_proxy_service;
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use wicket_config::Config;
 use wicket_core::{
     register_metrics as register_proxy_metrics,
@@ -289,36 +290,36 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         "HTTP proxy listening"
     );
 
-    // Add HTTPS listener if TLS is enabled with file-based certificates
+    // Add HTTPS listener if TLS is configured
     if let Some(ref tls_config) = config.tls {
-        if let Some(ref file_config) = tls_config.file {
-            // Use the first certificate as the default for the HTTPS listener
-            if let Some(first_cert) = file_config.certs.first() {
-                // HTTPS listens on port 443 by default, or calculate from HTTP port
-                let https_port = if config.server.listen.port() == 80 {
-                    443
-                } else {
-                    config.server.listen.port() + 363 // e.g., 8080 -> 8443
-                };
-                let https_addr = format!("{}:{}", config.server.listen.ip(), https_port);
+        let https_addr = compute_https_addr(config.server.listen);
 
-                let cert_path = first_cert.cert.to_str().unwrap_or("");
-                let key_path = first_cert.key.to_str().unwrap_or("");
+        match select_tls_cert(tls_config, &config) {
+            Some((cert_path, key_path, source)) => {
+                let cert_str = cert_path.to_str().unwrap_or("");
+                let key_str = key_path.to_str().unwrap_or("");
 
-                // add_tls uses TlsSettings::intermediate internally
-                if let Err(e) = proxy_service.add_tls(&https_addr, cert_path, key_path) {
+                if let Err(e) = proxy_service.add_tls(&https_addr, cert_str, key_str) {
                     error!(
                         error = %e,
-                        cert = %first_cert.cert.display(),
+                        source = %source,
+                        cert = %cert_path.display(),
                         "Failed to configure TLS listener, HTTPS disabled"
                     );
                 } else {
                     info!(
                         address = %https_addr,
-                        cert = %first_cert.cert.display(),
+                        source = %source,
+                        cert = %cert_path.display(),
                         "HTTPS proxy listening"
                     );
                 }
+            }
+            None => {
+                warn!(
+                    "TLS configured but no cert material found (no file certs, no stored ACME certs); \
+                     HTTPS listener skipped"
+                );
             }
         }
     }
@@ -366,6 +367,143 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     server.run_forever();
 }
 
+/// Compute the HTTPS listen address from the HTTP listen address.
+///
+/// Port mapping: 80 → 443, anything else → port + 363 (e.g. 8080 → 8443).
+fn compute_https_addr(http_addr: SocketAddr) -> String {
+    let https_port = if http_addr.port() == 80 {
+        443
+    } else {
+        http_addr.port().saturating_add(363)
+    };
+    // SocketAddr::to_string() already formats IPv6 with brackets: [::1]:port
+    SocketAddr::new(http_addr.ip(), https_port).to_string()
+}
+
+/// Select the TLS cert/key source for the HTTPS listener.
+///
+/// Precedence:
+/// 1. First file cert from `tls.file.certs` (if present)
+/// 2. First available ACME stored cert for configured domains
+///
+/// Returns `(cert_path, key_path, source_label)` or `None` if nothing is available.
+fn select_tls_cert(
+    tls_config: &wicket_core::wicket_tls::TlsConfig,
+    config: &Config,
+) -> Option<(PathBuf, PathBuf, &'static str)> {
+    // 1. File cert takes priority
+    if let Some(ref file_config) = tls_config.file {
+        if let Some(first) = file_config.certs.first() {
+            return Some((first.cert.clone(), first.key.clone(), "file"));
+        }
+    }
+
+    // 2. ACME stored cert fallback
+    if let Some(ref acme_config) = tls_config.acme {
+        let auto_tls_domains = config.collect_auto_tls_domains_with_providers();
+        let all_certs = acme_config.all_certs_with_providers(&auto_tls_domains);
+
+        for cert_cfg in &all_certs {
+            if let Some(primary_domain) = cert_cfg.domains.first() {
+                match materialize_acme_cert(acme_config, primary_domain) {
+                    Ok(Some((cert_path, key_path))) => {
+                        return Some((cert_path, key_path, "acme_storage"));
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!(
+                            domain = %primary_domain,
+                            error = %e,
+                            "Failed to materialize ACME cert for listener"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Read a stored ACME cert/key and write runtime listener files.
+///
+/// Files are written to `<storage>/runtime-listener/{domain}.cert.pem` and `.key.pem`.
+/// Returns `(cert_path, key_path)` if a stored cert exists, `None` if not yet provisioned.
+fn materialize_acme_cert(
+    acme_config: &wicket_core::wicket_tls::AcmeConfig,
+    primary_domain: &str,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    use wicket_core::wicket_tls::acme::storage::AcmeStorage;
+
+    let storage = AcmeStorage::new(acme_config.storage.clone()).with_context(|| {
+        format!(
+            "Failed to open ACME storage at {}",
+            acme_config.storage.display()
+        )
+    })?;
+
+    let stored = match storage.load_cert(primary_domain)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    // Write runtime listener files
+    let runtime_dir = acme_config.storage.join("runtime-listener");
+    std::fs::create_dir_all(&runtime_dir).with_context(|| {
+        format!(
+            "Failed to create runtime-listener dir: {}",
+            runtime_dir.display()
+        )
+    })?;
+
+    let safe_domain = primary_domain.replace(['/', '\\', '\0'], "_");
+    let cert_path = runtime_dir.join(format!("{}.cert.pem", safe_domain));
+    let key_path = runtime_dir.join(format!("{}.key.pem", safe_domain));
+
+    write_runtime_file(&cert_path, stored.cert_pem.as_bytes(), 0o644)?;
+    write_runtime_file(&key_path, stored.key_pem.as_bytes(), 0o600)?;
+
+    Ok(Some((cert_path, key_path)))
+}
+
+/// Write data to a file with the given Unix permissions (atomic via temp file).
+fn write_runtime_file(path: &Path, data: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".to_string());
+    let tmp_path = parent.join(format!(".{}.tmp", file_name));
+
+    {
+        let mut f = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("Failed to create temp file: {}", tmp_path.display()))?;
+
+        #[cfg(unix)]
+        f.set_permissions(std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("Failed to set permissions on {}", tmp_path.display()))?;
+
+        f.write_all(data)
+            .with_context(|| format!("Failed to write to {}", tmp_path.display()))?;
+    }
+
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to rename {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
 /// Parse log level string to foundations LogVerbosity
 fn parse_verbosity(level: &str) -> LogVerbosity {
     let level = match level.to_lowercase().as_str() {
@@ -377,4 +515,128 @@ fn parse_verbosity(level: &str) -> LogVerbosity {
         _ => Level::Info,
     };
     LogVerbosity(level)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── compute_https_addr ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_https_addr_port_80_maps_to_443() {
+        let addr: SocketAddr = "0.0.0.0:80".parse().unwrap();
+        assert_eq!(compute_https_addr(addr), "0.0.0.0:443");
+    }
+
+    #[test]
+    fn test_https_addr_port_8080_maps_to_8443() {
+        let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        assert_eq!(compute_https_addr(addr), "0.0.0.0:8443");
+    }
+
+    #[test]
+    fn test_https_addr_ipv6_port_80() {
+        let addr: SocketAddr = "[::]:80".parse().unwrap();
+        assert_eq!(compute_https_addr(addr), "[::]:443");
+    }
+
+    #[test]
+    fn test_https_addr_ipv6_port_8080() {
+        let addr: SocketAddr = "[::1]:8080".parse().unwrap();
+        assert_eq!(compute_https_addr(addr), "[::1]:8443");
+    }
+
+    #[test]
+    fn test_https_addr_non_standard_port() {
+        // 3000 + 363 = 3363
+        let addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        assert_eq!(compute_https_addr(addr), "127.0.0.1:3363");
+    }
+
+    // ── domain candidate extraction order ────────────────────────────────────
+
+    use wicket_core::wicket_tls::{AcmeCertConfig, AcmeConfig, AutoTlsDomain, DnsProviderConfig};
+
+    fn test_dns_provider() -> DnsProviderConfig {
+        DnsProviderConfig {
+            provider: "cloudflare".to_string(),
+            api_token: "token".to_string(),
+            api_token_file: None,
+            zone_id: None,
+        }
+    }
+
+    /// Build a minimal AcmeConfig with the given cert domain lists.
+    fn make_acme_config(domain_groups: &[&[&str]]) -> AcmeConfig {
+        let certs = domain_groups
+            .iter()
+            .map(|domains| AcmeCertConfig {
+                domains: domains.iter().map(|d| d.to_string()).collect(),
+                dns: test_dns_provider(),
+            })
+            .collect();
+
+        AcmeConfig {
+            email: "test@example.com".to_string(),
+            staging: true,
+            storage: PathBuf::from("/tmp/acme-test"),
+            renew_before_days: 30,
+            certs,
+            default_dns: None,
+            dns_providers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_domain_candidate_order_explicit_certs_first() {
+        let acme = make_acme_config(&[&["explicit.example.com"], &["second.example.com"]]);
+
+        // No auto-TLS domains
+        let candidates = acme.all_certs_with_providers(&[]);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].domains[0], "explicit.example.com");
+        assert_eq!(candidates[1].domains[0], "second.example.com");
+    }
+
+    #[test]
+    fn test_domain_candidate_auto_tls_appended_after_explicit() {
+        let mut acme = make_acme_config(&[&["explicit.example.com"]]);
+        // Give it a default_dns so auto-TLS domains get included
+        acme.default_dns = Some(test_dns_provider());
+
+        let auto_domains = vec![
+            AutoTlsDomain {
+                domain: "auto1.example.com".to_string(),
+                provider: None,
+            },
+            AutoTlsDomain {
+                domain: "auto2.example.com".to_string(),
+                provider: None,
+            },
+        ];
+
+        let candidates = acme.all_certs_with_providers(&auto_domains);
+        // explicit first, then auto in order
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].domains[0], "explicit.example.com");
+        assert_eq!(candidates[1].domains[0], "auto1.example.com");
+        assert_eq!(candidates[2].domains[0], "auto2.example.com");
+    }
+
+    #[test]
+    fn test_domain_candidate_already_covered_not_duplicated() {
+        let mut acme = make_acme_config(&[&["explicit.example.com"]]);
+        acme.default_dns = Some(test_dns_provider());
+
+        // explicit.example.com is already in certs — should not be duplicated
+        let auto_domains = vec![AutoTlsDomain {
+            domain: "explicit.example.com".to_string(),
+            provider: None,
+        }];
+
+        let candidates = acme.all_certs_with_providers(&auto_domains);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].domains[0], "explicit.example.com");
+    }
 }
