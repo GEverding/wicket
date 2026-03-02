@@ -4,14 +4,51 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::metrics::{
+    STREAM_BYTES_TOTAL, STREAM_CONNECTIONS_ACTIVE, STREAM_CONNECTIONS_TOTAL,
+    STREAM_CONNECTION_DURATION_SECONDS, STREAM_CONNECTION_ERRORS_TOTAL,
+    STREAM_CONNECT_DURATION_SECONDS, STREAM_SNI_EXTRACTIONS_TOTAL,
+};
 use crate::pool::SourceIpPool;
 use crate::protocol::{ProxyProtocolEncoder, ProxyProtocolVersion};
 use crate::router::SniRouter;
 use crate::sni::extract_sni;
 use crate::StreamError;
+
+/// RAII guard that decrements the active-connections gauge and records duration on drop.
+struct ConnectionGuard {
+    upstream: Option<String>,
+    start: Instant,
+}
+
+impl ConnectionGuard {
+    fn new() -> Self {
+        STREAM_CONNECTIONS_ACTIVE.inc();
+        Self {
+            upstream: None,
+            start: Instant::now(),
+        }
+    }
+
+    fn set_upstream(&mut self, name: String) {
+        self.upstream = Some(name);
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        STREAM_CONNECTIONS_ACTIVE.dec();
+        if let Some(ref upstream) = self.upstream {
+            STREAM_CONNECTION_DURATION_SECONDS
+                .with_label_values(&[upstream])
+                .observe(self.start.elapsed().as_secs_f64());
+        }
+    }
+}
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 use std::sync::Mutex;
@@ -151,36 +188,86 @@ impl StreamProxy {
     /// Handle a single client connection.
     async fn handle_connection(
         &self,
-        client: TcpStream,
+        mut client: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<(), StreamError> {
+        // Active-connection guard: decrements gauge + records duration on every return path.
+        let mut guard = ConnectionGuard::new();
+
         // 1. Peek bytes to extract SNI
         let mut peek_buf = vec![0u8; 4096];
         let n = client.peek(&mut peek_buf).await?;
         let sni = extract_sni(&peek_buf[..n]);
 
+        // Record SNI extraction result
+        match &sni {
+            Some(_) => {
+                STREAM_SNI_EXTRACTIONS_TOTAL
+                    .with_label_values(&["success"])
+                    .inc();
+            }
+            None => {
+                // First byte 0x16 = TLS ClientHello record type — TLS but no SNI extension.
+                let result = if peek_buf.first() == Some(&0x16) {
+                    "failure"
+                } else {
+                    "none"
+                };
+                STREAM_SNI_EXTRACTIONS_TOTAL
+                    .with_label_values(&[result])
+                    .inc();
+            }
+        }
+
         // 2. Route to upstream
-        let upstream_name = self
-            .router
-            .match_sni(sni.as_deref())
-            .ok_or_else(|| StreamError::RoutingError("No matching upstream".into()))?;
+        let upstream_name = match self.router.match_sni(sni.as_deref()) {
+            Some(name) => name,
+            None => {
+                STREAM_CONNECTION_ERRORS_TOTAL
+                    .with_label_values(&["routing"])
+                    .inc();
+                return Err(StreamError::RoutingError("No matching upstream".into()));
+            }
+        };
 
         let upstream = self.upstreams.get(upstream_name).ok_or_else(|| {
+            STREAM_CONNECTION_ERRORS_TOTAL
+                .with_label_values(&["routing"])
+                .inc();
             StreamError::RoutingError(format!("Unknown upstream: {}", upstream_name))
         })?;
 
         let backend_addr = upstream.next_server();
+        let upstream_name = upstream_name.to_owned();
 
         tracing::debug!(
             client = %client_addr,
             sni = ?sni,
-            upstream = upstream_name,
+            upstream = %upstream_name,
             backend = %backend_addr,
             "Routing connection"
         );
 
-        // 3. Connect to backend (with optional source IP binding)
-        let mut backend = self.connect_backend(backend_addr).await?;
+        // 3. Connect to backend (with optional source IP binding) — timed
+        let connect_start = Instant::now();
+        let mut backend = match self.connect_backend(backend_addr).await {
+            Ok(b) => b,
+            Err(e) => {
+                STREAM_CONNECTION_ERRORS_TOTAL
+                    .with_label_values(&["connect"])
+                    .inc();
+                return Err(e);
+            }
+        };
+        STREAM_CONNECT_DURATION_SECONDS
+            .with_label_values(&[&upstream_name])
+            .observe(connect_start.elapsed().as_secs_f64());
+
+        // Connection is established — record it and arm the duration guard.
+        STREAM_CONNECTIONS_TOTAL
+            .with_label_values(&[&upstream_name])
+            .inc();
+        guard.set_upstream(upstream_name.clone());
 
         // 4. Send proxy protocol header if configured
         if let Some(version) = self.proxy_protocol {
@@ -208,7 +295,8 @@ impl StreamProxy {
                     "Using eBPF sockmap for kernel-level proxying"
                 );
 
-                // Kernel handles data transfer - just wait for either side to close
+                // Kernel handles data transfer - just wait for either side to close.
+                // Bytes are not measurable in this path (kernel does the copy).
                 tokio::select! {
                     _ = client.readable() => {}
                     _ = backend.readable() => {}
@@ -225,23 +313,22 @@ impl StreamProxy {
             // Fall through to user-space proxying if registration failed
         }
 
-        // User-space bidirectional copy (fallback or non-Linux)
-        let (mut client_read, mut client_write) = client.into_split();
-        let (mut backend_read, mut backend_write) = backend.into_split();
-
-        let client_to_backend = tokio::io::copy(&mut client_read, &mut backend_write);
-        let backend_to_client = tokio::io::copy(&mut backend_read, &mut client_write);
-
-        tokio::select! {
-            result = client_to_backend => {
-                if let Err(e) = result {
-                    tracing::debug!(error = %e, "Client to backend copy ended");
-                }
+        // User-space bidirectional copy (fallback or non-Linux).
+        // copy_bidirectional returns (client→backend bytes, backend→client bytes).
+        match tokio::io::copy_bidirectional(&mut client, &mut backend).await {
+            Ok((client_to_backend, backend_to_client)) => {
+                STREAM_BYTES_TOTAL
+                    .with_label_values(&["rx"])
+                    .inc_by(client_to_backend);
+                STREAM_BYTES_TOTAL
+                    .with_label_values(&["tx"])
+                    .inc_by(backend_to_client);
             }
-            result = backend_to_client => {
-                if let Err(e) = result {
-                    tracing::debug!(error = %e, "Backend to client copy ended");
-                }
+            Err(e) => {
+                STREAM_CONNECTION_ERRORS_TOTAL
+                    .with_label_values(&["transfer"])
+                    .inc();
+                tracing::debug!(error = %e, "Transfer error");
             }
         }
 

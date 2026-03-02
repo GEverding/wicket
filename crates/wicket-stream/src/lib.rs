@@ -4,6 +4,7 @@
 //! including SNI-based routing, source IP pooling, and proxy protocol support.
 
 mod listener;
+pub mod metrics;
 mod pool;
 mod protocol;
 mod proxy;

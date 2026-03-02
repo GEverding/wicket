@@ -4890,7 +4890,9 @@ name = "wicket-stream"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "lazy_static",
  "libc",
+ "prometheus",
  "rand 0.8.5",
  "socket2 0.5.10",
  "thiserror 1.0.69",
