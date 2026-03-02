@@ -41,6 +41,12 @@ pub async fn reconcile_referencegrant(
 
     tracing::debug!(namespace = %namespace, name = %name, "Reconciling ReferenceGrant");
 
+    // Upsert into shared store so cross-namespace reference checks can use the cache.
+    let key = format!("{}/{}", namespace, name);
+    ctx.store
+        .upsert_reference_grant(key, (*grant).clone())
+        .await;
+
     // Update the total count of ReferenceGrants
     update_referencegrant_metrics(&ctx.client).await;
 

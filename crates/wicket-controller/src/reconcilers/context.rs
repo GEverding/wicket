@@ -9,6 +9,7 @@ use kube::{Client, ResourceExt};
 use tokio::sync::RwLock;
 
 use super::config_generator::{GatewayState, WicketConfig};
+use super::store::SharedStore;
 use crate::crds::{Gateway, GatewayClass, HTTPRoute, TCPRoute, TLSRoute};
 
 /// Shared context passed to all reconcilers.
@@ -19,6 +20,10 @@ pub struct Context {
 
     /// Current generated Wicket configuration.
     pub config: Arc<RwLock<WicketConfig>>,
+
+    /// Shared resource cache/index.  Reconcilers read from this store
+    /// instead of issuing repeated full-list API calls.
+    pub store: Arc<SharedStore>,
 
     /// Controller name for status updates.
     pub controller_name: String,
@@ -72,6 +77,7 @@ impl Context {
         Self {
             client,
             config: Arc::new(RwLock::new(WicketConfig::default())),
+            store: Arc::new(SharedStore::new()),
             controller_name: "wicket.io/gateway-controller".to_string(),
             controller_namespace,
             watch_all_namespaces,
@@ -145,79 +151,142 @@ pub enum ConfigUpdateError {
 
 /// Trigger a full configuration update by loading all resources and regenerating config.
 ///
-/// This is called by reconcilers when a resource changes. It loads all Gateways,
-/// Routes, and service endpoints, generates a new configuration, and updates it.
+/// ## Cache-first strategy
+///
+/// When the shared store is ready, we use its snapshot directly — no API
+/// list calls needed.  When the store is not yet ready (startup warm-up),
+/// we fall back to the existing full-list API path.
+///
+/// ## Store readiness safety
+///
+/// The store is only marked ready (via `ingest_gateway_state`) when **all**
+/// core list calls succeed.  If any list fails, we still generate config
+/// from whatever partial data we have (existing behavior), but we do NOT
+/// promote the store to ready — so future calls continue to fall back to
+/// the API-list path until a fully-successful list completes.
 pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), ConfigUpdateError> {
     use super::service::load_all_service_endpoints;
 
     tracing::debug!(reason = %reason, "Triggering configuration update");
 
+    // ── Cache-first path ──────────────────────────────────────────────────────
+    if let Some(state) = ctx.store.snapshot().await {
+        tracing::debug!(reason = %reason, "Using shared store snapshot for config generation");
+        let config = state.generate_config();
+        ctx.update_config(config).await?;
+        tracing::debug!(reason = %reason, "Configuration update completed (cache path)");
+        return Ok(());
+    }
+
+    // ── Fallback: full API-list path ──────────────────────────────────────────
+    tracing::info!(
+        reason = %reason,
+        "Shared store not ready; falling back to full API-list for config generation"
+    );
+
     let mut state = GatewayState::default();
+    let mut all_lists_ok = true;
 
     // Load all Gateways (only Wicket-managed ones)
     let gw_api: Api<Gateway> = Api::all(ctx.client.clone());
-    if let Ok(gateways) = gw_api.list(&Default::default()).await {
-        for gateway in gateways.items {
-            let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
-            let is_wicket = gc_api
-                .get(&gateway.spec.gateway_class_name)
-                .await
-                .map(|gc| gc.is_wicket_managed())
-                .unwrap_or(false);
+    match gw_api.list(&Default::default()).await {
+        Ok(gateways) => {
+            for gateway in gateways.items {
+                let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
+                let is_wicket = gc_api
+                    .get(&gateway.spec.gateway_class_name)
+                    .await
+                    .map(|gc| gc.is_wicket_managed())
+                    .unwrap_or(false);
 
-            if is_wicket {
-                let gw_key = GatewayState::key(
-                    gateway.namespace().as_deref().unwrap_or("default"),
-                    &gateway.name_any(),
-                );
-                state.gateways.insert(gw_key, gateway);
+                if is_wicket {
+                    let gw_key = GatewayState::key(
+                        gateway.namespace().as_deref().unwrap_or("default"),
+                        &gateway.name_any(),
+                    );
+                    state.gateways.insert(gw_key, gateway);
+                }
             }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list Gateways; store will not be marked ready");
+            all_lists_ok = false;
         }
     }
 
     // Load all HTTPRoutes
     let route_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.http_routes.insert(route_key, route);
+    match route_api.list(&Default::default()).await {
+        Ok(routes) => {
+            for route in routes.items {
+                let route_key = GatewayState::key(
+                    route.namespace().as_deref().unwrap_or("default"),
+                    &route.name_any(),
+                );
+                state.http_routes.insert(route_key, route);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list HTTPRoutes; store will not be marked ready");
+            all_lists_ok = false;
         }
     }
 
     // Load all TCPRoutes
     let tcp_route_api: Api<TCPRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = tcp_route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.tcp_routes.insert(route_key, route);
+    match tcp_route_api.list(&Default::default()).await {
+        Ok(routes) => {
+            for route in routes.items {
+                let route_key = GatewayState::key(
+                    route.namespace().as_deref().unwrap_or("default"),
+                    &route.name_any(),
+                );
+                state.tcp_routes.insert(route_key, route);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list TCPRoutes; store will not be marked ready");
+            all_lists_ok = false;
         }
     }
 
     // Load all TLSRoutes
     let tls_route_api: Api<TLSRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = tls_route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.tls_routes.insert(route_key, route);
+    match tls_route_api.list(&Default::default()).await {
+        Ok(routes) => {
+            for route in routes.items {
+                let route_key = GatewayState::key(
+                    route.namespace().as_deref().unwrap_or("default"),
+                    &route.name_any(),
+                );
+                state.tls_routes.insert(route_key, route);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list TLSRoutes; store will not be marked ready");
+            all_lists_ok = false;
         }
     }
 
     // Load service endpoints
     load_all_service_endpoints(&ctx.client, &mut state).await;
 
-    // Generate and update config
+    // Only populate the shared store when ALL core lists succeeded.
+    // A partial snapshot would lock in missing resources and prevent
+    // future fallback retries.
+    if all_lists_ok {
+        ctx.store.ingest_gateway_state(state.clone()).await;
+    } else {
+        tracing::warn!(
+            reason = %reason,
+            "Skipping store ingestion due to partial list failures;              store remains not-ready for future fallback retries"
+        );
+    }
+
+    // Generate and update config from whatever we got (preserves existing behavior).
     let config = state.generate_config();
     ctx.update_config(config).await?;
 
-    tracing::debug!(reason = %reason, "Configuration update completed");
+    tracing::debug!(reason = %reason, "Configuration update completed (API-list fallback path)");
     Ok(())
 }

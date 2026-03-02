@@ -3,7 +3,6 @@
 //! Watches Kubernetes Secrets referenced by Gateways for TLS termination.
 //! Validates cross-namespace references using ReferenceGrant.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +25,7 @@ use crate::metrics::{
 };
 
 use super::config_generator::GatewayState;
-use super::context::{trigger_config_update as shared_trigger_config_update, Context};
+use super::context::{trigger_config_update, Context};
 
 /// Error type for Secret reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -176,8 +175,20 @@ pub async fn reconcile_secret(
         "TLS certificate extracted"
     );
 
-    // Trigger configuration regeneration
-    trigger_config_update(&ctx, &namespace, &name, cert_path, key_path)
+    // Upsert the TLS secret into the shared store so the cache path reflects
+    // this event.  We do this before triggering config update so that if the
+    // store is already ready the snapshot will include the new cert paths.
+    let secret_key = GatewayState::key(&namespace, &name);
+    ctx.store
+        .upsert_tls_secret(
+            secret_key,
+            cert_path.to_string_lossy().to_string(),
+            key_path.to_string_lossy().to_string(),
+        )
+        .await;
+
+    // Trigger configuration regeneration via the shared path.
+    trigger_config_update(&ctx, "Secret reconciled")
         .await
         .map_err(|e| SecretError::ConfigError(e.to_string()))?;
 
@@ -410,106 +421,6 @@ async fn write_tls_file(
     Ok(path)
 }
 
-/// Trigger a full configuration update with the new TLS secret.
-///
-/// This wraps the shared trigger_config_update but adds the TLS secret to the state first.
-async fn trigger_config_update(
-    ctx: &Context,
-    secret_ns: &str,
-    secret_name: &str,
-    cert_path: PathBuf,
-    key_path: PathBuf,
-) -> Result<(), SecretError> {
-    // First, add this TLS secret to the state by updating the config
-    let mut state = GatewayState::default();
-
-    // Add this TLS secret to state
-    let secret_key = GatewayState::key(secret_ns, secret_name);
-    state.tls_secrets.insert(
-        secret_key,
-        (
-            cert_path.to_string_lossy().to_string(),
-            key_path.to_string_lossy().to_string(),
-        ),
-    );
-
-    // Load all other TLS secrets that have been extracted
-    load_existing_tls_secrets(&ctx.tls_cert_dir, &mut state).await;
-
-    // Now use the shared function to load all resources and update config
-    // We need to manually do this since the shared function doesn't handle TLS secrets
-    use super::service::load_all_service_endpoints;
-    use crate::crds::{HTTPRoute, TCPRoute, TLSRoute};
-
-    // Load all Gateways (only Wicket-managed ones)
-    let gw_api: Api<Gateway> = Api::all(ctx.client.clone());
-    if let Ok(gateways) = gw_api.list(&Default::default()).await {
-        for gateway in gateways.items {
-            let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
-            let is_wicket = gc_api
-                .get(&gateway.spec.gateway_class_name)
-                .await
-                .map(|gc| gc.is_wicket_managed())
-                .unwrap_or(false);
-
-            if is_wicket {
-                let gw_key = GatewayState::key(
-                    gateway.namespace().as_deref().unwrap_or("default"),
-                    &gateway.name_any(),
-                );
-                state.gateways.insert(gw_key, gateway);
-            }
-        }
-    }
-
-    // Load all HTTPRoutes
-    let route_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.http_routes.insert(route_key, route);
-        }
-    }
-
-    // Load all TCPRoutes
-    let tcp_route_api: Api<TCPRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = tcp_route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.tcp_routes.insert(route_key, route);
-        }
-    }
-
-    // Load all TLSRoutes
-    let tls_route_api: Api<TLSRoute> = Api::all(ctx.client.clone());
-    if let Ok(routes) = tls_route_api.list(&Default::default()).await {
-        for route in routes.items {
-            let route_key = GatewayState::key(
-                route.namespace().as_deref().unwrap_or("default"),
-                &route.name_any(),
-            );
-            state.tls_routes.insert(route_key, route);
-        }
-    }
-
-    // Load service endpoints
-    load_all_service_endpoints(&ctx.client, &mut state).await;
-
-    // Generate and update config
-    let config = state.generate_config();
-    ctx.update_config(config)
-        .await
-        .map_err(|e| SecretError::ConfigError(e.to_string()))?;
-
-    Ok(())
-}
-
 /// Parse a PEM-encoded X.509 certificate to extract its expiry timestamp.
 ///
 /// Returns the expiry as a Unix timestamp (seconds since epoch), or None if parsing fails.
@@ -533,46 +444,6 @@ fn parse_certificate_expiry(cert_data: &[u8]) -> Option<i64> {
         Err(e) => {
             tracing::warn!(error = %e, "Failed to parse X.509 certificate for expiry");
             None
-        }
-    }
-}
-
-/// Load existing TLS secrets from the certificate directory.
-async fn load_existing_tls_secrets(tls_cert_dir: &str, state: &mut GatewayState) {
-    let dir = PathBuf::from(tls_cert_dir);
-
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(e) => e,
-        Err(_) => return, // Directory doesn't exist yet
-    };
-
-    let mut cert_files: HashSet<String> = HashSet::new();
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let filename = entry.file_name().to_string_lossy().to_string();
-        if filename.ends_with(".crt") {
-            // Extract the base name (without .crt extension)
-            let base = filename.trim_end_matches(".crt").to_string();
-            cert_files.insert(base);
-        }
-    }
-
-    // For each .crt file, check if matching .key exists
-    for base in cert_files {
-        let cert_path = dir.join(format!("{}.crt", base));
-        let key_path = dir.join(format!("{}.key", base));
-
-        if cert_path.exists() && key_path.exists() {
-            // Parse namespace-name from filename
-            // Filename format: {namespace}-{name}.{ext}
-            // Note: We use the filename as the key since we sanitized it
-            state.tls_secrets.insert(
-                base.clone(),
-                (
-                    cert_path.to_string_lossy().to_string(),
-                    key_path.to_string_lossy().to_string(),
-                ),
-            );
         }
     }
 }
@@ -626,4 +497,49 @@ pub async fn run_secret_controller(ctx: Arc<Context>) -> Result<(), kube::Error>
         .set(0);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reconcilers::store::SharedStore;
+
+    /// Verify that the secret module no longer defines its own trigger_config_update.
+    ///
+    /// Compile-time assertion: if a local function with the old 5-argument signature
+    /// existed it would shadow the import and the two-argument call site above would
+    /// fail to compile.  This test confirms the store upsert path works in isolation.
+    #[tokio::test]
+    async fn test_tls_secret_upsert_into_store() {
+        let store = SharedStore::new();
+        store.mark_ready().await;
+
+        let key = GatewayState::key("default", "my-cert");
+        store
+            .upsert_tls_secret(
+                key.clone(),
+                "/var/run/wicket/tls/default-my-cert.crt".to_string(),
+                "/var/run/wicket/tls/default-my-cert.key".to_string(),
+            )
+            .await;
+
+        let snap = store.snapshot().await.expect("store should be ready");
+        let (cert, key_path) = snap
+            .tls_secrets
+            .get(&key)
+            .expect("secret should be present");
+        assert!(cert.ends_with(".crt"));
+        assert!(key_path.ends_with(".key"));
+    }
+
+    /// Verify that sanitize_filename_component handles edge cases safely.
+    #[test]
+    fn test_sanitize_filename_component_basic() {
+        assert_eq!(sanitize_filename_component("my-namespace"), "my-namespace");
+        assert_eq!(sanitize_filename_component("my.secret"), "my-secret");
+        // All-hyphen input collapses to empty → falls back to "unnamed"
+        assert_eq!(sanitize_filename_component("---"), "unnamed");
+        assert_eq!(sanitize_filename_component(""), "unnamed");
+        assert_eq!(sanitize_filename_component("a/b"), "a-b");
+    }
 }

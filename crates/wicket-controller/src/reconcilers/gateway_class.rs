@@ -84,6 +84,11 @@ pub async fn reconcile_gateway_class(
     tracing::info!(name = %name, "GatewayClass accepted");
     metrics.record_success();
 
+    // Upsert into shared store so cache reflects this GatewayClass.
+    ctx.store
+        .upsert_gateway_class(name.clone(), (*gc).clone())
+        .await;
+
     // Update metrics
     update_gateway_class_metrics(&ctx.client).await;
 

@@ -10,6 +10,7 @@ mod httproute;
 mod referencegrant;
 mod secret;
 mod service;
+pub mod store;
 mod tcproute;
 mod tlsroute;
 
@@ -21,5 +22,6 @@ pub use httproute::*;
 pub use referencegrant::*;
 pub use secret::*;
 pub use service::*;
+pub use store::SharedStore;
 pub use tcproute::*;
 pub use tlsroute::*;

@@ -165,8 +165,13 @@ pub async fn reconcile_tcproute(
     )
     .await?;
 
-    // If we have a valid parent, trigger configuration update
+    // If we have a valid parent, upsert into store and trigger configuration update.
     if has_valid_parent {
+        let route_key = GatewayState::key(&namespace, &name);
+        ctx.store
+            .upsert_tcp_route(route_key, (*route).clone())
+            .await;
+
         trigger_config_update(&ctx, "TCPRoute reconciled")
             .await
             .map_err(|e| TCPRouteError::ConfigError(e.to_string()))?;
