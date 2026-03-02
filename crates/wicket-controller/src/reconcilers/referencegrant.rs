@@ -21,13 +21,16 @@ use crate::metrics::{
     WATCH_EVENTS_TOTAL,
 };
 
-use super::context::Context;
+use super::context::{trigger_config_update, Context};
 
 /// Error type for ReferenceGrant reconciliation.
 #[derive(Debug, thiserror::Error)]
 pub enum ReferenceGrantError {
     #[error("Kubernetes API error: {0}")]
     KubeError(#[from] kube::Error),
+
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
 }
 
 /// Reconcile a ReferenceGrant resource.
@@ -40,6 +43,18 @@ pub async fn reconcile_referencegrant(
     let name = grant.name_any();
 
     tracing::debug!(namespace = %namespace, name = %name, "Reconciling ReferenceGrant");
+
+    // Handle deletion: remove from store and trigger config update.
+    if grant.metadata.deletion_timestamp.is_some() {
+        let key = format!("{}/{}", namespace, name);
+        ctx.store.remove_reference_grant(&key).await;
+        tracing::info!(namespace = %namespace, name = %name, "ReferenceGrant deleted, removed from store");
+        trigger_config_update(&ctx, "ReferenceGrant deleted")
+            .await
+            .map_err(|e| ReferenceGrantError::ConfigError(e.to_string()))?;
+        metrics.record_success();
+        return Ok(Action::await_change());
+    }
 
     // Upsert into shared store so cross-namespace reference checks can use the cache.
     let key = format!("{}/{}", namespace, name);

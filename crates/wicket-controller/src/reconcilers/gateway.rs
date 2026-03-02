@@ -51,6 +51,17 @@ pub async fn reconcile_gateway(
 
     tracing::info!(namespace = %namespace, name = %name, "Reconciling Gateway");
 
+    // Handle deletion: remove from store and trigger config update.
+    if gateway.metadata.deletion_timestamp.is_some() {
+        let key = super::config_generator::GatewayState::key(&namespace, &name);
+        ctx.store.remove_gateway(&key).await;
+        tracing::info!(namespace = %namespace, name = %name, "Gateway deleted, removed from store");
+        trigger_config_update(&ctx, "Gateway deleted")
+            .await
+            .map_err(|e| GatewayError::ConfigError(e.to_string()))?;
+        return Ok(Action::await_change());
+    }
+
     // Check if the GatewayClass is managed by Wicket
     let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
     let gc = gc_api

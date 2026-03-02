@@ -350,9 +350,24 @@ impl SharedStore {
             .insert(key, (cert_path, key_path));
     }
 
+    /// Remove a GatewayClass.
+    pub async fn remove_gateway_class(&self, key: &str) {
+        self.inner.write().await.gateway_classes.remove(key);
+    }
+
+    /// Remove a TLS secret.
+    pub async fn remove_tls_secret(&self, key: &str) {
+        self.inner.write().await.tls_secrets.remove(key);
+    }
+
     /// Upsert a ReferenceGrant.
     pub async fn upsert_reference_grant(&self, key: String, grant: ReferenceGrant) {
         self.inner.write().await.reference_grants.insert(key, grant);
+    }
+
+    /// Remove a ReferenceGrant.
+    pub async fn remove_reference_grant(&self, key: &str) {
+        self.inner.write().await.reference_grants.remove(key);
     }
 
     /// Bulk-replace all store contents atomically (used for initial population).
@@ -707,6 +722,118 @@ mod tests {
             cert, "/real/cert.crt",
             "existing TLS path should not be overwritten"
         );
+    }
+
+    // ── remove_gateway_class ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remove_gateway_class() {
+        use crate::crds::{GatewayClassSpec, GatewayClassStatus};
+        let store = SharedStore::new();
+        store.mark_ready().await;
+
+        let gc = GatewayClass {
+            metadata: ObjectMeta {
+                name: Some("wicket".to_string()),
+                ..Default::default()
+            },
+            spec: GatewayClassSpec {
+                controller_name: "wicket.io/gateway-controller".to_string(),
+                parameters_ref: None,
+                description: None,
+            },
+            status: None,
+        };
+        store.upsert_gateway_class("wicket".to_string(), gc).await;
+
+        // Verify it's present
+        {
+            let inner = store.inner.read().await;
+            assert!(inner.gateway_classes.contains_key("wicket"));
+        }
+
+        // Remove it
+        store.remove_gateway_class("wicket").await;
+
+        // Verify it's gone
+        {
+            let inner = store.inner.read().await;
+            assert!(!inner.gateway_classes.contains_key("wicket"));
+        }
+    }
+
+    // ── remove_tls_secret ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remove_tls_secret() {
+        let store = SharedStore::new();
+        store.mark_ready().await;
+
+        store
+            .upsert_tls_secret(
+                "default/my-cert".to_string(),
+                "/tls/default-my-cert.crt".to_string(),
+                "/tls/default-my-cert.key".to_string(),
+            )
+            .await;
+
+        // Verify present in snapshot
+        let snap = store.snapshot().await.expect("ready");
+        assert!(snap.tls_secrets.contains_key("default/my-cert"));
+
+        // Remove it
+        store.remove_tls_secret("default/my-cert").await;
+
+        // Verify gone from snapshot
+        let snap = store.snapshot().await.expect("ready");
+        assert!(!snap.tls_secrets.contains_key("default/my-cert"));
+    }
+
+    // ── remove_reference_grant ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remove_reference_grant() {
+        use crate::crds::{ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo};
+        let store = SharedStore::new();
+        store.mark_ready().await;
+
+        let grant = ReferenceGrant {
+            metadata: ObjectMeta {
+                name: Some("allow-secret".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: ReferenceGrantSpec {
+                from: vec![ReferenceGrantFrom {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "Gateway".to_string(),
+                    namespace: "other-ns".to_string(),
+                }],
+                to: vec![ReferenceGrantTo {
+                    group: "".to_string(),
+                    kind: "Secret".to_string(),
+                    name: None,
+                }],
+            },
+        };
+        store
+            .upsert_reference_grant("default/allow-secret".to_string(), grant)
+            .await;
+
+        // Verify present
+        {
+            let inner = store.inner.read().await;
+            assert!(inner.reference_grants.contains_key("default/allow-secret"));
+        }
+
+        // Remove it
+        store.remove_reference_grant("default/allow-secret").await;
+
+        // Verify gone
+        {
+            let inner = store.inner.read().await;
+            assert!(!inner.reference_grants.contains_key("default/allow-secret"));
+        }
     }
 
     // ── replace_all ───────────────────────────────────────────────────────────

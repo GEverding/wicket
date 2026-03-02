@@ -38,6 +38,14 @@ pub async fn reconcile_gateway_class(
 
     tracing::info!(name = %name, "Reconciling GatewayClass");
 
+    // Handle deletion: remove from store.
+    if gc.metadata.deletion_timestamp.is_some() {
+        ctx.store.remove_gateway_class(&name).await;
+        tracing::info!(name = %name, "GatewayClass deleted, removed from store");
+        metrics.record_success();
+        return Ok(Action::await_change());
+    }
+
     // Only process GatewayClasses managed by Wicket
     if !gc.is_wicket_managed() {
         tracing::debug!(
