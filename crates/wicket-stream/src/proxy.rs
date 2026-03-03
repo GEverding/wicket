@@ -4,14 +4,15 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::health::BackendHealth;
 use crate::metrics::{
-    STREAM_BYTES_TOTAL, STREAM_CONNECTIONS_ACTIVE, STREAM_CONNECTIONS_TOTAL,
-    STREAM_CONNECTION_DURATION_SECONDS, STREAM_CONNECTION_ERRORS_TOTAL,
-    STREAM_CONNECT_DURATION_SECONDS, STREAM_SNI_EXTRACTIONS_TOTAL,
+    STREAM_BACKEND_HEALTH, STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL, STREAM_BYTES_TOTAL,
+    STREAM_CONNECTIONS_ACTIVE, STREAM_CONNECTIONS_TOTAL, STREAM_CONNECTION_DURATION_SECONDS,
+    STREAM_CONNECTION_ERRORS_TOTAL, STREAM_CONNECT_DURATION_SECONDS, STREAM_SNI_EXTRACTIONS_TOTAL,
 };
 use crate::pool::SourceIpPool;
 use crate::protocol::{ProxyProtocolEncoder, ProxyProtocolVersion};
@@ -56,28 +57,90 @@ use std::sync::Mutex;
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 use volt_sockmap::SocketMap;
 
-/// Upstream server configuration.
+/// Upstream server configuration with passive health tracking.
 #[derive(Debug)]
 pub struct Upstream {
     pub name: String,
     pub servers: Vec<SocketAddr>,
+    pub(crate) health: Vec<BackendHealth>,
     counter: AtomicUsize,
+    cooldown: Duration,
 }
 
 impl Upstream {
     /// Create a new upstream with the given name and servers.
+    /// Uses a default 30-second cooldown for unhealthy backends.
     pub fn new(name: String, servers: Vec<SocketAddr>) -> Self {
+        Self::with_cooldown(name, servers, Duration::from_secs(30))
+    }
+
+    /// Create a new upstream with a custom cooldown duration.
+    pub fn with_cooldown(name: String, servers: Vec<SocketAddr>, cooldown: Duration) -> Self {
+        let health = servers.iter().map(|&a| BackendHealth::new(a)).collect();
         Self {
             name,
             servers,
+            health,
             counter: AtomicUsize::new(0),
+            cooldown,
         }
     }
 
-    /// Get next server using round-robin selection.
+    /// Select next healthy/eligible server using round-robin.
+    ///
+    /// Tries up to `servers.len()` slots starting from the current counter position.
+    /// If all backends are unhealthy and within cooldown, fails open — returns the
+    /// next round-robin server anyway to avoid refusing all traffic.
     pub fn next_server(&self) -> SocketAddr {
-        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.servers.len();
-        self.servers[idx]
+        let len = self.servers.len();
+        let start = self.counter.fetch_add(1, Ordering::Relaxed);
+
+        // First pass: find an eligible (healthy or past cooldown) server
+        for i in 0..len {
+            let idx = (start + i) % len;
+            if self.health[idx].is_eligible(self.cooldown) {
+                return self.servers[idx];
+            }
+        }
+
+        // Fail-open: all unhealthy and in cooldown — route anyway
+        tracing::warn!(
+            upstream = %self.name,
+            "All backends unhealthy; routing to next backend anyway (fail-open)"
+        );
+        self.servers[start % len]
+    }
+
+    /// Report a successful connect for a specific backend address.
+    pub fn report_success(&self, addr: SocketAddr) {
+        if let Some(h) = self.health.iter().find(|h| h.addr() == addr) {
+            let was_healthy = h.is_healthy();
+            h.record_success();
+            if !was_healthy {
+                STREAM_BACKEND_HEALTH
+                    .with_label_values(&[&self.name, &addr.to_string()])
+                    .set(1);
+                STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL
+                    .with_label_values(&[&self.name, &addr.to_string(), "unhealthy_to_healthy"])
+                    .inc();
+            }
+        }
+    }
+
+    /// Report a failed connect for a specific backend address.
+    pub fn report_failure(&self, addr: SocketAddr) {
+        if let Some(h) = self.health.iter().find(|h| h.addr() == addr) {
+            let was_healthy = h.is_healthy();
+            h.record_failure();
+            if was_healthy {
+                STREAM_BACKEND_HEALTH
+                    .with_label_values(&[&self.name, &addr.to_string()])
+                    .set(0);
+                STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL
+                    .with_label_values(&[&self.name, &addr.to_string(), "healthy_to_unhealthy"])
+                    .inc();
+            }
+        }
     }
 }
 
@@ -125,6 +188,8 @@ impl StreamProxy {
         // Build router
         let router = SniRouter::new(&config.sni_routes, config.default_upstream.clone());
 
+        let cooldown = Duration::from_secs(config.health_cooldown_secs);
+
         // Build upstreams
         let mut upstreams = HashMap::new();
         for upstream_config in &config.upstreams {
@@ -137,7 +202,11 @@ impl StreamProxy {
 
             upstreams.insert(
                 upstream_config.name.clone(),
-                Arc::new(Upstream::new(upstream_config.name.clone(), servers)),
+                Arc::new(Upstream::with_cooldown(
+                    upstream_config.name.clone(),
+                    servers,
+                    cooldown,
+                )),
             );
         }
 
@@ -251,8 +320,12 @@ impl StreamProxy {
         // 3. Connect to backend (with optional source IP binding) — timed
         let connect_start = Instant::now();
         let mut backend = match self.connect_backend(backend_addr).await {
-            Ok(b) => b,
+            Ok(b) => {
+                upstream.report_success(backend_addr);
+                b
+            }
             Err(e) => {
+                upstream.report_failure(backend_addr);
                 STREAM_CONNECTION_ERRORS_TOTAL
                     .with_label_values(&["connect"])
                     .inc();
@@ -479,6 +552,7 @@ mod tests {
                 name: "default".into(),
                 servers: vec!["127.0.0.1:8080".into()],
             }],
+            health_cooldown_secs: 30,
         }
     }
 
@@ -631,5 +705,100 @@ mod tests {
         let servers = vec![addr(1), addr(2), addr(3)];
         let upstream = Upstream::new("test".into(), servers.clone());
         assert_eq!(upstream.servers, servers);
+    }
+
+    // ============================================================================
+    // Health-aware selection tests
+    // ============================================================================
+
+    #[test]
+    fn test_upstream_skips_unhealthy_backend() {
+        let upstream = Upstream::with_cooldown(
+            "test".into(),
+            vec![addr(1), addr(2), addr(3)],
+            Duration::from_secs(3600), // long cooldown
+        );
+        // Mark addr(1) unhealthy
+        upstream.health[0].record_failure();
+
+        // next_server should skip addr(1) and return addr(2) or addr(3)
+        let selected = upstream.next_server();
+        assert_ne!(selected, addr(1), "should skip unhealthy backend");
+    }
+
+    #[test]
+    fn test_upstream_fail_open_all_unhealthy() {
+        let upstream = Upstream::with_cooldown(
+            "test".into(),
+            vec![addr(1), addr(2)],
+            Duration::from_secs(3600), // long cooldown
+        );
+        // Mark all unhealthy
+        upstream.health[0].record_failure();
+        upstream.health[1].record_failure();
+
+        // Should still return a server (fail-open)
+        let selected = upstream.next_server();
+        assert!(
+            selected == addr(1) || selected == addr(2),
+            "fail-open must return a server"
+        );
+    }
+
+    #[test]
+    fn test_upstream_recovery_after_cooldown() {
+        let upstream = Upstream::with_cooldown(
+            "test".into(),
+            vec![addr(1)],
+            Duration::from_secs(0), // zero cooldown — immediately eligible
+        );
+        upstream.health[0].record_failure();
+        // With zero cooldown, backend is immediately eligible again
+        assert!(upstream.health[0].is_eligible(Duration::from_secs(0)));
+        let selected = upstream.next_server();
+        assert_eq!(selected, addr(1));
+    }
+
+    #[test]
+    fn test_report_success_recovers_backend() {
+        let upstream = Upstream::new("test".into(), vec![addr(1)]);
+        upstream.health[0].record_failure();
+        assert!(!upstream.health[0].is_healthy());
+
+        upstream.report_success(addr(1));
+        assert!(upstream.health[0].is_healthy());
+        assert_eq!(upstream.health[0].consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_report_failure_marks_unhealthy() {
+        let upstream = Upstream::new("test".into(), vec![addr(1)]);
+        assert!(upstream.health[0].is_healthy());
+
+        upstream.report_failure(addr(1));
+        assert!(!upstream.health[0].is_healthy());
+        assert_eq!(upstream.health[0].consecutive_failures(), 1);
+    }
+
+    #[test]
+    fn test_report_unknown_addr_is_noop() {
+        let upstream = Upstream::new("test".into(), vec![addr(1)]);
+        // Reporting for an address not in the upstream should not panic
+        upstream.report_success(addr(9999));
+        upstream.report_failure(addr(9999));
+        // addr(1) health unchanged
+        assert!(upstream.health[0].is_healthy());
+    }
+
+    #[test]
+    fn test_upstream_with_cooldown_constructor() {
+        let upstream = Upstream::with_cooldown(
+            "test".into(),
+            vec![addr(1), addr(2)],
+            Duration::from_secs(60),
+        );
+        assert_eq!(upstream.servers.len(), 2);
+        assert_eq!(upstream.health.len(), 2);
+        assert_eq!(upstream.cooldown, Duration::from_secs(60));
     }
 }

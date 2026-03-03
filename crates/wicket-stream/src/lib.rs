@@ -3,6 +3,7 @@
 //! This crate provides TCP stream proxying capabilities similar to nginx's stream block,
 //! including SNI-based routing, source IP pooling, and proxy protocol support.
 
+pub mod health;
 mod listener;
 pub mod metrics;
 mod pool;

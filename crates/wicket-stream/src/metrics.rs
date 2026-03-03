@@ -5,8 +5,8 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, register_int_gauge, HistogramVec,
-    IntCounterVec, IntGauge,
+    register_histogram_vec, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
+    HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
 };
 
 lazy_static! {
@@ -92,6 +92,28 @@ lazy_static! {
         vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
     )
     .expect("metric can be created");
+
+    // ============================================================
+    // Backend health
+    // ============================================================
+
+    /// Backend health status (1=healthy, 0=unhealthy), labelled by upstream and backend.
+    pub static ref STREAM_BACKEND_HEALTH: IntGaugeVec = register_int_gauge_vec!(
+        "wicket_stream_backend_healthy",
+        "Backend health status (1=healthy, 0=unhealthy)",
+        &["upstream", "backend"]
+    )
+    .expect("metric can be created");
+
+    /// Backend health state transitions, labelled by upstream, backend, and transition type.
+    ///
+    /// `transition` values: `"healthy_to_unhealthy"`, `"unhealthy_to_healthy"`.
+    pub static ref STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "wicket_stream_backend_health_transitions_total",
+        "Backend health state transitions",
+        &["upstream", "backend", "transition"]
+    )
+    .expect("metric can be created");
 }
 
 /// Force lazy_static initialization. Call from main before serving traffic.
@@ -103,6 +125,8 @@ pub fn register_stream_metrics() {
     let _ = &*STREAM_BYTES_TOTAL;
     let _ = &*STREAM_SNI_EXTRACTIONS_TOTAL;
     let _ = &*STREAM_CONNECT_DURATION_SECONDS;
+    let _ = &*STREAM_BACKEND_HEALTH;
+    let _ = &*STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL;
 }
 
 #[cfg(test)]
