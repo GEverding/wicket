@@ -4889,6 +4889,7 @@ dependencies = [
 name = "wicket-stream"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "lazy_static",
  "libc",

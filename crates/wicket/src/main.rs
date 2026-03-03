@@ -17,6 +17,7 @@ use pingora_proxy::http_proxy_service;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, warn};
 use wicket_config::Config;
 use wicket_core::{
@@ -331,8 +332,8 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     server.add_service(proxy_service);
 
     // Optionally start stream proxy
-    if let Some(ref stream_config) = config.stream {
-        let stream_proxy = Arc::new(
+    let stream_proxy: Option<Arc<StreamProxy>> = if let Some(ref stream_config) = config.stream {
+        let proxy = Arc::new(
             StreamProxy::from_config(stream_config).context("Failed to build stream proxy")?,
         );
 
@@ -358,13 +359,55 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
             "Starting stream proxy"
         );
 
-        let proxy = Arc::clone(&stream_proxy);
+        let proxy_run = Arc::clone(&proxy);
         tokio::spawn(async move {
-            if let Err(e) = proxy.run(listener).await {
+            if let Err(e) = proxy_run.run(listener).await {
                 error!(error = %e, "Stream proxy error");
             }
         });
-    }
+
+        Some(proxy)
+    } else {
+        None
+    };
+
+    // Config file watcher: poll every 5s, reload stream proxy on mtime change.
+    let config_path = args.config.clone();
+    let stream_reload = stream_proxy.clone();
+    tokio::spawn(async move {
+        let mut last_modified = tokio::fs::metadata(&config_path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            let current_modified = tokio::fs::metadata(&config_path)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok());
+
+            if current_modified != last_modified {
+                info!("Config file changed, reloading...");
+                match Config::load(&config_path) {
+                    Ok(new_config) => {
+                        if let Some(ref proxy) = stream_reload {
+                            if let Some(ref stream_config) = new_config.stream {
+                                if let Err(e) = proxy.reload(stream_config) {
+                                    error!(error = %e, "Failed to reload stream proxy config");
+                                }
+                            }
+                        }
+                        last_modified = current_modified;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to load new config, keeping current config");
+                    }
+                }
+            }
+        }
+    });
 
     // Run the server (blocks until shutdown)
     server.run_forever();
