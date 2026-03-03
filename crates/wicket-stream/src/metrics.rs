@@ -116,6 +116,17 @@ lazy_static! {
     .expect("metric can be created");
 
     // ============================================================
+    // Connection limits
+    // ============================================================
+
+    /// Connections rejected due to connection limit.
+    pub static ref STREAM_CONNECTIONS_REJECTED_TOTAL: IntCounter = register_int_counter!(
+        "wicket_stream_connections_rejected_total",
+        "Connections rejected due to connection limit"
+    )
+    .expect("metric can be created");
+
+    // ============================================================
     // Hot reload
     // ============================================================
 
@@ -138,6 +149,7 @@ pub fn register_stream_metrics() {
     let _ = &*STREAM_CONNECT_DURATION_SECONDS;
     let _ = &*STREAM_BACKEND_HEALTH;
     let _ = &*STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL;
+    let _ = &*STREAM_CONNECTIONS_REJECTED_TOTAL;
     let _ = &*STREAM_CONFIG_RELOADS_TOTAL;
 }
 

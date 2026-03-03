@@ -274,6 +274,8 @@ async fn test_sni_routing_wildcard_match() {
             },
         ],
         health_cooldown_secs: 30,
+        connect_timeout_ms: 5000,
+        max_connections: 10000,
     };
     config
         .sni_routes
@@ -399,6 +401,8 @@ async fn test_sni_routing_default_upstream() {
             },
         ],
         health_cooldown_secs: 30,
+        connect_timeout_ms: 5000,
+        max_connections: 10000,
     };
     config
         .sni_routes
@@ -499,6 +503,8 @@ async fn test_sni_routing_no_match_no_default() {
             servers: vec![backend.addr.to_string()],
         }],
         health_cooldown_secs: 30,
+        connect_timeout_ms: 5000,
+        max_connections: 10000,
     };
     config
         .sni_routes
@@ -575,6 +581,8 @@ async fn test_sni_routing_non_tls_traffic() {
             },
         ],
         health_cooldown_secs: 30,
+        connect_timeout_ms: 5000,
+        max_connections: 10000,
     };
     config
         .sni_routes
@@ -637,6 +645,8 @@ async fn test_proxy_basic_routing() {
             servers: vec![backend.addr.to_string()],
         }],
         health_cooldown_secs: 30,
+        connect_timeout_ms: 5000,
+        max_connections: 10000,
     };
 
     // Start proxy

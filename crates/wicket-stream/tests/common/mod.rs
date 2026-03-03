@@ -54,6 +54,8 @@ pub fn test_stream_config(
         sni_routes,
         upstreams,
         health_cooldown_secs: 30,
+        connect_timeout_ms: 5000,
+        max_connections: 10000,
     }
 }
 

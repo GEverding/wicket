@@ -12,8 +12,8 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::health::BackendHealth;
 use crate::metrics::{
     STREAM_BACKEND_HEALTH, STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL, STREAM_BYTES_TOTAL,
-    STREAM_CONFIG_RELOADS_TOTAL, STREAM_CONNECTIONS_ACTIVE, STREAM_CONNECTIONS_TOTAL,
-    STREAM_CONNECTION_DURATION_SECONDS, STREAM_CONNECTION_ERRORS_TOTAL,
+    STREAM_CONFIG_RELOADS_TOTAL, STREAM_CONNECTIONS_ACTIVE, STREAM_CONNECTIONS_REJECTED_TOTAL,
+    STREAM_CONNECTIONS_TOTAL, STREAM_CONNECTION_DURATION_SECONDS, STREAM_CONNECTION_ERRORS_TOTAL,
     STREAM_CONNECT_DURATION_SECONDS, STREAM_SNI_EXTRACTIONS_TOTAL,
 };
 use crate::pool::SourceIpPool;
@@ -154,6 +154,11 @@ pub struct StreamProxy {
     pub(crate) source_ip_pool: Option<SourceIpPool>,
     pub(crate) proxy_protocol: Option<ProxyProtocolVersion>,
     pub(crate) local_addr: SocketAddr,
+    pub(crate) connect_timeout: Duration,
+    /// Semaphore for connection limiting. `None` means unlimited.
+    ///
+    /// Set at startup from `max_connections`; not reloadable (restart required to change).
+    pub(crate) connection_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     pub(crate) sockmap: Option<Arc<Mutex<SocketMap>>>,
 }
@@ -166,13 +171,24 @@ impl StreamProxy {
         source_ip_pool: Option<SourceIpPool>,
         proxy_protocol: Option<ProxyProtocolVersion>,
         local_addr: SocketAddr,
+        connect_timeout: Duration,
+        max_connections: u32,
     ) -> Self {
+        let connection_semaphore = if max_connections > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                max_connections as usize,
+            )))
+        } else {
+            None
+        };
         Self {
             router: ArcSwap::new(Arc::new(router)),
             upstreams: ArcSwap::new(Arc::new(upstreams)),
             source_ip_pool,
             proxy_protocol,
             local_addr,
+            connect_timeout,
+            connection_semaphore,
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             sockmap: None,
         }
@@ -231,12 +247,23 @@ impl StreamProxy {
             .parse()
             .map_err(|e| StreamError::ConfigError(format!("Invalid listen address: {}", e)))?;
 
+        let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
+        let connection_semaphore = if config.max_connections > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                config.max_connections as usize,
+            )))
+        } else {
+            None
+        };
+
         Ok(Self {
             router: ArcSwap::new(Arc::new(router)),
             upstreams: ArcSwap::new(Arc::new(upstreams)),
             source_ip_pool,
             proxy_protocol,
             local_addr,
+            connect_timeout,
+            connection_semaphore,
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             sockmap: None,
         })
@@ -285,7 +312,27 @@ impl StreamProxy {
             let (client_stream, client_addr) = listener.accept().await?;
             let proxy = Arc::clone(&self);
 
+            // Acquire connection permit (if limits configured).
+            // try_acquire_owned never blocks the accept loop.
+            let permit = if let Some(ref sem) = self.connection_semaphore {
+                match sem.clone().try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        STREAM_CONNECTIONS_REJECTED_TOTAL.inc();
+                        tracing::warn!(
+                            client = %client_addr,
+                            "Connection rejected: max connections reached"
+                        );
+                        // Drop client_stream to close the connection
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
             tokio::spawn(async move {
+                let _permit = permit; // held until task completes
                 if let Err(e) = proxy.handle_connection(client_stream, client_addr).await {
                     tracing::warn!(client = %client_addr, error = %e, "Connection failed");
                 }
@@ -362,19 +409,35 @@ impl StreamProxy {
 
         // 3. Connect to backend (with optional source IP binding) — timed
         let connect_start = Instant::now();
-        let mut backend = match self.connect_backend(backend_addr).await {
-            Ok(b) => {
-                upstream.report_success(backend_addr);
-                b
-            }
-            Err(e) => {
-                upstream.report_failure(backend_addr);
-                STREAM_CONNECTION_ERRORS_TOTAL
-                    .with_label_values(&["connect"])
-                    .inc();
-                return Err(e);
-            }
-        };
+        let mut backend =
+            match tokio::time::timeout(self.connect_timeout, self.connect_backend(backend_addr))
+                .await
+            {
+                Ok(Ok(b)) => {
+                    upstream.report_success(backend_addr);
+                    b
+                }
+                Ok(Err(e)) => {
+                    upstream.report_failure(backend_addr);
+                    STREAM_CONNECTION_ERRORS_TOTAL
+                        .with_label_values(&["connect"])
+                        .inc();
+                    return Err(e);
+                }
+                Err(_elapsed) => {
+                    upstream.report_failure(backend_addr);
+                    STREAM_CONNECTION_ERRORS_TOTAL
+                        .with_label_values(&["connect_timeout"])
+                        .inc();
+                    return Err(StreamError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "Backend connect timed out after {}ms",
+                            self.connect_timeout.as_millis()
+                        ),
+                    )));
+                }
+            };
         STREAM_CONNECT_DURATION_SECONDS
             .with_label_values(&[&upstream_name])
             .observe(connect_start.elapsed().as_secs_f64());
@@ -596,6 +659,8 @@ mod tests {
                 servers: vec!["127.0.0.1:8080".into()],
             }],
             health_cooldown_secs: 30,
+            connect_timeout_ms: 5000,
+            max_connections: 10000,
         }
     }
 
@@ -899,5 +964,55 @@ mod tests {
         assert_eq!(upstream.servers.len(), 2);
         assert_eq!(upstream.health.len(), 2);
         assert_eq!(upstream.cooldown, Duration::from_secs(60));
+    }
+
+    // ============================================================================
+    // Connect timeout tests (bd-2f4)
+    // ============================================================================
+
+    #[test]
+    fn test_stream_proxy_from_config_connect_timeout() {
+        let mut config = test_stream_config();
+        config.connect_timeout_ms = 3000;
+        let proxy = StreamProxy::from_config(&config).unwrap();
+        assert_eq!(proxy.connect_timeout, Duration::from_millis(3000));
+    }
+
+    #[test]
+    fn test_stream_proxy_from_config_connect_timeout_default() {
+        let config = test_stream_config();
+        let proxy = StreamProxy::from_config(&config).unwrap();
+        assert_eq!(proxy.connect_timeout, Duration::from_millis(5000));
+    }
+
+    // ============================================================================
+    // Connection limit tests (bd-tpd)
+    // ============================================================================
+
+    #[test]
+    fn test_stream_proxy_from_config_connection_limit() {
+        let mut config = test_stream_config();
+        config.max_connections = 500;
+        let proxy = StreamProxy::from_config(&config).unwrap();
+        assert!(proxy.connection_semaphore.is_some());
+        let sem = proxy.connection_semaphore.unwrap();
+        assert_eq!(sem.available_permits(), 500);
+    }
+
+    #[test]
+    fn test_stream_proxy_from_config_unlimited_connections() {
+        let mut config = test_stream_config();
+        config.max_connections = 0;
+        let proxy = StreamProxy::from_config(&config).unwrap();
+        assert!(proxy.connection_semaphore.is_none());
+    }
+
+    #[test]
+    fn test_stream_proxy_from_config_default_connection_limit() {
+        let config = test_stream_config();
+        let proxy = StreamProxy::from_config(&config).unwrap();
+        assert!(proxy.connection_semaphore.is_some());
+        let sem = proxy.connection_semaphore.unwrap();
+        assert_eq!(sem.available_permits(), 10000);
     }
 }
