@@ -353,6 +353,14 @@ pub struct StreamConfig {
     /// Unhealthy backends become eligible for retry after this duration.
     #[serde(default = "default_health_cooldown_secs")]
     pub health_cooldown_secs: u64,
+
+    /// Backend connect timeout in milliseconds (default 5000).
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+
+    /// Maximum concurrent connections (default 10000). 0 = unlimited.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
 }
 
 /// Configuration for a stream upstream.
@@ -413,6 +421,14 @@ fn default_backlog() -> u32 {
 
 fn default_health_cooldown_secs() -> u64 {
     30
+}
+
+fn default_connect_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_max_connections() -> u32 {
+    10000
 }
 
 impl Config {
