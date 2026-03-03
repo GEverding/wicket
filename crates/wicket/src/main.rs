@@ -336,9 +336,43 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     let shutdown_token = CancellationToken::new();
 
     let stream_proxy: Option<Arc<StreamProxy>> = if let Some(ref stream_config) = config.stream {
-        let proxy = Arc::new(
-            StreamProxy::from_config(stream_config).context("Failed to build stream proxy")?,
-        );
+        #[allow(unused_mut)]
+        let mut proxy_builder =
+            StreamProxy::from_config(stream_config).context("Failed to build stream proxy")?;
+
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        {
+            use volt_sockmap::{SocketMap, SocketMapConfig};
+
+            let sockmap_config = SocketMapConfig {
+                bpf_object_path: None, // Use embedded BPF bytecode
+                max_connections: 500_000,
+                verbose: false,
+            };
+
+            match SocketMap::load(sockmap_config) {
+                Ok(mut sockmap) => match sockmap.attach() {
+                    Ok(()) => {
+                        tracing::info!("eBPF sockmap loaded and attached");
+                        proxy_builder = proxy_builder.with_sockmap(sockmap);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to attach eBPF sockmap, falling back to userspace proxying"
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to load eBPF sockmap, falling back to userspace proxying"
+                    );
+                }
+            }
+        }
+
+        let proxy = Arc::new(proxy_builder);
 
         let listener_config = ListenerConfig {
             addr: stream_config

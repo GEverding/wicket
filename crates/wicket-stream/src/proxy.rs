@@ -15,7 +15,7 @@ use crate::metrics::{
     STREAM_BACKEND_HEALTH, STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL, STREAM_BYTES_TOTAL,
     STREAM_CONFIG_RELOADS_TOTAL, STREAM_CONNECTIONS_ACTIVE, STREAM_CONNECTIONS_REJECTED_TOTAL,
     STREAM_CONNECTIONS_TOTAL, STREAM_CONNECTION_DURATION_SECONDS, STREAM_CONNECTION_ERRORS_TOTAL,
-    STREAM_CONNECT_DURATION_SECONDS, STREAM_SNI_EXTRACTIONS_TOTAL,
+    STREAM_CONNECT_DURATION_SECONDS, STREAM_PROXY_PATH_TOTAL, STREAM_SNI_EXTRACTIONS_TOTAL,
 };
 use crate::pool::SourceIpPool;
 use crate::protocol::{ProxyProtocolEncoder, ProxyProtocolVersion};
@@ -518,6 +518,7 @@ impl StreamProxy {
                     client = %client_addr,
                     "Using eBPF sockmap for kernel-level proxying"
                 );
+                STREAM_PROXY_PATH_TOTAL.with_label_values(&["ebpf"]).inc();
 
                 // Kernel handles data transfer - just wait for either side to close.
                 // Bytes are not measurable in this path (kernel does the copy).
@@ -535,10 +536,16 @@ impl StreamProxy {
                 return Ok(());
             }
             // Fall through to user-space proxying if registration failed
+            STREAM_PROXY_PATH_TOTAL
+                .with_label_values(&["ebpf_fallback"])
+                .inc();
         }
 
         // User-space bidirectional copy (fallback or non-Linux).
         // copy_bidirectional returns (client→backend bytes, backend→client bytes).
+        STREAM_PROXY_PATH_TOTAL
+            .with_label_values(&["userspace"])
+            .inc();
         match tokio::io::copy_bidirectional(&mut client, &mut backend).await {
             Ok((client_to_backend, backend_to_client)) => {
                 STREAM_BYTES_TOTAL

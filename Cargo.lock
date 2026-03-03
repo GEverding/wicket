@@ -4820,6 +4820,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "volt-sockmap",
  "wicket-config",
  "wicket-core",
  "wicket-stream",

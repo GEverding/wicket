@@ -10,6 +10,9 @@ default-run = "wicket"
 name = "wicket"
 path = "src/main.rs"
 
+[features]
+ebpf = ["wicket-stream/ebpf", "volt-sockmap"]
+
 [dependencies]
 wicket-config = { workspace = true }
 wicket-core = { workspace = true }
@@ -35,3 +38,6 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+volt-sockmap = { workspace = true, optional = true }
