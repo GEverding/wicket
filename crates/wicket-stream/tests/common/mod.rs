@@ -56,6 +56,7 @@ pub fn test_stream_config(
         health_cooldown_secs: 30,
         connect_timeout_ms: 5000,
         max_connections: 10000,
+        drain_timeout_secs: 30,
     }
 }
 

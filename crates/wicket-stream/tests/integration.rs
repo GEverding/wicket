@@ -144,6 +144,8 @@ async fn start_proxy(
     (Arc<wicket_stream::StreamProxy>, tokio::task::JoinHandle<()>),
     Box<dyn std::error::Error>,
 > {
+    use tokio_util::sync::CancellationToken;
+
     let proxy = Arc::new(wicket_stream::StreamProxy::from_config(config)?);
     let listen_addr: SocketAddr = config.listen.parse()?;
 
@@ -157,8 +159,10 @@ async fn start_proxy(
     let listener = wicket_stream::into_tokio_listener(listener)?;
 
     let proxy_clone = Arc::clone(&proxy);
+    // Pass a never-cancelled token; tests finish via handle.abort()
+    let shutdown = CancellationToken::new();
     let handle = tokio::spawn(async move {
-        if let Err(e) = proxy_clone.run(listener).await {
+        if let Err(e) = proxy_clone.run(listener, shutdown).await {
             eprintln!("Proxy error: {}", e);
         }
     });
@@ -276,6 +280,7 @@ async fn test_sni_routing_wildcard_match() {
         health_cooldown_secs: 30,
         connect_timeout_ms: 5000,
         max_connections: 10000,
+        drain_timeout_secs: 30,
     };
     config
         .sni_routes
@@ -403,6 +408,7 @@ async fn test_sni_routing_default_upstream() {
         health_cooldown_secs: 30,
         connect_timeout_ms: 5000,
         max_connections: 10000,
+        drain_timeout_secs: 30,
     };
     config
         .sni_routes
@@ -505,6 +511,7 @@ async fn test_sni_routing_no_match_no_default() {
         health_cooldown_secs: 30,
         connect_timeout_ms: 5000,
         max_connections: 10000,
+        drain_timeout_secs: 30,
     };
     config
         .sni_routes
@@ -583,6 +590,7 @@ async fn test_sni_routing_non_tls_traffic() {
         health_cooldown_secs: 30,
         connect_timeout_ms: 5000,
         max_connections: 10000,
+        drain_timeout_secs: 30,
     };
     config
         .sni_routes
@@ -647,6 +655,7 @@ async fn test_proxy_basic_routing() {
         health_cooldown_secs: 30,
         connect_timeout_ms: 5000,
         max_connections: 10000,
+        drain_timeout_secs: 30,
     };
 
     // Start proxy

@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use wicket_config::Config;
 use wicket_core::{
@@ -332,6 +333,8 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     server.add_service(proxy_service);
 
     // Optionally start stream proxy
+    let shutdown_token = CancellationToken::new();
+
     let stream_proxy: Option<Arc<StreamProxy>> = if let Some(ref stream_config) = config.stream {
         let proxy = Arc::new(
             StreamProxy::from_config(stream_config).context("Failed to build stream proxy")?,
@@ -360,8 +363,9 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         );
 
         let proxy_run = Arc::clone(&proxy);
+        let stream_shutdown = shutdown_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = proxy_run.run(listener).await {
+            if let Err(e) = proxy_run.run(listener, stream_shutdown).await {
                 error!(error = %e, "Stream proxy error");
             }
         });
@@ -370,6 +374,21 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     } else {
         None
     };
+
+    // Signal handler: cancel the shutdown token on SIGTERM or SIGINT.
+    let signal_shutdown = shutdown_token.clone();
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("failed to install SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => { tracing::info!("Received SIGTERM"); }
+            _ = sigint.recv() => { tracing::info!("Received SIGINT"); }
+        }
+        signal_shutdown.cancel();
+    });
 
     // Config file watcher: poll every 5s, reload stream proxy on mtime change.
     let config_path = args.config.clone();

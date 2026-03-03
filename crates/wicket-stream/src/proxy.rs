@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
 
 use crate::health::BackendHealth;
 use crate::metrics::{
@@ -159,6 +160,8 @@ pub struct StreamProxy {
     ///
     /// Set at startup from `max_connections`; not reloadable (restart required to change).
     pub(crate) connection_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// How long to wait for active connections to drain on shutdown.
+    pub(crate) drain_timeout: Duration,
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     pub(crate) sockmap: Option<Arc<Mutex<SocketMap>>>,
 }
@@ -189,6 +192,7 @@ impl StreamProxy {
             local_addr,
             connect_timeout,
             connection_semaphore,
+            drain_timeout: Duration::from_secs(30),
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             sockmap: None,
         }
@@ -264,6 +268,7 @@ impl StreamProxy {
             local_addr,
             connect_timeout,
             connection_semaphore,
+            drain_timeout: Duration::from_secs(config.drain_timeout_secs),
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             sockmap: None,
         })
@@ -306,38 +311,78 @@ impl StreamProxy {
         Ok(())
     }
 
-    /// Run the proxy server.
-    pub async fn run(self: Arc<Self>, listener: TcpListener) -> Result<(), StreamError> {
+    /// Run the proxy server until `shutdown` is cancelled.
+    ///
+    /// On shutdown, stops accepting new connections and waits up to `drain_timeout`
+    /// for active connections to finish before returning.
+    pub async fn run(
+        self: Arc<Self>,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+    ) -> Result<(), StreamError> {
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+
         loop {
-            let (client_stream, client_addr) = listener.accept().await?;
-            let proxy = Arc::clone(&self);
+            tokio::select! {
+                result = listener.accept() => {
+                    let (client_stream, client_addr) = result?;
+                    let proxy = Arc::clone(&self);
 
-            // Acquire connection permit (if limits configured).
-            // try_acquire_owned never blocks the accept loop.
-            let permit = if let Some(ref sem) = self.connection_semaphore {
-                match sem.clone().try_acquire_owned() {
-                    Ok(permit) => Some(permit),
-                    Err(_) => {
-                        STREAM_CONNECTIONS_REJECTED_TOTAL.inc();
-                        tracing::warn!(
-                            client = %client_addr,
-                            "Connection rejected: max connections reached"
-                        );
-                        // Drop client_stream to close the connection
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
+                    // Acquire connection permit (if limits configured).
+                    // try_acquire_owned never blocks the accept loop.
+                    let permit = if let Some(ref sem) = self.connection_semaphore {
+                        match sem.clone().try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                STREAM_CONNECTIONS_REJECTED_TOTAL.inc();
+                                tracing::warn!(
+                                    client = %client_addr,
+                                    "Connection rejected: max connections reached"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
-            tokio::spawn(async move {
-                let _permit = permit; // held until task completes
-                if let Err(e) = proxy.handle_connection(client_stream, client_addr).await {
-                    tracing::warn!(client = %client_addr, error = %e, "Connection failed");
+                    active_tasks.fetch_add(1, Ordering::Relaxed);
+                    let task_counter = Arc::clone(&active_tasks);
+
+                    tokio::spawn(async move {
+                        let _permit = permit; // held until task completes
+                        if let Err(e) = proxy.handle_connection(client_stream, client_addr).await {
+                            tracing::warn!(client = %client_addr, error = %e, "Connection failed");
+                        }
+                        task_counter.fetch_sub(1, Ordering::Relaxed);
+                    });
                 }
-            });
+                _ = shutdown.cancelled() => {
+                    tracing::info!("Stream proxy shutting down, draining active connections...");
+                    break;
+                }
+            }
         }
+
+        // Drain: wait for active connections with a hard timeout.
+        let drain_start = Instant::now();
+        loop {
+            let remaining = active_tasks.load(Ordering::Relaxed);
+            if remaining == 0 {
+                tracing::info!("Stream proxy: all connections drained");
+                break;
+            }
+            if drain_start.elapsed() >= self.drain_timeout {
+                tracing::warn!(
+                    remaining = remaining,
+                    "Stream proxy: drain timeout reached, forcing shutdown"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        Ok(())
     }
 
     /// Handle a single client connection.
@@ -661,6 +706,7 @@ mod tests {
             health_cooldown_secs: 30,
             connect_timeout_ms: 5000,
             max_connections: 10000,
+            drain_timeout_secs: 30,
         }
     }
 
