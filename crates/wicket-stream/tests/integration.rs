@@ -273,6 +273,7 @@ async fn test_sni_routing_wildcard_match() {
                 servers: vec![exact_backend.addr.to_string()],
             },
         ],
+        health_cooldown_secs: 30,
     };
     config
         .sni_routes
@@ -397,6 +398,7 @@ async fn test_sni_routing_default_upstream() {
                 servers: vec![specific_backend.addr.to_string()],
             },
         ],
+        health_cooldown_secs: 30,
     };
     config
         .sni_routes
@@ -496,6 +498,7 @@ async fn test_sni_routing_no_match_no_default() {
             name: "api".into(),
             servers: vec![backend.addr.to_string()],
         }],
+        health_cooldown_secs: 30,
     };
     config
         .sni_routes
@@ -571,6 +574,7 @@ async fn test_sni_routing_non_tls_traffic() {
                 servers: vec![specific_backend.addr.to_string()],
             },
         ],
+        health_cooldown_secs: 30,
     };
     config
         .sni_routes
@@ -632,6 +636,7 @@ async fn test_proxy_basic_routing() {
             name: "backend".into(),
             servers: vec![backend.addr.to_string()],
         }],
+        health_cooldown_secs: 30,
     };
 
     // Start proxy

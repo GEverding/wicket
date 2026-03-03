@@ -347,6 +347,12 @@ pub struct StreamConfig {
     /// Stream upstream definitions
     #[serde(default)]
     pub upstreams: Vec<StreamUpstreamConfig>,
+
+    /// Health check cooldown in seconds (default 30).
+    ///
+    /// Unhealthy backends become eligible for retry after this duration.
+    #[serde(default = "default_health_cooldown_secs")]
+    pub health_cooldown_secs: u64,
 }
 
 /// Configuration for a stream upstream.
@@ -403,6 +409,10 @@ fn default_health_threshold() -> u32 {
 
 fn default_backlog() -> u32 {
     8000
+}
+
+fn default_health_cooldown_secs() -> u64 {
+    30
 }
 
 impl Config {

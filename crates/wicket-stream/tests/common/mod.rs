@@ -53,6 +53,7 @@ pub fn test_stream_config(
         default_upstream: None,
         sni_routes,
         upstreams,
+        health_cooldown_secs: 30,
     }
 }
 
