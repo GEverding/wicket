@@ -15,6 +15,7 @@ wicket-config = { path = "../wicket-config" }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 # Utilities
 thiserror = { workspace = true }
@@ -31,3 +32,4 @@ volt-sockmap = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+tokio-util = { workspace = true }

@@ -361,6 +361,13 @@ pub struct StreamConfig {
     /// Maximum concurrent connections (default 10000). 0 = unlimited.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+
+    /// Graceful shutdown drain timeout in seconds (default 30).
+    ///
+    /// After receiving a shutdown signal, the proxy stops accepting new connections
+    /// and waits up to this duration for active connections to finish.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
 }
 
 /// Configuration for a stream upstream.
@@ -429,6 +436,10 @@ fn default_connect_timeout_ms() -> u64 {
 
 fn default_max_connections() -> u32 {
     10000
+}
+
+fn default_drain_timeout_secs() -> u64 {
+    30
 }
 
 impl Config {

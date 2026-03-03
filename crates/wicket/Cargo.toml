@@ -25,6 +25,7 @@ foundations = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 # Logging / Telemetry
 tracing = { workspace = true }
