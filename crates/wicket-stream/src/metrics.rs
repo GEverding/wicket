@@ -136,6 +136,21 @@ lazy_static! {
         "Total stream proxy config reloads"
     )
     .expect("metric can be created");
+
+    // ============================================================
+    // Acceleration path
+    // ============================================================
+
+    /// Connections by proxy path used.
+    ///
+    /// `path` values: `"ebpf"` (kernel sockmap), `"ebpf_fallback"` (sockmap register failed),
+    /// `"userspace"` (no sockmap or non-Linux).
+    pub static ref STREAM_PROXY_PATH_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "wicket_stream_proxy_path_total",
+        "Connection proxy path used",
+        &["path"]
+    )
+    .expect("metric can be created");
 }
 
 /// Force lazy_static initialization. Call from main before serving traffic.
@@ -151,6 +166,7 @@ pub fn register_stream_metrics() {
     let _ = &*STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL;
     let _ = &*STREAM_CONNECTIONS_REJECTED_TOTAL;
     let _ = &*STREAM_CONFIG_RELOADS_TOTAL;
+    let _ = &*STREAM_PROXY_PATH_TOTAL;
 }
 
 #[cfg(test)]
