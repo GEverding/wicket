@@ -5,8 +5,8 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_histogram_vec, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
-    HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
+    register_int_gauge_vec, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
 };
 
 lazy_static! {
@@ -114,6 +114,17 @@ lazy_static! {
         &["upstream", "backend", "transition"]
     )
     .expect("metric can be created");
+
+    // ============================================================
+    // Hot reload
+    // ============================================================
+
+    /// Total stream proxy configuration reloads.
+    pub static ref STREAM_CONFIG_RELOADS_TOTAL: IntCounter = register_int_counter!(
+        "wicket_stream_config_reloads_total",
+        "Total stream proxy config reloads"
+    )
+    .expect("metric can be created");
 }
 
 /// Force lazy_static initialization. Call from main before serving traffic.
@@ -127,6 +138,7 @@ pub fn register_stream_metrics() {
     let _ = &*STREAM_CONNECT_DURATION_SECONDS;
     let _ = &*STREAM_BACKEND_HEALTH;
     let _ = &*STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL;
+    let _ = &*STREAM_CONFIG_RELOADS_TOTAL;
 }
 
 #[cfg(test)]

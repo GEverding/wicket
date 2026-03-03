@@ -1,5 +1,6 @@
 //! TCP stream proxy implementation.
 
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,8 +12,9 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::health::BackendHealth;
 use crate::metrics::{
     STREAM_BACKEND_HEALTH, STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL, STREAM_BYTES_TOTAL,
-    STREAM_CONNECTIONS_ACTIVE, STREAM_CONNECTIONS_TOTAL, STREAM_CONNECTION_DURATION_SECONDS,
-    STREAM_CONNECTION_ERRORS_TOTAL, STREAM_CONNECT_DURATION_SECONDS, STREAM_SNI_EXTRACTIONS_TOTAL,
+    STREAM_CONFIG_RELOADS_TOTAL, STREAM_CONNECTIONS_ACTIVE, STREAM_CONNECTIONS_TOTAL,
+    STREAM_CONNECTION_DURATION_SECONDS, STREAM_CONNECTION_ERRORS_TOTAL,
+    STREAM_CONNECT_DURATION_SECONDS, STREAM_SNI_EXTRACTIONS_TOTAL,
 };
 use crate::pool::SourceIpPool;
 use crate::protocol::{ProxyProtocolEncoder, ProxyProtocolVersion};
@@ -147,8 +149,8 @@ impl Upstream {
 /// Main L4 stream proxy.
 #[derive(Debug)]
 pub struct StreamProxy {
-    pub(crate) router: SniRouter,
-    pub(crate) upstreams: HashMap<String, Arc<Upstream>>,
+    pub(crate) router: ArcSwap<SniRouter>,
+    pub(crate) upstreams: ArcSwap<HashMap<String, Arc<Upstream>>>,
     pub(crate) source_ip_pool: Option<SourceIpPool>,
     pub(crate) proxy_protocol: Option<ProxyProtocolVersion>,
     pub(crate) local_addr: SocketAddr,
@@ -166,8 +168,8 @@ impl StreamProxy {
         local_addr: SocketAddr,
     ) -> Self {
         Self {
-            router,
-            upstreams,
+            router: ArcSwap::new(Arc::new(router)),
+            upstreams: ArcSwap::new(Arc::new(upstreams)),
             source_ip_pool,
             proxy_protocol,
             local_addr,
@@ -230,14 +232,51 @@ impl StreamProxy {
             .map_err(|e| StreamError::ConfigError(format!("Invalid listen address: {}", e)))?;
 
         Ok(Self {
-            router,
-            upstreams,
+            router: ArcSwap::new(Arc::new(router)),
+            upstreams: ArcSwap::new(Arc::new(upstreams)),
             source_ip_pool,
             proxy_protocol,
             local_addr,
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             sockmap: None,
         })
+    }
+
+    /// Reload configuration. Active connections continue with the previous config.
+    ///
+    /// On success, atomically swaps in the new router and upstreams.
+    /// On failure, the running config is unchanged.
+    pub fn reload(&self, config: &wicket_config::StreamConfig) -> Result<(), StreamError> {
+        // Build new router
+        let router = SniRouter::new(&config.sni_routes, config.default_upstream.clone());
+
+        // Build new upstreams (fresh health state — all healthy)
+        let cooldown = Duration::from_secs(config.health_cooldown_secs);
+        let mut upstreams = HashMap::new();
+        for upstream_config in &config.upstreams {
+            let servers: Vec<SocketAddr> = upstream_config
+                .servers
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<_, _>>()
+                .map_err(|e| StreamError::ConfigError(format!("Invalid server address: {}", e)))?;
+
+            upstreams.insert(
+                upstream_config.name.clone(),
+                Arc::new(Upstream::with_cooldown(
+                    upstream_config.name.clone(),
+                    servers,
+                    cooldown,
+                )),
+            );
+        }
+
+        self.router.store(Arc::new(router));
+        self.upstreams.store(Arc::new(upstreams));
+
+        STREAM_CONFIG_RELOADS_TOTAL.inc();
+        tracing::info!("Stream proxy configuration reloaded");
+        Ok(())
     }
 
     /// Run the proxy server.
@@ -260,6 +299,10 @@ impl StreamProxy {
         mut client: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<(), StreamError> {
+        // Snapshot config at connection start — a mid-connection reload won't affect this conn.
+        let router = self.router.load();
+        let upstreams = self.upstreams.load();
+
         // Active-connection guard: decrements gauge + records duration on every return path.
         let mut guard = ConnectionGuard::new();
 
@@ -289,7 +332,7 @@ impl StreamProxy {
         }
 
         // 2. Route to upstream
-        let upstream_name = match self.router.match_sni(sni.as_deref()) {
+        let upstream_name = match router.match_sni(sni.as_deref()) {
             Some(name) => name,
             None => {
                 STREAM_CONNECTION_ERRORS_TOTAL
@@ -299,7 +342,7 @@ impl StreamProxy {
             }
         };
 
-        let upstream = self.upstreams.get(upstream_name).ok_or_else(|| {
+        let upstream = upstreams.get(upstream_name).ok_or_else(|| {
             STREAM_CONNECTION_ERRORS_TOTAL
                 .with_label_values(&["routing"])
                 .inc();
@@ -596,10 +639,38 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_proxy_from_config_without_source_ips() {
-        let config = test_stream_config();
+    fn test_stream_proxy_reload_updates_router() {
+        let mut config = test_stream_config();
+        // No default upstream so unmatched SNI returns None
+        config.default_upstream = None;
         let proxy = StreamProxy::from_config(&config).unwrap();
-        assert!(proxy.source_ip_pool.is_none());
+
+        // Initially no route for "new.example.com"
+        assert!(
+            proxy
+                .router
+                .load()
+                .match_sni(Some("new.example.com"))
+                .is_none(),
+            "should not match before reload"
+        );
+
+        // Add a new SNI route and reload
+        config.upstreams.push(wicket_config::StreamUpstreamConfig {
+            name: "new".into(),
+            servers: vec!["127.0.0.1:9999".into()],
+        });
+        config
+            .sni_routes
+            .insert("new.example.com".into(), "new".into());
+
+        proxy.reload(&config).unwrap();
+
+        // After reload, the new route should match
+        assert_eq!(
+            proxy.router.load().match_sni(Some("new.example.com")),
+            Some("new")
+        );
     }
 
     #[test]
@@ -637,7 +708,7 @@ mod tests {
             .insert("api.example.com".into(), "api".into());
 
         let proxy = StreamProxy::from_config(&config).unwrap();
-        assert_eq!(proxy.upstreams.len(), 2);
+        assert_eq!(proxy.upstreams.load().len(), 2);
     }
 
     #[test]
@@ -666,7 +737,8 @@ mod tests {
             "127.0.0.1:8082".into(),
         ];
         let proxy = StreamProxy::from_config(&config).unwrap();
-        let upstream = proxy.upstreams.get("default").unwrap();
+        let upstream = proxy.upstreams.load();
+        let upstream = upstream.get("default").unwrap();
         assert_eq!(upstream.servers.len(), 3);
     }
 
@@ -675,7 +747,7 @@ mod tests {
         let config = test_stream_config();
         let proxy = StreamProxy::from_config(&config).unwrap();
         // Router should have default upstream configured
-        assert!(proxy.router.match_sni(None).is_some());
+        assert!(proxy.router.load().match_sni(None).is_some());
     }
 
     #[test]
@@ -690,8 +762,35 @@ mod tests {
             .insert("secure.example.com".into(), "secure".into());
 
         let proxy = StreamProxy::from_config(&config).unwrap();
-        let matched = proxy.router.match_sni(Some("secure.example.com"));
+        let router = proxy.router.load();
+        let matched = router.match_sni(Some("secure.example.com"));
         assert_eq!(matched, Some("secure"));
+    }
+
+    #[test]
+    fn test_stream_proxy_reload_updates_upstreams() {
+        let config = test_stream_config();
+        let proxy = StreamProxy::from_config(&config).unwrap();
+
+        // Initially only "default" upstream
+        assert_eq!(proxy.upstreams.load().len(), 1);
+        assert!(proxy.upstreams.load().contains_key("default"));
+
+        // Reload with an additional upstream
+        let mut new_config = config;
+        new_config
+            .upstreams
+            .push(wicket_config::StreamUpstreamConfig {
+                name: "extra".into(),
+                servers: vec!["127.0.0.1:7777".into()],
+            });
+
+        proxy.reload(&new_config).unwrap();
+
+        let upstreams = proxy.upstreams.load();
+        assert_eq!(upstreams.len(), 2);
+        assert!(upstreams.contains_key("default"));
+        assert!(upstreams.contains_key("extra"));
     }
 
     #[test]
