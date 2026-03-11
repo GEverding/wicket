@@ -1,16 +1,37 @@
 //! Shared context for reconcilers.
+//!
+//! ## Config regeneration flow
+//!
+//! Config generation is now split into a pure planning step and a side-effecting
+//! apply step:
+//!
+//! ```text
+//!   GatewayState (from store snapshot or API-list fallback)
+//!         |
+//!         v
+//!   GlobalConfigPlanner::plan()   -- pure, sync, no I/O
+//!         |
+//!         v
+//!   ConfigPlan { Update { toml_content, config_hash } | NoOp }
+//!         |
+//!         v
+//!   apply_config_plan()           -- async, patches ConfigMap + updates metrics
+//! ```
+//!
+//! `update_config` and `trigger_config_update` preserve their existing public
+//! signatures and behavior; they now delegate to the planner/applier pair.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::ConfigMap;
-use kube::api::{Api, Patch, PatchParams};
-use kube::{Client, ResourceExt};
+use kube::Client;
 use tokio::sync::RwLock;
 
+use super::config_applier::{apply_config_plan, read_current_config_hash, ConfigApplierInput};
 use super::config_generator::{GatewayState, WicketConfig};
+use super::config_planner::{GlobalConfigPlanInput, GlobalConfigPlanner};
 use super::store::SharedStore;
 use crate::crds::{Gateway, GatewayClass, HTTPRoute, TCPRoute, TLSRoute};
+use crate::reconcilers::contracts::{ConfigApplyResult, ConfigPlan, Planner};
 
 /// Shared context passed to all reconcilers.
 #[derive(Clone)]
@@ -88,48 +109,42 @@ impl Context {
     }
 
     /// Update the Wicket configuration by patching the ConfigMap.
+    ///
+    /// Delegates to the planner/applier pair:
+    /// 1. `GlobalConfigPlanner::plan()` serializes `config` to TOML and
+    ///    computes the hash (always `Update` since no current hash is supplied).
+    /// 2. `apply_config_plan()` patches the ConfigMap, updates in-memory state,
+    ///    and increments metrics.
     pub async fn update_config(&self, config: WicketConfig) -> Result<(), ConfigUpdateError> {
-        // Update in memory
-        {
-            let mut current = self.config.write().await;
-            *current = config.clone();
-        }
+        // Build a minimal GatewayState from the WicketConfig.  Because
+        // WicketConfig is already the rendered output (not raw Gateway API
+        // objects), we cannot reconstruct a GatewayState from it.  Instead we
+        // serialize it directly to TOML and wrap it in a ConfigPlan::Update,
+        // bypassing the planner's generate_config step.
+        //
+        // This preserves the existing `update_config` contract: callers pass
+        // an already-generated WicketConfig and expect it to be applied as-is.
+        let toml_content = toml::to_string_pretty(&config)
+            .map_err(|e| ConfigUpdateError::Serialization(e.to_string()))?;
 
-        // Serialize to TOML
-        let toml_content: String = toml::to_string_pretty(&config)
-            .map_err(|e: toml::ser::Error| ConfigUpdateError::Serialization(e.to_string()))?;
+        let config_hash = super::runtime_plan::sha256_hex(&toml_content);
 
-        // Update the ConfigMap
-        let api: Api<ConfigMap> =
-            Api::namespaced(self.client.clone(), &self.config_configmap_namespace);
+        let plan = ConfigPlan::Update {
+            toml_content,
+            config_hash,
+        };
 
-        let mut data = BTreeMap::new();
-        data.insert("wicket.toml".to_string(), toml_content);
+        let applier_input = ConfigApplierInput {
+            client: &self.client,
+            configmap_name: &self.config_configmap_name,
+            configmap_namespace: &self.config_configmap_namespace,
+            in_memory_config: &self.config,
+        };
 
-        let patch = serde_json::json!({
-            "data": data
-        });
+        apply_config_plan(&plan, &applier_input)
+            .await
+            .map_err(map_apply_error)?;
 
-        api.patch(
-            &self.config_configmap_name,
-            &PatchParams::apply("wicket-controller"),
-            &Patch::Merge(&patch),
-        )
-        .await
-        .map_err(|e| ConfigUpdateError::KubeApi(e.to_string()))?;
-
-        // Update metrics
-        crate::metrics::CONFIG_UPDATES_TOTAL
-            .with_label_values(&["success"])
-            .inc();
-        crate::metrics::CONFIG_LAST_UPDATE_TIMESTAMP.set(chrono::Utc::now().timestamp());
-        crate::metrics::CONFIG_GENERATION.inc();
-
-        tracing::info!(
-            configmap = %self.config_configmap_name,
-            namespace = %self.config_configmap_namespace,
-            "Configuration updated in ConfigMap"
-        );
         Ok(())
     }
 
@@ -142,18 +157,43 @@ impl Context {
 /// Errors that can occur during configuration updates.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigUpdateError {
+    /// A planning-phase error (pure logic; no I/O involved).
+    #[error("Config planning error: {0}")]
+    Planning(String),
+
+    /// TOML serialization or deserialization failed.
     #[error("Failed to serialize configuration: {0}")]
     Serialization(String),
 
+    /// A Kubernetes API call failed during the apply phase.
     #[error("Kubernetes API error: {0}")]
     KubeApi(String),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Map an `ApplyError` to the appropriate `ConfigUpdateError` variant,
+/// preserving the planner-vs-apply distinction.
+fn map_apply_error(e: crate::reconcilers::contracts::ApplyError) -> ConfigUpdateError {
+    use crate::reconcilers::contracts::ApplyError;
+    match e {
+        ApplyError::Serialization(msg) => ConfigUpdateError::Serialization(msg),
+        ApplyError::KubeApi(msg) => ConfigUpdateError::KubeApi(msg),
+        ApplyError::Filesystem(msg) => ConfigUpdateError::KubeApi(msg),
+        ApplyError::NotOwned { namespace, name } => ConfigUpdateError::KubeApi(format!(
+            "object {}/{} is not owned by wicket-controller",
+            namespace, name
+        )),
+    }
 }
 
 /// Trigger a full configuration update by loading all resources and regenerating config.
 ///
 /// ## Cache-first strategy
 ///
-/// When the shared store is ready, we use its snapshot directly — no API
+/// When the shared store is ready, we use its snapshot directly -- no API
 /// list calls needed.  When the store is not yet ready (startup warm-up),
 /// we fall back to the existing full-list API path.
 ///
@@ -162,8 +202,14 @@ pub enum ConfigUpdateError {
 /// The store is only marked ready (via `ingest_gateway_state`) when **all**
 /// core list calls succeed.  If any list fails, we still generate config
 /// from whatever partial data we have (existing behavior), but we do NOT
-/// promote the store to ready — so future calls continue to fall back to
+/// promote the store to ready -- so future calls continue to fall back to
 /// the API-list path until a fully-successful list completes.
+///
+/// ## Planner/applier split
+///
+/// Config generation is now split:
+/// - `GlobalConfigPlanner::plan()` is the pure step (snapshot -> `ConfigPlan`).
+/// - `apply_config_plan()` is the side-effecting step (ConfigMap patch + metrics).
 pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), ConfigUpdateError> {
     use super::service::load_all_service_endpoints;
 
@@ -172,8 +218,7 @@ pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), Co
     // ── Cache-first path ──────────────────────────────────────────────────────
     if let Some(state) = ctx.store.snapshot().await {
         tracing::debug!(reason = %reason, "Using shared store snapshot for config generation");
-        let config = state.generate_config();
-        ctx.update_config(config).await?;
+        apply_from_gateway_state(ctx, state).await?;
         tracing::debug!(reason = %reason, "Configuration update completed (cache path)");
         return Ok(());
     }
@@ -188,11 +233,11 @@ pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), Co
     let mut all_lists_ok = true;
 
     // Load all Gateways (only Wicket-managed ones)
-    let gw_api: Api<Gateway> = Api::all(ctx.client.clone());
+    let gw_api: kube::api::Api<Gateway> = kube::api::Api::all(ctx.client.clone());
     match gw_api.list(&Default::default()).await {
         Ok(gateways) => {
             for gateway in gateways.items {
-                let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
+                let gc_api: kube::api::Api<GatewayClass> = kube::api::Api::all(ctx.client.clone());
                 let is_wicket = gc_api
                     .get(&gateway.spec.gateway_class_name)
                     .await
@@ -201,8 +246,8 @@ pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), Co
 
                 if is_wicket {
                     let gw_key = GatewayState::key(
-                        gateway.namespace().as_deref().unwrap_or("default"),
-                        &gateway.name_any(),
+                        gateway.metadata.namespace.as_deref().unwrap_or("default"),
+                        &kube::ResourceExt::name_any(&gateway),
                     );
                     state.gateways.insert(gw_key, gateway);
                 }
@@ -215,13 +260,13 @@ pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), Co
     }
 
     // Load all HTTPRoutes
-    let route_api: Api<HTTPRoute> = Api::all(ctx.client.clone());
+    let route_api: kube::api::Api<HTTPRoute> = kube::api::Api::all(ctx.client.clone());
     match route_api.list(&Default::default()).await {
         Ok(routes) => {
             for route in routes.items {
                 let route_key = GatewayState::key(
-                    route.namespace().as_deref().unwrap_or("default"),
-                    &route.name_any(),
+                    route.metadata.namespace.as_deref().unwrap_or("default"),
+                    &kube::ResourceExt::name_any(&route),
                 );
                 state.http_routes.insert(route_key, route);
             }
@@ -233,13 +278,13 @@ pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), Co
     }
 
     // Load all TCPRoutes
-    let tcp_route_api: Api<TCPRoute> = Api::all(ctx.client.clone());
+    let tcp_route_api: kube::api::Api<TCPRoute> = kube::api::Api::all(ctx.client.clone());
     match tcp_route_api.list(&Default::default()).await {
         Ok(routes) => {
             for route in routes.items {
                 let route_key = GatewayState::key(
-                    route.namespace().as_deref().unwrap_or("default"),
-                    &route.name_any(),
+                    route.metadata.namespace.as_deref().unwrap_or("default"),
+                    &kube::ResourceExt::name_any(&route),
                 );
                 state.tcp_routes.insert(route_key, route);
             }
@@ -251,13 +296,13 @@ pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), Co
     }
 
     // Load all TLSRoutes
-    let tls_route_api: Api<TLSRoute> = Api::all(ctx.client.clone());
+    let tls_route_api: kube::api::Api<TLSRoute> = kube::api::Api::all(ctx.client.clone());
     match tls_route_api.list(&Default::default()).await {
         Ok(routes) => {
             for route in routes.items {
                 let route_key = GatewayState::key(
-                    route.namespace().as_deref().unwrap_or("default"),
-                    &route.name_any(),
+                    route.metadata.namespace.as_deref().unwrap_or("default"),
+                    &kube::ResourceExt::name_any(&route),
                 );
                 state.tls_routes.insert(route_key, route);
             }
@@ -279,14 +324,81 @@ pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), Co
     } else {
         tracing::warn!(
             reason = %reason,
-            "Skipping store ingestion due to partial list failures;              store remains not-ready for future fallback retries"
+            "Skipping store ingestion due to partial list failures; \
+             store remains not-ready for future fallback retries"
         );
     }
 
-    // Generate and update config from whatever we got (preserves existing behavior).
-    let config = state.generate_config();
-    ctx.update_config(config).await?;
+    // Generate and apply config from whatever we got (preserves existing behavior).
+    apply_from_gateway_state(ctx, state).await?;
 
     tracing::debug!(reason = %reason, "Configuration update completed (API-list fallback path)");
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal: plan + apply from a GatewayState
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Plan and apply config from a `GatewayState`.
+///
+/// This is the shared inner step used by both the cache-first path and the
+/// API-list fallback path in `trigger_config_update`.
+///
+/// ## Steps
+///
+/// 1. Read the current `wicket.io/config-revision` annotation from the
+///    ConfigMap (one lightweight GET).  This is the only I/O before planning.
+/// 2. Run the pure planner.  When the generated hash matches the annotation
+///    the planner returns `ConfigPlan::NoOp` and the ConfigMap patch is
+///    skipped; the in-memory view is still synced from the plan content.
+/// 3. Apply the plan (ConfigMap patch + in-memory sync + metrics).
+async fn apply_from_gateway_state(
+    ctx: &Context,
+    state: GatewayState,
+) -> Result<(), ConfigUpdateError> {
+    // ── 1. Read current revision from ConfigMap annotation ────────────────────
+    // A 404 (ConfigMap not yet created) is treated as "no current hash" so the
+    // planner always returns Update on first run.  Hard API errors are surfaced
+    // as KubeApi so the reconcile cycle requeues with backoff.
+    let current_config_hash = read_current_config_hash(
+        &ctx.client,
+        &ctx.config_configmap_name,
+        &ctx.config_configmap_namespace,
+    )
+    .await
+    .map_err(|e| ConfigUpdateError::KubeApi(e.to_string()))?;
+
+    // ── 2. Pure planning step ─────────────────────────────────────────────────
+    let planner = GlobalConfigPlanner;
+    let plan_input = GlobalConfigPlanInput {
+        gateway_state: state,
+        current_config_hash,
+    };
+    let plan: ConfigPlan = planner
+        .plan(&plan_input)
+        .map_err(|e| ConfigUpdateError::Planning(e.to_string()))?;
+
+    // ── 3. Apply step ─────────────────────────────────────────────────────────
+    let applier_input = ConfigApplierInput {
+        client: &ctx.client,
+        configmap_name: &ctx.config_configmap_name,
+        configmap_namespace: &ctx.config_configmap_namespace,
+        in_memory_config: &ctx.config,
+    };
+
+    let result = apply_config_plan(&plan, &applier_input)
+        .await
+        .map_err(map_apply_error)?;
+
+    match result {
+        ConfigApplyResult::Updated { ref config_hash } => {
+            tracing::debug!(config_hash = %config_hash, "Config applied");
+        }
+        ConfigApplyResult::NoOp => {
+            tracing::debug!("Config apply was a no-op (hash unchanged); in-memory view synced");
+        }
+    }
+
     Ok(())
 }
