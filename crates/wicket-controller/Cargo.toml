@@ -41,6 +41,9 @@ lazy_static = "1.4"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
 
+# Hashing (config_hash / spec_hash for GatewayRuntimePlan)
+sha2 = "0.10"
+
 # Utilities
 anyhow = { workspace = true }
 thiserror = { workspace = true }

@@ -147,6 +147,47 @@ pub async fn run_gateway_class_controller(ctx: Arc<Context>) -> Result<(), kube:
 
     let api: Api<GatewayClass> = Api::all(ctx.client.clone());
 
+    // Retry the initial list until it succeeds.  A transient API error must
+    // not leave the store permanently stuck in NotReady: the Controller watch
+    // loop only fires per-object reconcile events and never re-signals "list
+    // complete", so without an explicit retry here the readiness flag would
+    // never be set after a startup failure.
+    //
+    // An empty list is a valid observation (no GatewayClasses exist) and must
+    // still set the flag.  Only a successful list (Ok) sets the flag.
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match api.list(&Default::default()).await {
+            Ok(list) => {
+                for gc in list.items {
+                    if gc.is_wicket_managed() {
+                        let name = gc.metadata.name.clone().unwrap_or_default();
+                        ctx.store.upsert_gateway_class(name, gc).await;
+                    }
+                }
+                // Mark the resource class as listed only after a successful list.
+                // An empty list is a valid observation; a failed list is not.
+                ctx.store.mark_gateway_classes_listed().await;
+                tracing::debug!(
+                    attempt,
+                    "GatewayClass initial list complete; store flag set"
+                );
+                break;
+            }
+            Err(e) => {
+                let backoff = std::cmp::min(attempt * 2, 30);
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    backoff_secs = backoff,
+                    "Initial GatewayClass list failed; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+        }
+    }
+
     WATCH_CONNECTIONS_ACTIVE
         .with_label_values(&["GatewayClass"])
         .set(1);
