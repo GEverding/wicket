@@ -62,6 +62,12 @@ pub async fn reconcile_referencegrant(
         .upsert_reference_grant(key, (*grant).clone())
         .await;
 
+    // Trigger a config/planner recompute so policy changes take effect
+    // immediately rather than waiting for an unrelated event.
+    trigger_config_update(&ctx, "ReferenceGrant upserted")
+        .await
+        .map_err(|e| ReferenceGrantError::ConfigError(e.to_string()))?;
+
     // Update the total count of ReferenceGrants
     update_referencegrant_metrics(&ctx.client).await;
 
@@ -124,6 +130,47 @@ pub async fn run_referencegrant_controller(ctx: Arc<Context>) -> Result<(), kube
     } else {
         Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
     };
+
+    // Retry the initial list until it succeeds.  A transient API error must
+    // not leave the store permanently stuck in NotReady: the Controller watch
+    // loop only fires per-object reconcile events and never re-signals "list
+    // complete", so without an explicit retry here the readiness flag would
+    // never be set after a startup failure.
+    //
+    // An empty list is a valid observation (no ReferenceGrants exist) and must
+    // still set the flag.  Only a successful list (Ok) sets the flag.
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match api.list(&Default::default()).await {
+            Ok(list) => {
+                for grant in list.items {
+                    let ns = grant.metadata.namespace.clone().unwrap_or_default();
+                    let name = grant.metadata.name.clone().unwrap_or_default();
+                    let key = format!("{}/{}", ns, name);
+                    ctx.store.upsert_reference_grant(key, grant).await;
+                }
+                // Mark the resource class as listed only after a successful list.
+                // An empty list is a valid observation; a failed list is not.
+                ctx.store.mark_reference_grants_listed().await;
+                tracing::debug!(
+                    attempt,
+                    "ReferenceGrant initial list complete; store flag set"
+                );
+                break;
+            }
+            Err(e) => {
+                let backoff = std::cmp::min(attempt * 2, 30);
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    backoff_secs = backoff,
+                    "Initial ReferenceGrant list failed; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+        }
+    }
 
     WATCH_CONNECTIONS_ACTIVE
         .with_label_values(&["ReferenceGrant"])

@@ -142,7 +142,13 @@ impl CompiledRoute {
             host_matcher,
             path_matcher,
             methods,
-            headers: config.match_rules.headers.clone(),
+            // BTreeMap -> HashMap: routing only needs O(1) lookup, not sorted order.
+            headers: config
+                .match_rules
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         })
     }
 
@@ -261,6 +267,7 @@ impl PathMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use wicket_config::RouteMatch as ConfigRouteMatch;
 
     fn make_route(
@@ -279,7 +286,7 @@ mod tests {
                 path_prefix: path_prefix.map(String::from),
                 path: path.map(String::from),
                 methods: methods.into_iter().map(String::from).collect(),
-                headers: HashMap::new(),
+                headers: BTreeMap::new(),
             },
             tls: None,
             filters: None,

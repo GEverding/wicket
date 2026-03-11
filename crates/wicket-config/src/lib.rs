@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
@@ -310,9 +310,12 @@ pub struct RouteMatch {
     #[serde(default)]
     pub methods: Vec<String>,
 
-    /// Headers to match (exact match)
+    /// Headers to match (exact match).
+    ///
+    /// Uses `BTreeMap` so that TOML serialization is deterministic (keys are
+    /// emitted in sorted order), which keeps `config_hash` stable across runs.
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: BTreeMap<String, String>,
 }
 
 /// Stream (L4) proxy configuration.

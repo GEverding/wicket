@@ -1,7 +1,7 @@
 //! Configuration generator that converts Gateway API resources to Wicket TOML config.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::warn;
 
 use crate::crds::{Gateway, HTTPRoute, Listener, ProtocolType, TCPRoute, TLSRoute};
@@ -13,8 +13,10 @@ use wicket_config::{RouteConfig, RouteMatch};
 pub struct WicketConfig {
     pub server: ServerConfig,
 
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub upstreams: HashMap<String, UpstreamConfig>,
+    /// Upstream clusters keyed by name.  Uses `BTreeMap` so that TOML
+    /// serialization is deterministic (keys are emitted in sorted order).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub upstreams: BTreeMap<String, UpstreamConfig>,
 
     /// Routes using the canonical wicket-config RouteConfig type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -161,8 +163,10 @@ pub struct StreamConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_protocol: Option<String>,
 
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub sni_routes: HashMap<String, String>,
+    /// SNI routing table.  Uses `BTreeMap` so that TOML serialization is
+    /// deterministic (keys are emitted in sorted order).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sni_routes: BTreeMap<String, String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_upstream: Option<String>,
@@ -218,6 +222,313 @@ impl GatewayState {
         format!("{}/{}", namespace, name)
     }
 
+    /// Generate Wicket configuration with deterministic output.
+    ///
+    /// Identical to [`generate_config`] but iterates all internal `HashMap`
+    /// fields in sorted key order so that the resulting `WicketConfig` --
+    /// and therefore the serialized TOML -- is identical for the same logical
+    /// state regardless of `HashMap` insertion order.
+    ///
+    /// Use this method whenever the output will be hashed or compared for
+    /// change detection.
+    pub fn generate_config_deterministic(&self) -> WicketConfig {
+        // Build a temporary GatewayState whose maps are backed by sorted
+        // iteration.  We do this by constructing a new GatewayState whose
+        // HashMap fields contain the same entries but were inserted in sorted
+        // key order.  Because HashMap does not guarantee insertion-order
+        // iteration, we instead shadow the fields with BTreeMap-ordered
+        // iterators inside generate_config by building a wrapper that
+        // iterates in sorted order.
+        //
+        // The cleanest approach without duplicating generate_config logic is
+        // to build a new GatewayState with the same entries inserted in
+        // sorted key order.  HashMap iteration order is not stable across
+        // runs, but inserting in a fixed order does not help either.
+        //
+        // Instead we call a private sorted-iteration variant directly.
+        self.generate_config_sorted()
+    }
+
+    /// Internal: generate config by iterating all maps in sorted key order.
+    fn generate_config_sorted(&self) -> WicketConfig {
+        let mut config = WicketConfig::default();
+        let mut upstreams: BTreeMap<String, UpstreamConfig> = BTreeMap::new();
+        let mut routes = Vec::new();
+        let mut tls_certs = Vec::new();
+        let mut stream_config: Option<StreamConfig> = None;
+
+        // Collect and sort gateway entries.
+        let mut gw_entries: Vec<(&String, &Gateway)> = self.gateways.iter().collect();
+        gw_entries.sort_by_key(|(k, _)| k.as_str());
+
+        // Determine listeners from gateways (sorted).
+        let mut http_listeners: Vec<(String, &Listener)> = Vec::new();
+        let mut tcp_listeners: Vec<(String, &Listener)> = Vec::new();
+
+        for (gw_key, gateway) in &gw_entries {
+            for listener in &gateway.spec.listeners {
+                match listener.protocol {
+                    ProtocolType::HTTP | ProtocolType::HTTPS => {
+                        http_listeners.push(((*gw_key).clone(), listener));
+                    }
+                    ProtocolType::TCP | ProtocolType::TLS => {
+                        tcp_listeners.push(((*gw_key).clone(), listener));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Set server listen address from first HTTP listener.
+        if let Some((_, listener)) = http_listeners.first() {
+            config.server.listen = format!("0.0.0.0:{}", listener.port);
+        }
+
+        // Process HTTPRoutes in sorted key order.
+        let mut http_route_entries: Vec<(&String, &HTTPRoute)> = self.http_routes.iter().collect();
+        http_route_entries.sort_by_key(|(k, _)| k.as_str());
+
+        for (route_key, route) in &http_route_entries {
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
+
+            for (rule_idx, rule) in route.spec.rules.iter().enumerate() {
+                let upstream_name = format!("{}-{}-rule{}", route_ns, route_name, rule_idx);
+
+                let mut backend_addrs = Vec::new();
+                for backend_ref in &rule.backend_refs {
+                    let backend_ns = backend_ref
+                        .backend_ref
+                        .namespace
+                        .as_deref()
+                        .unwrap_or(route_ns);
+                    let backend_key = Self::key(backend_ns, &backend_ref.backend_ref.name);
+
+                    if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
+                        // Sort endpoints for determinism.
+                        let mut sorted = endpoints.endpoints.clone();
+                        sorted.sort();
+                        backend_addrs.extend(sorted);
+                    } else {
+                        let port = backend_ref.backend_ref.port.unwrap_or(80);
+                        backend_addrs.push(format!(
+                            "{}.{}.svc.cluster.local:{}",
+                            backend_ref.backend_ref.name, backend_ns, port
+                        ));
+                    }
+                }
+
+                if !backend_addrs.is_empty() {
+                    upstreams.insert(
+                        upstream_name.clone(),
+                        UpstreamConfig {
+                            backends: backend_addrs,
+                            strategy: "round_robin".to_string(),
+                            health_check: None,
+                        },
+                    );
+
+                    if !rule.filters.is_empty() {
+                        tracing::warn!(
+                            route = %format!("{}/{}", route_ns, route_name),
+                            rule_idx = rule_idx,
+                            filter_count = rule.filters.len(),
+                            "HTTPRoute rule has filters which are not yet supported and will be \
+                             skipped; generated route will have no filters applied"
+                        );
+                    }
+
+                    let timeout = rule.timeouts.as_ref().and_then(|t| {
+                        t.request
+                            .as_ref()
+                            .and_then(|d| Self::parse_duration_to_secs(d))
+                    });
+
+                    if rule.matches.is_empty() {
+                        let route_config = wicket_config::RouteConfig {
+                            name: Some(format!("{}-{}-rule{}", route_ns, route_name, rule_idx)),
+                            upstream: upstream_name.clone(),
+                            match_rules: wicket_config::RouteMatch {
+                                host: route.spec.hostnames.first().cloned(),
+                                path: None,
+                                path_prefix: Some("/".to_string()),
+                                methods: vec![],
+                                headers: BTreeMap::new(),
+                            },
+                            tls: None,
+                            filters: None,
+                            timeout,
+                        };
+                        routes.push(route_config);
+                    } else {
+                        for (match_idx, route_match) in rule.matches.iter().enumerate() {
+                            let (path, path_prefix) = if let Some(ref path_match) = route_match.path
+                            {
+                                match path_match.type_ {
+                                    crate::crds::PathMatchType::Exact => {
+                                        (Some(path_match.value.clone()), None)
+                                    }
+                                    crate::crds::PathMatchType::PathPrefix => {
+                                        (None, Some(path_match.value.clone()))
+                                    }
+                                    crate::crds::PathMatchType::RegularExpression => {
+                                        tracing::warn!(
+                                            route = %format!("{}/{}", route_ns, route_name),
+                                            rule_idx = rule_idx,
+                                            match_idx = match_idx,
+                                            pattern = %path_match.value,
+                                            "Skipping route match: RegularExpression path \
+                                             matching is not yet supported in wicket-config \
+                                             RouteMatch (tracked in bd-89m)"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                (None, Some("/".to_string()))
+                            };
+
+                            let methods: Vec<String> = route_match
+                                .method
+                                .iter()
+                                .map(|m| format!("{:?}", m))
+                                .collect();
+
+                            // BTreeMap preserves sorted key order for deterministic serialization.
+                            let headers: BTreeMap<String, String> = route_match
+                                .headers
+                                .iter()
+                                .map(|h| (h.name.clone(), h.value.clone()))
+                                .collect();
+
+                            let route_config = wicket_config::RouteConfig {
+                                name: Some(format!(
+                                    "{}-{}-rule{}-match{}",
+                                    route_ns, route_name, rule_idx, match_idx
+                                )),
+                                upstream: upstream_name.clone(),
+                                match_rules: wicket_config::RouteMatch {
+                                    host: route.spec.hostnames.first().cloned(),
+                                    path,
+                                    path_prefix,
+                                    methods,
+                                    headers,
+                                },
+                                tls: None,
+                                filters: None,
+                                timeout,
+                            };
+                            routes.push(route_config);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process TLS configuration from Gateway listeners (sorted).
+        for (gw_key, gateway) in &gw_entries {
+            let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
+            let _ = gw_key; // key used only for sort order
+
+            for listener in &gateway.spec.listeners {
+                if let Some(ref tls_config) = listener.tls {
+                    for cert_ref in &tls_config.certificate_refs {
+                        let cert_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
+                        let cert_key = Self::key(cert_ns, &cert_ref.name);
+
+                        if let Some((cert_path, key_path)) = self.tls_secrets.get(&cert_key) {
+                            tls_certs.push(CertConfig {
+                                name: cert_ref.name.clone(),
+                                cert: cert_path.clone(),
+                                key: key_path.clone(),
+                                domains: listener.hostname.iter().cloned().collect(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process TCPRoutes and TLSRoutes for stream config (sorted).
+        if !self.tcp_routes.is_empty() || !self.tls_routes.is_empty() {
+            let mut sni_routes: Vec<(String, String)> = Vec::new();
+            let mut stream_upstreams = Vec::new();
+
+            let mut tls_route_entries: Vec<(&String, &TLSRoute)> = self.tls_routes.iter().collect();
+            tls_route_entries.sort_by_key(|(k, _)| k.as_str());
+
+            for (_route_key, route) in &tls_route_entries {
+                let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+                let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
+                let _ = route_name;
+
+                for hostname in &route.spec.hostnames {
+                    for rule in &route.spec.rules {
+                        for backend_ref in &rule.backend_refs {
+                            let upstream_name = format!("{}-{}", route_ns, backend_ref.name);
+                            let backend_ns = backend_ref.namespace.as_deref().unwrap_or(route_ns);
+                            let backend_key = Self::key(backend_ns, &backend_ref.name);
+
+                            let servers =
+                                if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
+                                    let mut sorted = endpoints.endpoints.clone();
+                                    sorted.sort();
+                                    sorted
+                                } else {
+                                    let port = backend_ref.port.unwrap_or(443);
+                                    vec![format!(
+                                        "{}.{}.svc.cluster.local:{}",
+                                        backend_ref.name, backend_ns, port
+                                    )]
+                                };
+
+                            stream_upstreams.push(StreamUpstreamConfig {
+                                name: upstream_name.clone(),
+                                servers,
+                            });
+
+                            sni_routes.push((hostname.clone(), upstream_name));
+                        }
+                    }
+                }
+            }
+
+            // Sort SNI routes for determinism, then collect into BTreeMap.
+            sni_routes.sort_by_key(|(k, _)| k.clone());
+            let sni_routes_map: BTreeMap<String, String> = sni_routes.into_iter().collect();
+
+            if let Some((_, listener)) = tcp_listeners.first() {
+                stream_config = Some(StreamConfig {
+                    listen: format!("0.0.0.0:{}", listener.port),
+                    backlog: 8000,
+                    reuseport: true,
+                    proxy_protocol: None,
+                    sni_routes: sni_routes_map,
+                    default_upstream: None,
+                    upstreams: stream_upstreams,
+                });
+            }
+        }
+
+        if !tls_certs.is_empty() {
+            config.tls = Some(TlsConfig {
+                mode: "file".to_string(),
+                file: Some(FileTlsConfig {
+                    watch: true,
+                    poll_interval_secs: 30,
+                    certs: tls_certs,
+                }),
+                acme: None,
+            });
+        }
+
+        config.upstreams = upstreams;
+        config.routes = routes;
+        config.stream = stream_config;
+
+        config
+    }
+
     /// Parse Duration string to seconds.
     fn parse_duration_to_secs(duration: &str) -> Option<u64> {
         // Gateway API uses Go duration format like "10s", "1m", "1h"
@@ -240,7 +551,7 @@ impl GatewayState {
     /// Generate Wicket configuration from the current state.
     pub fn generate_config(&self) -> WicketConfig {
         let mut config = WicketConfig::default();
-        let mut upstreams = HashMap::new();
+        let mut upstreams: BTreeMap<String, UpstreamConfig> = BTreeMap::new();
         let mut routes = Vec::new();
         let mut tls_certs = Vec::new();
         let mut stream_config: Option<StreamConfig> = None;
@@ -337,7 +648,7 @@ impl GatewayState {
                                 path: None,
                                 path_prefix: Some("/".to_string()),
                                 methods: vec![],
-                                headers: HashMap::new(),
+                                headers: BTreeMap::new(),
                             },
                             tls: None,
                             filters: None,
@@ -380,7 +691,8 @@ impl GatewayState {
                                 .map(|m| format!("{:?}", m))
                                 .collect();
 
-                            let headers: HashMap<String, String> = route_match
+                            // BTreeMap preserves sorted key order for deterministic serialization.
+                            let headers: BTreeMap<String, String> = route_match
                                 .headers
                                 .iter()
                                 .map(|h| (h.name.clone(), h.value.clone()))
@@ -435,7 +747,7 @@ impl GatewayState {
 
         // Process TCPRoutes and TLSRoutes for stream config
         if !self.tcp_routes.is_empty() || !self.tls_routes.is_empty() {
-            let mut sni_routes = HashMap::new();
+            let mut sni_routes: BTreeMap<String, String> = BTreeMap::new();
             let mut stream_upstreams = Vec::new();
 
             for (route_key, route) in &self.tls_routes {
@@ -1208,5 +1520,149 @@ mod tests {
                 route_cfg.name.as_deref().unwrap_or("<unnamed>")
             );
         }
+    }
+
+    /// Test: header matches are serialized in deterministic (sorted) key order.
+    ///
+    /// Inserts headers in reverse-alphabetical order in the CRD match spec and
+    /// verifies that both `generate_config` and `generate_config_deterministic`
+    /// produce identical TOML output regardless of insertion order, and that the
+    /// TOML keys appear in sorted order.
+    #[test]
+    fn test_header_match_serialization_is_deterministic() {
+        use crate::crds::{HTTPHeaderMatch, HTTPRouteMatch, PathMatchType};
+
+        let mut state = GatewayState::default();
+
+        let gateway = Gateway {
+            metadata: ObjectMeta {
+                name: Some("gw".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![Listener {
+                    name: "http".to_string(),
+                    hostname: None,
+                    port: 8080,
+                    protocol: ProtocolType::HTTP,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        };
+        state
+            .gateways
+            .insert(GatewayState::key("default", "gw"), gateway);
+
+        // Headers listed in reverse-alphabetical order to expose any HashMap
+        // nondeterminism: if the map is iterated in insertion order the TOML
+        // would emit "z-header" before "a-header".
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some("header-route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HTTPRouteSpec {
+                parent_refs: vec![],
+                hostnames: vec!["example.com".to_string()],
+                rules: vec![HTTPRouteRule {
+                    name: None,
+                    matches: vec![HTTPRouteMatch {
+                        path: Some(crate::crds::HTTPPathMatch {
+                            type_: PathMatchType::PathPrefix,
+                            value: "/api".to_string(),
+                        }),
+                        headers: vec![
+                            HTTPHeaderMatch {
+                                type_: crate::crds::HeaderMatchType::Exact,
+                                name: "z-header".to_string(),
+                                value: "z-value".to_string(),
+                            },
+                            HTTPHeaderMatch {
+                                type_: crate::crds::HeaderMatchType::Exact,
+                                name: "m-header".to_string(),
+                                value: "m-value".to_string(),
+                            },
+                            HTTPHeaderMatch {
+                                type_: crate::crds::HeaderMatchType::Exact,
+                                name: "a-header".to_string(),
+                                value: "a-value".to_string(),
+                            },
+                        ],
+                        query_params: vec![],
+                        method: None,
+                    }],
+                    filters: vec![],
+                    backend_refs: vec![HTTPBackendRef {
+                        backend_ref: crate::crds::BackendRef {
+                            group: "".to_string(),
+                            kind: "Service".to_string(),
+                            name: "backend".to_string(),
+                            namespace: None,
+                            port: Some(80),
+                            weight: 1,
+                        },
+                        filters: vec![],
+                    }],
+                    timeouts: None,
+                }],
+            },
+            status: None,
+        };
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "header-route"), route);
+
+        state.service_endpoints.insert(
+            GatewayState::key("default", "backend"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "backend".to_string(),
+                port: 80,
+                endpoints: vec!["10.0.0.1:80".to_string()],
+            },
+        );
+
+        // Both paths must produce the same TOML.
+        let cfg_a = state.generate_config();
+        let cfg_b = state.generate_config_deterministic();
+
+        let toml_a = toml::to_string(&cfg_a).expect("serialize cfg_a");
+        let toml_b = toml::to_string(&cfg_b).expect("serialize cfg_b");
+        assert_eq!(
+            toml_a, toml_b,
+            "generate_config and generate_config_deterministic must produce identical TOML"
+        );
+
+        // Headers in the generated RouteMatch must be in sorted key order.
+        assert_eq!(cfg_a.routes.len(), 1);
+        let headers = &cfg_a.routes[0].match_rules.headers;
+        let keys: Vec<&str> = headers.keys().map(String::as_str).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            keys, sorted,
+            "header keys must be in sorted order in the generated RouteMatch"
+        );
+
+        // Verify all three headers are present with correct values.
+        assert_eq!(headers.get("a-header").map(String::as_str), Some("a-value"));
+        assert_eq!(headers.get("m-header").map(String::as_str), Some("m-value"));
+        assert_eq!(headers.get("z-header").map(String::as_str), Some("z-value"));
+
+        // The serialized TOML must contain the keys in sorted order.
+        let a_pos = toml_a.find("a-header").expect("a-header in TOML");
+        let m_pos = toml_a.find("m-header").expect("m-header in TOML");
+        let z_pos = toml_a.find("z-header").expect("z-header in TOML");
+        assert!(
+            a_pos < m_pos && m_pos < z_pos,
+            "TOML header keys must appear in sorted order"
+        );
     }
 }
