@@ -15,7 +15,7 @@ use kube::{
         controller::{Action, Controller},
         watcher::Config,
     },
-    Client, Resource, ResourceExt,
+    Client, ResourceExt,
 };
 
 use crate::crds::{Gateway, GatewayClass, ReferenceGrant};

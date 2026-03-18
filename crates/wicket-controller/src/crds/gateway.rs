@@ -67,19 +67,14 @@ pub struct Listener {
 }
 
 /// ProtocolType defines the protocol of a Listener.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub enum ProtocolType {
+    #[default]
     HTTP,
     HTTPS,
     TLS,
     TCP,
     UDP,
-}
-
-impl Default for ProtocolType {
-    fn default() -> Self {
-        ProtocolType::HTTP
-    }
 }
 
 /// GatewayTLSConfig describes TLS configuration for a Gateway.

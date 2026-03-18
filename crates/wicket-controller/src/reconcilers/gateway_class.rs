@@ -10,10 +10,10 @@ use kube::{
         controller::{Action, Controller},
         watcher::Config,
     },
-    Client, Resource, ResourceExt,
+    Client, ResourceExt,
 };
 
-use crate::crds::{Condition, GatewayClass, GatewayClassStatus, WICKET_CONTROLLER_NAME};
+use crate::crds::{Condition, GatewayClass, GatewayClassStatus};
 use crate::metrics::{ReconcileMetrics, GATEWAY_CLASSES_TOTAL};
 
 use super::context::Context;

@@ -54,6 +54,7 @@ pub struct LeaseState {
 
 /// Leader election coordinator.
 pub struct LeaderElection {
+    #[allow(dead_code)]
     client: Client,
     config: LeaderElectionConfig,
     api: Api<Lease>,
@@ -165,7 +166,6 @@ impl LeaderElection {
 
     /// Update an existing lease.
     async fn update_lease(&self, lease: &Lease) -> Result<LeaseState, kube::Error> {
-        use k8s_openapi::api::coordination::v1::LeaseSpec;
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 
         let now = Utc::now();

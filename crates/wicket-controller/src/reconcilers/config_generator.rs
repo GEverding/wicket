@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use tracing::warn;
 
-use crate::crds::{Gateway, HTTPRoute, Listener, ProtocolType, TCPRoute, TLSRoute};
+use crate::crds::{
+    Gateway, HTTPRoute, Listener, ProtocolType, RouteParentStatus, TCPRoute, TLSRoute,
+    WICKET_CONTROLLER_NAME,
+};
 
 use wicket_config::{RouteConfig, RouteMatch};
 
@@ -216,10 +219,74 @@ pub struct GatewayState {
     pub tls_secrets: HashMap<String, (String, String)>,
 }
 
+/// Returns `true` if `parents` contains at least one entry where
+/// `controller_name == WICKET_CONTROLLER_NAME` and the `Accepted` condition
+/// status is `"True"`.
+///
+/// This is the single authoritative implementation of the render-time
+/// accepted-parent check.  All three route-type wrappers
+/// (`http_route_is_accepted`, `tcp_route_is_accepted`, `tls_route_is_accepted`)
+/// delegate here so the semantics are identical across route types.
+///
+/// Exposed as `pub(crate)` so `context.rs` can reuse it in the fallback path
+/// instead of maintaining three separate copies.
+pub(crate) fn parents_accepted_by_wicket(parents: &[RouteParentStatus]) -> bool {
+    parents.iter().any(|p| {
+        p.controller_name == WICKET_CONTROLLER_NAME
+            && p.conditions
+                .iter()
+                .any(|c| c.type_ == "Accepted" && c.status == "True")
+    })
+}
+
 impl GatewayState {
     /// Create a key from namespace and name.
     pub fn key(namespace: &str, name: &str) -> String {
         format!("{}/{}", namespace, name)
+    }
+
+    /// Returns `true` if the HTTPRoute has at least one `status.parents` entry
+    /// where `controller_name == WICKET_CONTROLLER_NAME` and the `Accepted`
+    /// condition is `True`.
+    ///
+    /// Fail-closed: routes with no status (not yet reconciled) are excluded.
+    fn http_route_is_accepted(route: &HTTPRoute) -> bool {
+        let parents = match &route.status {
+            Some(s) => s.parents.as_slice(),
+            None => return false,
+        };
+        parents_accepted_by_wicket(parents)
+    }
+
+    /// Returns `true` if the TCPRoute has at least one `status.parents` entry
+    /// where `controller_name == WICKET_CONTROLLER_NAME` and the `Accepted`
+    /// condition is `True`.
+    ///
+    /// Fail-closed: routes with no status (not yet reconciled) are excluded.
+    fn tcp_route_is_accepted(route: &TCPRoute) -> bool {
+        let parents = match &route.status {
+            Some(s) => s.parents.as_slice(),
+            None => return false,
+        };
+        parents_accepted_by_wicket(parents)
+    }
+
+    /// Returns `true` if the TLSRoute has at least one `status.parents` entry
+    /// where `controller_name == WICKET_CONTROLLER_NAME` and the `Accepted`
+    /// condition is `True`.
+    ///
+    /// This is the render-time parity guard: routes that were never accepted by
+    /// this controller (or whose status has not yet been written) are excluded
+    /// from the generated stream config.  The store already only holds accepted
+    /// routes, so in normal operation this is belt-and-suspenders; it becomes
+    /// the primary guard if a route is injected into the store by other means.
+    fn tls_route_is_accepted(route: &TLSRoute) -> bool {
+        let parents = match &route.status {
+            Some(s) => s.parents.as_slice(),
+            // No status written yet → fail-closed: do not render.
+            None => return false,
+        };
+        parents_accepted_by_wicket(parents)
     }
 
     /// Generate Wicket configuration with deterministic output.
@@ -289,6 +356,16 @@ impl GatewayState {
         http_route_entries.sort_by_key(|(k, _)| k.as_str());
 
         for (route_key, route) in &http_route_entries {
+            // ── Parity guard: only render routes accepted by this controller ──
+            if !Self::http_route_is_accepted(route) {
+                tracing::warn!(
+                    route = %route_key,
+                    "HTTPRoute in store has no Accepted=True parent for this controller; \
+                     skipping render (fail-closed)"
+                );
+                continue;
+            }
+
             let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
             let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
 
@@ -451,51 +528,150 @@ impl GatewayState {
 
         // Process TCPRoutes and TLSRoutes for stream config (sorted).
         if !self.tcp_routes.is_empty() || !self.tls_routes.is_empty() {
-            let mut sni_routes: Vec<(String, String)> = Vec::new();
+            // sni_routes_ordered: (hostname, upstream_name) pairs in sorted
+            // route-key order.  Duplicate SNI detection uses a BTreeMap so
+            // that the first-writer (lowest sort key) wins deterministically.
+            let mut sni_routes_ordered: Vec<(String, String)> = Vec::new();
             let mut stream_upstreams = Vec::new();
+            // Track which upstream name already owns each SNI hostname so we
+            // can warn on collisions without silently overwriting.
+            let mut sni_owner: BTreeMap<String, String> = BTreeMap::new();
+            // The first accepted TLSRoute with empty hostnames becomes the
+            // catch-all default_upstream.
+            let mut catch_all_upstream: Option<String> = None;
 
             let mut tls_route_entries: Vec<(&String, &TLSRoute)> = self.tls_routes.iter().collect();
             tls_route_entries.sort_by_key(|(k, _)| k.as_str());
 
-            for (_route_key, route) in &tls_route_entries {
+            for (route_key, route) in &tls_route_entries {
                 let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-                let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
-                let _ = route_name;
 
-                for hostname in &route.spec.hostnames {
-                    for rule in &route.spec.rules {
-                        for backend_ref in &rule.backend_refs {
-                            let upstream_name = format!("{}-{}", route_ns, backend_ref.name);
-                            let backend_ns = backend_ref.namespace.as_deref().unwrap_or(route_ns);
-                            let backend_key = Self::key(backend_ns, &backend_ref.name);
+                // ── Parity guard: only render routes accepted by this controller ──
+                if !Self::tls_route_is_accepted(route) {
+                    tracing::warn!(
+                        route = %route_key,
+                        "TLSRoute in store has no Accepted=True parent for this controller; \
+                         skipping render (fail-closed)"
+                    );
+                    continue;
+                }
 
-                            let servers =
-                                if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
-                                    let mut sorted = endpoints.endpoints.clone();
-                                    sorted.sort();
-                                    sorted
+                // Build the upstream entry from the first rule's first backend.
+                // (Multi-backend weighting is not yet supported in stream config.)
+                for rule in &route.spec.rules {
+                    for backend_ref in &rule.backend_refs {
+                        let upstream_name = format!("{}-{}", route_ns, backend_ref.name);
+                        let backend_ns = backend_ref.namespace.as_deref().unwrap_or(route_ns);
+                        let backend_key = Self::key(backend_ns, &backend_ref.name);
+
+                        let servers =
+                            if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
+                                let mut sorted = endpoints.endpoints.clone();
+                                sorted.sort();
+                                sorted
+                            } else {
+                                let port = backend_ref.port.unwrap_or(443);
+                                vec![format!(
+                                    "{}.{}.svc.cluster.local:{}",
+                                    backend_ref.name, backend_ns, port
+                                )]
+                            };
+
+                        stream_upstreams.push(StreamUpstreamConfig {
+                            name: upstream_name.clone(),
+                            servers,
+                        });
+
+                        if route.spec.hostnames.is_empty() {
+                            // Empty hostnames → catch-all / default upstream.
+                            // First accepted route with empty hostnames wins.
+                            if catch_all_upstream.is_none() {
+                                tracing::debug!(
+                                    route = %route_key,
+                                    upstream = %upstream_name,
+                                    "TLSRoute has no hostnames; using as stream default_upstream"
+                                );
+                                catch_all_upstream = Some(upstream_name.clone());
+                            } else {
+                                tracing::warn!(
+                                    route = %route_key,
+                                    upstream = %upstream_name,
+                                    existing = %catch_all_upstream.as_deref().unwrap_or(""),
+                                    "Multiple TLSRoutes with empty hostnames; \
+                                     first-accepted route keeps default_upstream slot"
+                                );
+                            }
+                        } else {
+                            for hostname in &route.spec.hostnames {
+                                if let Some(existing) = sni_owner.get(hostname) {
+                                    tracing::warn!(
+                                        hostname = %hostname,
+                                        existing_upstream = %existing,
+                                        new_upstream = %upstream_name,
+                                        route = %route_key,
+                                        "Duplicate SNI hostname across TLSRoutes; \
+                                         first-accepted route keeps the SNI slot (deterministic)"
+                                    );
+                                    // Do NOT overwrite — first-writer wins.
                                 } else {
-                                    let port = backend_ref.port.unwrap_or(443);
-                                    vec![format!(
-                                        "{}.{}.svc.cluster.local:{}",
-                                        backend_ref.name, backend_ns, port
-                                    )]
-                                };
-
-                            stream_upstreams.push(StreamUpstreamConfig {
-                                name: upstream_name.clone(),
-                                servers,
-                            });
-
-                            sni_routes.push((hostname.clone(), upstream_name));
+                                    sni_owner.insert(hostname.clone(), upstream_name.clone());
+                                    sni_routes_ordered
+                                        .push((hostname.clone(), upstream_name.clone()));
+                                }
+                            }
                         }
                     }
                 }
             }
 
+            // Process TCPRoutes in sorted key order.
+            // TCPRoutes produce plain stream upstreams (no SNI routing).
+            let mut tcp_route_entries: Vec<(&String, &TCPRoute)> = self.tcp_routes.iter().collect();
+            tcp_route_entries.sort_by_key(|(k, _)| k.as_str());
+
+            for (route_key, route) in &tcp_route_entries {
+                let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+
+                // ── Parity guard: only render routes accepted by this controller ──
+                if !Self::tcp_route_is_accepted(route) {
+                    tracing::warn!(
+                        route = %route_key,
+                        "TCPRoute in store has no Accepted=True parent for this controller; \
+                         skipping render (fail-closed)"
+                    );
+                    continue;
+                }
+
+                for rule in &route.spec.rules {
+                    for backend_ref in &rule.backend_refs {
+                        let upstream_name = format!("{}-{}", route_ns, backend_ref.name);
+                        let backend_ns = backend_ref.namespace.as_deref().unwrap_or(route_ns);
+                        let backend_key = Self::key(backend_ns, &backend_ref.name);
+
+                        let servers =
+                            if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
+                                let mut sorted = endpoints.endpoints.clone();
+                                sorted.sort();
+                                sorted
+                            } else {
+                                let port = backend_ref.port.unwrap_or(9000);
+                                vec![format!(
+                                    "{}.{}.svc.cluster.local:{}",
+                                    backend_ref.name, backend_ns, port
+                                )]
+                            };
+
+                        stream_upstreams.push(StreamUpstreamConfig {
+                            name: upstream_name,
+                            servers,
+                        });
+                    }
+                }
+            }
+
             // Sort SNI routes for determinism, then collect into BTreeMap.
-            sni_routes.sort_by_key(|(k, _)| k.clone());
-            let sni_routes_map: BTreeMap<String, String> = sni_routes.into_iter().collect();
+            sni_routes_ordered.sort_by_key(|(k, _)| k.clone());
+            let sni_routes_map: BTreeMap<String, String> = sni_routes_ordered.into_iter().collect();
 
             if let Some((_, listener)) = tcp_listeners.first() {
                 stream_config = Some(StreamConfig {
@@ -504,7 +680,7 @@ impl GatewayState {
                     reuseport: true,
                     proxy_protocol: None,
                     sni_routes: sni_routes_map,
-                    default_upstream: None,
+                    default_upstream: catch_all_upstream,
                     upstreams: stream_upstreams,
                 });
             }
@@ -581,6 +757,16 @@ impl GatewayState {
 
         // Process HTTPRoutes
         for (route_key, route) in &self.http_routes {
+            // ── Parity guard: only render routes accepted by this controller ──
+            if !Self::http_route_is_accepted(route) {
+                tracing::warn!(
+                    route = %route_key,
+                    "HTTPRoute in store has no Accepted=True parent for this controller; \
+                     skipping render (fail-closed)"
+                );
+                continue;
+            }
+
             let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
             let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
 
@@ -723,7 +909,7 @@ impl GatewayState {
         }
 
         // Process TLS configuration from Gateway listeners
-        for (gw_key, gateway) in &self.gateways {
+        for gateway in self.gateways.values() {
             let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
 
             for listener in &gateway.spec.listeners {
@@ -749,36 +935,112 @@ impl GatewayState {
         if !self.tcp_routes.is_empty() || !self.tls_routes.is_empty() {
             let mut sni_routes: BTreeMap<String, String> = BTreeMap::new();
             let mut stream_upstreams = Vec::new();
+            let mut catch_all_upstream: Option<String> = None;
 
             for (route_key, route) in &self.tls_routes {
                 let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-                let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
 
-                for hostname in &route.spec.hostnames {
-                    for rule in &route.spec.rules {
-                        for backend_ref in &rule.backend_refs {
-                            let upstream_name = format!("{}-{}", route_ns, backend_ref.name);
-                            let backend_ns = backend_ref.namespace.as_deref().unwrap_or(route_ns);
-                            let backend_key = Self::key(backend_ns, &backend_ref.name);
+                // ── Parity guard: only render routes accepted by this controller ──
+                if !Self::tls_route_is_accepted(route) {
+                    tracing::warn!(
+                        route = %route_key,
+                        "TLSRoute in store has no Accepted=True parent for this controller; \
+                         skipping render (fail-closed)"
+                    );
+                    continue;
+                }
 
-                            let servers =
-                                if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
-                                    endpoints.endpoints.clone()
+                for rule in &route.spec.rules {
+                    for backend_ref in &rule.backend_refs {
+                        let upstream_name = format!("{}-{}", route_ns, backend_ref.name);
+                        let backend_ns = backend_ref.namespace.as_deref().unwrap_or(route_ns);
+                        let backend_key = Self::key(backend_ns, &backend_ref.name);
+
+                        let servers =
+                            if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
+                                endpoints.endpoints.clone()
+                            } else {
+                                let port = backend_ref.port.unwrap_or(443);
+                                vec![format!(
+                                    "{}.{}.svc.cluster.local:{}",
+                                    backend_ref.name, backend_ns, port
+                                )]
+                            };
+
+                        stream_upstreams.push(StreamUpstreamConfig {
+                            name: upstream_name.clone(),
+                            servers,
+                        });
+
+                        if route.spec.hostnames.is_empty() {
+                            if catch_all_upstream.is_none() {
+                                catch_all_upstream = Some(upstream_name.clone());
+                            } else {
+                                tracing::warn!(
+                                    route = %route_key,
+                                    upstream = %upstream_name,
+                                    existing = %catch_all_upstream.as_deref().unwrap_or(""),
+                                    "Multiple TLSRoutes with empty hostnames; \
+                                     first-accepted route keeps default_upstream slot"
+                                );
+                            }
+                        } else {
+                            for hostname in &route.spec.hostnames {
+                                if let Some(existing) = sni_routes.get(hostname) {
+                                    tracing::warn!(
+                                        hostname = %hostname,
+                                        existing_upstream = %existing,
+                                        new_upstream = %upstream_name,
+                                        route = %route_key,
+                                        "Duplicate SNI hostname across TLSRoutes; \
+                                         first-accepted route keeps the SNI slot (deterministic)"
+                                    );
+                                    // Do NOT overwrite — first-writer wins.
                                 } else {
-                                    let port = backend_ref.port.unwrap_or(443);
-                                    vec![format!(
-                                        "{}.{}.svc.cluster.local:{}",
-                                        backend_ref.name, backend_ns, port
-                                    )]
-                                };
-
-                            stream_upstreams.push(StreamUpstreamConfig {
-                                name: upstream_name.clone(),
-                                servers,
-                            });
-
-                            sni_routes.insert(hostname.clone(), upstream_name);
+                                    sni_routes.insert(hostname.clone(), upstream_name.clone());
+                                }
+                            }
                         }
+                    }
+                }
+            }
+
+            // Process TCPRoutes.
+            // TCPRoutes produce plain stream upstreams (no SNI routing).
+            for (route_key, route) in &self.tcp_routes {
+                let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+
+                // ── Parity guard: only render routes accepted by this controller ──
+                if !Self::tcp_route_is_accepted(route) {
+                    tracing::warn!(
+                        route = %route_key,
+                        "TCPRoute in store has no Accepted=True parent for this controller; \
+                         skipping render (fail-closed)"
+                    );
+                    continue;
+                }
+
+                for rule in &route.spec.rules {
+                    for backend_ref in &rule.backend_refs {
+                        let upstream_name = format!("{}-{}", route_ns, backend_ref.name);
+                        let backend_ns = backend_ref.namespace.as_deref().unwrap_or(route_ns);
+                        let backend_key = Self::key(backend_ns, &backend_ref.name);
+
+                        let servers =
+                            if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
+                                endpoints.endpoints.clone()
+                            } else {
+                                let port = backend_ref.port.unwrap_or(9000);
+                                vec![format!(
+                                    "{}.{}.svc.cluster.local:{}",
+                                    backend_ref.name, backend_ns, port
+                                )]
+                            };
+
+                        stream_upstreams.push(StreamUpstreamConfig {
+                            name: upstream_name,
+                            servers,
+                        });
                     }
                 }
             }
@@ -791,7 +1053,7 @@ impl GatewayState {
                     reuseport: true,
                     proxy_protocol: None,
                     sni_routes,
-                    default_upstream: None,
+                    default_upstream: catch_all_upstream,
                     upstreams: stream_upstreams,
                 });
             }
@@ -822,10 +1084,32 @@ impl GatewayState {
 mod tests {
     use super::*;
     use crate::crds::{
-        GatewaySpec, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec, Listener, ParentReference,
-        ProtocolType,
+        BackendRef, Condition, GatewaySpec, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec,
+        HTTPRouteStatus, Listener, ParentReference, ProtocolType, RouteParentStatus, TCPRoute,
+        TCPRouteSpec, TCPRouteStatus, TLSRoute, TLSRouteRule, TLSRouteSpec, TLSRouteStatus,
+        WICKET_CONTROLLER_NAME,
     };
     use kube::core::ObjectMeta;
+
+    /// Build an `HTTPRouteStatus` with a single `Accepted=True` parent entry
+    /// for the Wicket controller.  Used by pre-existing tests that need a route
+    /// to pass the render-time accepted guard.
+    fn wicket_accepted_http_status() -> HTTPRouteStatus {
+        HTTPRouteStatus {
+            parents: vec![RouteParentStatus {
+                parent_ref: ParentReference {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "Gateway".to_string(),
+                    namespace: None,
+                    name: "test-gateway".to_string(),
+                    section_name: None,
+                    port: None,
+                },
+                controller_name: WICKET_CONTROLLER_NAME.to_string(),
+                conditions: vec![Condition::accepted()],
+            }],
+        }
+    }
 
     #[test]
     fn test_generate_basic_config() {
@@ -885,7 +1169,7 @@ mod tests {
                     timeouts: None,
                 }],
             },
-            status: None,
+            status: Some(wicket_accepted_http_status()),
         };
         state
             .http_routes
@@ -979,7 +1263,7 @@ mod tests {
                     timeouts: None,
                 }],
             },
-            status: None,
+            status: Some(wicket_accepted_http_status()),
         };
         state
             .http_routes
@@ -1095,7 +1379,7 @@ mod tests {
                         timeouts: None,
                     }],
                 },
-                status: None,
+                status: Some(wicket_accepted_http_status()),
             };
             state
                 .http_routes
@@ -1223,7 +1507,7 @@ mod tests {
                     },
                 ],
             },
-            status: None,
+            status: Some(wicket_accepted_http_status()),
         };
         state
             .http_routes
@@ -1330,7 +1614,7 @@ mod tests {
                     timeouts: None,
                 }],
             },
-            status: None,
+            status: Some(wicket_accepted_http_status()),
         };
         state
             .http_routes
@@ -1491,7 +1775,7 @@ mod tests {
                     },
                 ],
             },
-            status: None,
+            status: Some(wicket_accepted_http_status()),
         };
         state
             .http_routes
@@ -1613,7 +1897,7 @@ mod tests {
                     timeouts: None,
                 }],
             },
-            status: None,
+            status: Some(wicket_accepted_http_status()),
         };
         state
             .http_routes
@@ -1663,6 +1947,878 @@ mod tests {
         assert!(
             a_pos < m_pos && m_pos < z_pos,
             "TOML header keys must appear in sorted order"
+        );
+    }
+
+    // ── TLS runtime parity tests ──────────────────────────────────────────────
+
+    /// Build a TLSRoute with an explicit status.
+    fn make_tls_route_with_status(
+        ns: &str,
+        name: &str,
+        hostnames: Vec<&str>,
+        backend_name: &str,
+        backend_port: u16,
+        status: Option<TLSRouteStatus>,
+    ) -> TLSRoute {
+        TLSRoute {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: TLSRouteSpec {
+                parent_refs: vec![],
+                hostnames: hostnames.into_iter().map(str::to_string).collect(),
+                rules: vec![TLSRouteRule {
+                    name: None,
+                    backend_refs: vec![BackendRef {
+                        group: "".to_string(),
+                        kind: "Service".to_string(),
+                        name: backend_name.to_string(),
+                        namespace: None,
+                        port: Some(backend_port),
+                        weight: 1,
+                    }],
+                }],
+            },
+            status,
+        }
+    }
+
+    /// Accepted status written by this controller.
+    fn accepted_status() -> TLSRouteStatus {
+        TLSRouteStatus {
+            parents: vec![RouteParentStatus {
+                parent_ref: ParentReference {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "Gateway".to_string(),
+                    namespace: None,
+                    name: "my-gw".to_string(),
+                    section_name: None,
+                    port: None,
+                },
+                controller_name: WICKET_CONTROLLER_NAME.to_string(),
+                conditions: vec![Condition::accepted()],
+            }],
+        }
+    }
+
+    /// Rejected status written by this controller.
+    fn rejected_status() -> TLSRouteStatus {
+        TLSRouteStatus {
+            parents: vec![RouteParentStatus {
+                parent_ref: ParentReference {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "Gateway".to_string(),
+                    namespace: None,
+                    name: "my-gw".to_string(),
+                    section_name: None,
+                    port: None,
+                },
+                controller_name: WICKET_CONTROLLER_NAME.to_string(),
+                conditions: vec![Condition::new(
+                    "Accepted",
+                    false,
+                    "NoMatchingListener",
+                    "Gateway has no TLS passthrough listener",
+                )],
+            }],
+        }
+    }
+
+    /// Build a minimal Gateway with a TLS listener for stream config generation.
+    fn make_tls_gateway(ns: &str, name: &str, port: u16) -> Gateway {
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![Listener {
+                    name: "tls".to_string(),
+                    hostname: None,
+                    port,
+                    protocol: ProtocolType::TLS,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        }
+    }
+
+    /// Integration test: only the accepted TLSRoute is rendered; the rejected
+    /// one must not appear in sni_routes or stream upstreams.
+    #[test]
+    fn tls_parity_only_accepted_route_is_rendered() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_tls_gateway("default", "gw", 8443),
+        );
+
+        // Accepted route — should appear in stream config.
+        let accepted = make_tls_route_with_status(
+            "default",
+            "accepted-route",
+            vec!["db.example.com"],
+            "db-svc",
+            5432,
+            Some(accepted_status()),
+        );
+        state
+            .tls_routes
+            .insert(GatewayState::key("default", "accepted-route"), accepted);
+
+        // Rejected route — must NOT appear in stream config.
+        let rejected = make_tls_route_with_status(
+            "default",
+            "rejected-route",
+            vec!["redis.example.com"],
+            "redis-svc",
+            6379,
+            Some(rejected_status()),
+        );
+        state
+            .tls_routes
+            .insert(GatewayState::key("default", "rejected-route"), rejected);
+
+        let config = state.generate_config_deterministic();
+
+        let stream = config.stream.expect("stream config must be present");
+
+        // Only the accepted hostname must appear.
+        assert!(
+            stream.sni_routes.contains_key("db.example.com"),
+            "accepted SNI must be present"
+        );
+        assert!(
+            !stream.sni_routes.contains_key("redis.example.com"),
+            "rejected SNI must not be present"
+        );
+
+        // Only one upstream (for the accepted route).
+        assert_eq!(
+            stream.upstreams.len(),
+            1,
+            "only the accepted route's upstream must be rendered"
+        );
+        assert_eq!(stream.upstreams[0].name, "default-db-svc");
+    }
+
+    /// Integration test: accepted TLSRoute with empty hostnames becomes the
+    /// stream default_upstream (catch-all).
+    #[test]
+    fn tls_parity_empty_hostnames_becomes_default_upstream() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_tls_gateway("default", "gw", 8443),
+        );
+
+        // Accepted route with no hostnames → should become default_upstream.
+        let catch_all = make_tls_route_with_status(
+            "default",
+            "catch-all-route",
+            vec![],
+            "fallback-svc",
+            443,
+            Some(accepted_status()),
+        );
+        state
+            .tls_routes
+            .insert(GatewayState::key("default", "catch-all-route"), catch_all);
+
+        let config = state.generate_config_deterministic();
+
+        let stream = config.stream.expect("stream config must be present");
+
+        assert!(
+            stream.sni_routes.is_empty(),
+            "no explicit SNI routes expected"
+        );
+        assert_eq!(
+            stream.default_upstream.as_deref(),
+            Some("default-fallback-svc"),
+            "empty-hostname accepted route must become default_upstream"
+        );
+    }
+
+    /// Integration test: route with no status (None) is fail-closed — not rendered.
+    #[test]
+    fn tls_parity_no_status_is_fail_closed() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_tls_gateway("default", "gw", 8443),
+        );
+
+        // Route with no status written yet.
+        let no_status = make_tls_route_with_status(
+            "default",
+            "no-status-route",
+            vec!["db.example.com"],
+            "db-svc",
+            5432,
+            None, // no status
+        );
+        state
+            .tls_routes
+            .insert(GatewayState::key("default", "no-status-route"), no_status);
+
+        let config = state.generate_config_deterministic();
+
+        // No stream config at all since no routes were rendered.
+        // (tcp_routes is also empty, so stream is None)
+        assert!(
+            config.stream.is_none()
+                || config
+                    .stream
+                    .as_ref()
+                    .map(|s| s.sni_routes.is_empty())
+                    .unwrap_or(true),
+            "route with no status must not be rendered"
+        );
+    }
+
+    // ── Shared status helpers ─────────────────────────────────────────────────
+
+    fn make_accepted_parent_status() -> RouteParentStatus {
+        RouteParentStatus {
+            parent_ref: ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "my-gw".to_string(),
+                section_name: None,
+                port: None,
+            },
+            controller_name: WICKET_CONTROLLER_NAME.to_string(),
+            conditions: vec![Condition::accepted()],
+        }
+    }
+
+    fn make_rejected_parent_status() -> RouteParentStatus {
+        RouteParentStatus {
+            parent_ref: ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "my-gw".to_string(),
+                section_name: None,
+                port: None,
+            },
+            controller_name: WICKET_CONTROLLER_NAME.to_string(),
+            conditions: vec![Condition::not_accepted()],
+        }
+    }
+
+    fn make_http_route_for_render(
+        ns: &str,
+        name: &str,
+        backend_name: &str,
+        status: Option<HTTPRouteStatus>,
+    ) -> HTTPRoute {
+        HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: HTTPRouteSpec {
+                parent_refs: vec![],
+                hostnames: vec!["api.example.com".to_string()],
+                rules: vec![HTTPRouteRule {
+                    name: None,
+                    matches: vec![],
+                    filters: vec![],
+                    backend_refs: vec![HTTPBackendRef {
+                        backend_ref: BackendRef {
+                            group: "".to_string(),
+                            kind: "Service".to_string(),
+                            name: backend_name.to_string(),
+                            namespace: None,
+                            port: Some(80),
+                            weight: 1,
+                        },
+                        filters: vec![],
+                    }],
+                    timeouts: None,
+                }],
+            },
+            status,
+        }
+    }
+
+    fn make_tcp_route_for_render(
+        ns: &str,
+        name: &str,
+        backend_name: &str,
+        status: Option<TCPRouteStatus>,
+    ) -> TCPRoute {
+        TCPRoute {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: TCPRouteSpec {
+                parent_refs: vec![],
+                rules: vec![crate::crds::TCPRouteRule {
+                    name: None,
+                    backend_refs: vec![BackendRef {
+                        group: "".to_string(),
+                        kind: "Service".to_string(),
+                        name: backend_name.to_string(),
+                        namespace: None,
+                        port: Some(9000),
+                        weight: 1,
+                    }],
+                }],
+            },
+            status,
+        }
+    }
+
+    fn make_http_gateway(ns: &str, name: &str, port: u16) -> Gateway {
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![Listener {
+                    name: "http".to_string(),
+                    hostname: None,
+                    port,
+                    protocol: ProtocolType::HTTP,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        }
+    }
+
+    // ── parents_accepted_by_wicket unit tests ─────────────────────────────────
+
+    #[test]
+    fn parents_accepted_empty_slice_returns_false() {
+        assert!(!parents_accepted_by_wicket(&[]));
+    }
+
+    #[test]
+    fn parents_accepted_wicket_accepted_returns_true() {
+        assert!(parents_accepted_by_wicket(&[make_accepted_parent_status()]));
+    }
+
+    #[test]
+    fn parents_accepted_wicket_rejected_returns_false() {
+        assert!(!parents_accepted_by_wicket(
+            &[make_rejected_parent_status()]
+        ));
+    }
+
+    #[test]
+    fn parents_accepted_other_controller_accepted_returns_false() {
+        let other = RouteParentStatus {
+            parent_ref: ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "gw".to_string(),
+                section_name: None,
+                port: None,
+            },
+            controller_name: "other.io/controller".to_string(),
+            conditions: vec![Condition::accepted()],
+        };
+        assert!(!parents_accepted_by_wicket(&[other]));
+    }
+
+    #[test]
+    fn parents_accepted_mixed_parents_returns_true_when_wicket_accepts() {
+        let other = RouteParentStatus {
+            parent_ref: ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: None,
+                name: "gw".to_string(),
+                section_name: None,
+                port: None,
+            },
+            controller_name: "other.io/controller".to_string(),
+            conditions: vec![Condition::not_accepted()],
+        };
+        assert!(parents_accepted_by_wicket(&[
+            other,
+            make_accepted_parent_status()
+        ]));
+    }
+
+    // ── HTTPRoute render-time accepted guard ──────────────────────────────────
+
+    /// Accepted HTTPRoute must produce routes in generated config.
+    #[test]
+    fn http_parity_accepted_route_is_rendered() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_http_gateway("default", "gw", 8080),
+        );
+
+        let route = make_http_route_for_render(
+            "default",
+            "accepted-route",
+            "api-svc",
+            Some(HTTPRouteStatus {
+                parents: vec![make_accepted_parent_status()],
+            }),
+        );
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "accepted-route"), route);
+
+        state.service_endpoints.insert(
+            GatewayState::key("default", "api-svc"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "api-svc".to_string(),
+                port: 80,
+                endpoints: vec!["10.0.0.1:80".to_string()],
+            },
+        );
+
+        let config = state.generate_config_deterministic();
+        assert_eq!(
+            config.routes.len(),
+            1,
+            "accepted HTTPRoute must be rendered"
+        );
+        assert_eq!(config.upstreams.len(), 1);
+    }
+
+    /// Rejected HTTPRoute must be excluded from generated config (fail-closed).
+    #[test]
+    fn http_parity_rejected_route_is_not_rendered() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_http_gateway("default", "gw", 8080),
+        );
+
+        let route = make_http_route_for_render(
+            "default",
+            "rejected-route",
+            "api-svc",
+            Some(HTTPRouteStatus {
+                parents: vec![make_rejected_parent_status()],
+            }),
+        );
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "rejected-route"), route);
+
+        state.service_endpoints.insert(
+            GatewayState::key("default", "api-svc"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "api-svc".to_string(),
+                port: 80,
+                endpoints: vec!["10.0.0.1:80".to_string()],
+            },
+        );
+
+        let config = state.generate_config_deterministic();
+        assert_eq!(
+            config.routes.len(),
+            0,
+            "rejected HTTPRoute must not be rendered"
+        );
+        assert_eq!(config.upstreams.len(), 0);
+    }
+
+    /// HTTPRoute with no status must be excluded (fail-closed).
+    #[test]
+    fn http_parity_no_status_is_fail_closed() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_http_gateway("default", "gw", 8080),
+        );
+
+        let route = make_http_route_for_render("default", "no-status-route", "api-svc", None);
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "no-status-route"), route);
+
+        state.service_endpoints.insert(
+            GatewayState::key("default", "api-svc"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "api-svc".to_string(),
+                port: 80,
+                endpoints: vec!["10.0.0.1:80".to_string()],
+            },
+        );
+
+        let config = state.generate_config_deterministic();
+        assert_eq!(
+            config.routes.len(),
+            0,
+            "HTTPRoute with no status must not be rendered"
+        );
+    }
+
+    /// Mixed: one accepted, one rejected HTTPRoute — only the accepted one renders.
+    #[test]
+    fn http_parity_only_accepted_route_is_rendered_among_mixed() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_http_gateway("default", "gw", 8080),
+        );
+
+        let accepted = make_http_route_for_render(
+            "default",
+            "accepted-route",
+            "api-svc",
+            Some(HTTPRouteStatus {
+                parents: vec![make_accepted_parent_status()],
+            }),
+        );
+        let rejected = make_http_route_for_render(
+            "default",
+            "rejected-route",
+            "other-svc",
+            Some(HTTPRouteStatus {
+                parents: vec![make_rejected_parent_status()],
+            }),
+        );
+
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "accepted-route"), accepted);
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "rejected-route"), rejected);
+
+        for svc in &["api-svc", "other-svc"] {
+            state.service_endpoints.insert(
+                GatewayState::key("default", svc),
+                ServiceEndpoints {
+                    namespace: "default".to_string(),
+                    name: svc.to_string(),
+                    port: 80,
+                    endpoints: vec!["10.0.0.1:80".to_string()],
+                },
+            );
+        }
+
+        let config = state.generate_config_deterministic();
+        assert_eq!(
+            config.routes.len(),
+            1,
+            "only the accepted HTTPRoute must be rendered"
+        );
+        // The accepted route's upstream name is default-accepted-route-rule0.
+        assert!(
+            config
+                .upstreams
+                .contains_key("default-accepted-route-rule0"),
+            "accepted route upstream must be present"
+        );
+        assert!(
+            !config
+                .upstreams
+                .contains_key("default-rejected-route-rule0"),
+            "rejected route upstream must not be present"
+        );
+    }
+
+    // ── TCPRoute render-time accepted guard ───────────────────────────────────
+    //
+    // TCPRoutes are processed in the stream-config block alongside TLSRoutes.
+    // The guard must exclude unaccepted TCPRoutes from the stream upstreams.
+
+    /// Accepted TCPRoute must appear in stream upstreams.
+    #[test]
+    fn tcp_parity_accepted_route_is_rendered() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_tls_gateway("default", "gw", 9000),
+        );
+
+        let route = make_tcp_route_for_render(
+            "default",
+            "accepted-tcp",
+            "db-svc",
+            Some(TCPRouteStatus {
+                parents: vec![make_accepted_parent_status()],
+            }),
+        );
+        state
+            .tcp_routes
+            .insert(GatewayState::key("default", "accepted-tcp"), route);
+
+        state.service_endpoints.insert(
+            GatewayState::key("default", "db-svc"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "db-svc".to_string(),
+                port: 9000,
+                endpoints: vec!["10.0.0.5:9000".to_string()],
+            },
+        );
+
+        let config = state.generate_config_deterministic();
+        // TCPRoutes produce stream upstreams (no SNI routing).
+        let stream = config
+            .stream
+            .expect("stream config must be present for TCPRoute");
+        assert_eq!(
+            stream.upstreams.len(),
+            1,
+            "accepted TCPRoute must produce a stream upstream"
+        );
+    }
+
+    /// Rejected TCPRoute must be excluded from stream upstreams (fail-closed).
+    #[test]
+    fn tcp_parity_rejected_route_is_not_rendered() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_tls_gateway("default", "gw", 9000),
+        );
+
+        let route = make_tcp_route_for_render(
+            "default",
+            "rejected-tcp",
+            "db-svc",
+            Some(TCPRouteStatus {
+                parents: vec![make_rejected_parent_status()],
+            }),
+        );
+        state
+            .tcp_routes
+            .insert(GatewayState::key("default", "rejected-tcp"), route);
+
+        state.service_endpoints.insert(
+            GatewayState::key("default", "db-svc"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "db-svc".to_string(),
+                port: 9000,
+                endpoints: vec!["10.0.0.5:9000".to_string()],
+            },
+        );
+
+        let config = state.generate_config_deterministic();
+        // No accepted routes → stream may be None or have empty upstreams.
+        let no_upstreams = config
+            .stream
+            .as_ref()
+            .map(|s| s.upstreams.is_empty())
+            .unwrap_or(true);
+        assert!(
+            no_upstreams,
+            "rejected TCPRoute must not produce stream upstreams"
+        );
+    }
+
+    /// TCPRoute with no status must be excluded (fail-closed).
+    #[test]
+    fn tcp_parity_no_status_is_fail_closed() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_tls_gateway("default", "gw", 9000),
+        );
+
+        let route = make_tcp_route_for_render("default", "no-status-tcp", "db-svc", None);
+        state
+            .tcp_routes
+            .insert(GatewayState::key("default", "no-status-tcp"), route);
+
+        let config = state.generate_config_deterministic();
+        let no_upstreams = config
+            .stream
+            .as_ref()
+            .map(|s| s.upstreams.is_empty())
+            .unwrap_or(true);
+        assert!(no_upstreams, "TCPRoute with no status must not be rendered");
+    }
+
+    // ── Cross-type symmetry: generate_config vs generate_config_deterministic ─
+
+    /// Both code paths must apply the same accepted guard for HTTPRoutes.
+    #[test]
+    fn http_parity_both_paths_agree_on_rejected_route() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_http_gateway("default", "gw", 8080),
+        );
+
+        let route = make_http_route_for_render(
+            "default",
+            "rejected-route",
+            "api-svc",
+            Some(HTTPRouteStatus {
+                parents: vec![make_rejected_parent_status()],
+            }),
+        );
+        state
+            .http_routes
+            .insert(GatewayState::key("default", "rejected-route"), route);
+
+        state.service_endpoints.insert(
+            GatewayState::key("default", "api-svc"),
+            ServiceEndpoints {
+                namespace: "default".to_string(),
+                name: "api-svc".to_string(),
+                port: 80,
+                endpoints: vec!["10.0.0.1:80".to_string()],
+            },
+        );
+
+        let cfg_sorted = state.generate_config_deterministic();
+        let cfg_unsorted = state.generate_config();
+
+        assert_eq!(
+            cfg_sorted.routes.len(),
+            0,
+            "generate_config_deterministic: rejected HTTPRoute must not be rendered"
+        );
+        assert_eq!(
+            cfg_unsorted.routes.len(),
+            0,
+            "generate_config: rejected HTTPRoute must not be rendered"
+        );
+    }
+
+    /// Both code paths must apply the same accepted guard for TLSRoutes.
+    #[test]
+    fn tls_parity_both_paths_agree_on_rejected_route() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_tls_gateway("default", "gw", 8443),
+        );
+
+        let rejected = make_tls_route_with_status(
+            "default",
+            "rejected-route",
+            vec!["db.example.com"],
+            "db-svc",
+            5432,
+            Some(rejected_status()),
+        );
+        state
+            .tls_routes
+            .insert(GatewayState::key("default", "rejected-route"), rejected);
+
+        let cfg_sorted = state.generate_config_deterministic();
+        let cfg_unsorted = state.generate_config();
+
+        let sorted_empty = cfg_sorted
+            .stream
+            .as_ref()
+            .map(|s| s.sni_routes.is_empty() && s.upstreams.is_empty())
+            .unwrap_or(true);
+        let unsorted_empty = cfg_unsorted
+            .stream
+            .as_ref()
+            .map(|s| s.sni_routes.is_empty() && s.upstreams.is_empty())
+            .unwrap_or(true);
+
+        assert!(
+            sorted_empty,
+            "generate_config_deterministic: rejected TLSRoute must not be rendered"
+        );
+        assert!(
+            unsorted_empty,
+            "generate_config: rejected TLSRoute must not be rendered"
+        );
+    }
+
+    /// Integration test: duplicate SNI hostnames — first-accepted route wins,
+    /// second is silently dropped (but warned).
+    #[test]
+    fn tls_parity_duplicate_sni_first_writer_wins() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "gw"),
+            make_tls_gateway("default", "gw", 8443),
+        );
+
+        // Two accepted routes claiming the same SNI.
+        // "aaa-route" sorts before "zzz-route" so it wins.
+        let first = make_tls_route_with_status(
+            "default",
+            "aaa-route",
+            vec!["shared.example.com"],
+            "first-svc",
+            443,
+            Some(accepted_status()),
+        );
+        let second = make_tls_route_with_status(
+            "default",
+            "zzz-route",
+            vec!["shared.example.com"],
+            "second-svc",
+            443,
+            Some(accepted_status()),
+        );
+
+        state
+            .tls_routes
+            .insert(GatewayState::key("default", "aaa-route"), first);
+        state
+            .tls_routes
+            .insert(GatewayState::key("default", "zzz-route"), second);
+
+        let config = state.generate_config_deterministic();
+        let stream = config.stream.expect("stream config must be present");
+
+        // The SNI must be present exactly once.
+        assert_eq!(
+            stream.sni_routes.len(),
+            1,
+            "duplicate SNI must appear only once"
+        );
+        // First-sorted route (aaa-route → default-first-svc) must win.
+        assert_eq!(
+            stream
+                .sni_routes
+                .get("shared.example.com")
+                .map(String::as_str),
+            Some("default-first-svc"),
+            "first-accepted (lowest sort key) route must own the SNI slot"
         );
     }
 }

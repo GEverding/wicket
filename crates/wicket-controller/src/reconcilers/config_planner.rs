@@ -135,7 +135,10 @@ pub use crate::reconcilers::runtime_plan::sha256_hex;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crds::{Gateway, HTTPRoute, ProtocolType};
+    use crate::crds::{
+        Condition, Gateway, HTTPRoute, HTTPRouteStatus, ParentReference, ProtocolType,
+        RouteParentStatus, WICKET_CONTROLLER_NAME,
+    };
     use crate::crds::{GatewaySpec, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec, Listener};
     use crate::reconcilers::config_generator::ServiceEndpoints;
     use kube::core::ObjectMeta;
@@ -204,7 +207,20 @@ mod tests {
                     timeouts: None,
                 }],
             },
-            status: None,
+            status: Some(HTTPRouteStatus {
+                parents: vec![RouteParentStatus {
+                    parent_ref: ParentReference {
+                        group: "gateway.networking.k8s.io".to_string(),
+                        kind: "Gateway".to_string(),
+                        namespace: None,
+                        name: "gw".to_string(),
+                        section_name: None,
+                        port: None,
+                    },
+                    controller_name: WICKET_CONTROLLER_NAME.to_string(),
+                    conditions: vec![Condition::accepted()],
+                }],
+            }),
         };
         state
             .http_routes

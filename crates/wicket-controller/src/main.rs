@@ -20,9 +20,10 @@ use wicket_controller::{
         CONTROLLER_UPTIME_SECONDS,
     },
     reconcilers::{
-        run_endpoints_controller, run_gateway_class_controller, run_gateway_controller,
-        run_httproute_controller, run_referencegrant_controller, run_secret_controller,
-        run_service_controller, run_tcproute_controller, run_tlsroute_controller, Context,
+        contracts::ServiceType, run_endpoints_controller, run_gateway_class_controller,
+        run_gateway_controller, run_httproute_controller, run_referencegrant_controller,
+        run_secret_controller, run_service_controller, run_tcproute_controller,
+        run_tlsroute_controller, runtime_plan::ControllerConfig, Context, DEFAULT_TLS_CERT_DIR,
     },
 };
 
@@ -67,6 +68,23 @@ struct Args {
     /// Leader election lease name
     #[arg(long, default_value = "wicket-controller-leader")]
     leader_election_name: String,
+
+    // ── Managed-runtime defaults ──────────────────────────────────────────────
+    /// Container image for managed proxy Deployments.
+    #[arg(
+        long,
+        env = "WICKET_PROXY_IMAGE",
+        default_value = "ghcr.io/geverding/wicket:latest"
+    )]
+    proxy_image: String,
+
+    /// Default replica count for managed proxy Deployments (>= 1, <= i32::MAX).
+    #[arg(long, env = "WICKET_DEFAULT_REPLICAS", default_value = "1")]
+    default_replicas: u32,
+
+    /// Default service type for managed Services (ClusterIP, LoadBalancer, NodePort).
+    #[arg(long, env = "WICKET_DEFAULT_SERVICE_TYPE", default_value = "ClusterIP")]
+    default_service_type: String,
 }
 
 #[tokio::main]
@@ -75,6 +93,24 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize logging
     init_logging(&args.log_level, args.json_logs)?;
+
+    // ── Validate and build ControllerConfig ───────────────────────────────────
+    // Parse service type fail-fast: do not silently default on an invalid value.
+    let default_service_type: ServiceType =
+        args.default_service_type.parse().map_err(|e: String| {
+            anyhow::anyhow!(
+                "--default-service-type / WICKET_DEFAULT_SERVICE_TYPE: {}",
+                e
+            )
+        })?;
+
+    // Validate replicas via the explicit constructor (>= 1, <= i32::MAX).
+    let controller_config = ControllerConfig::new(
+        args.proxy_image.clone(),
+        args.default_replicas,
+        default_service_type,
+    )
+    .map_err(|e| anyhow::anyhow!("invalid managed-runtime defaults: {}", e))?;
 
     // Determine ConfigMap namespace (default to controller namespace)
     let config_configmap_namespace = args
@@ -91,6 +127,14 @@ async fn main() -> anyhow::Result<()> {
         "Starting Wicket Gateway API Controller"
     );
 
+    // Log effective managed-runtime defaults for operability.
+    tracing::info!(
+        proxy_image = %controller_config.proxy_image,
+        default_replicas = controller_config.default_replicas,
+        default_service_type = %controller_config.default_service_type,
+        "Managed-runtime defaults"
+    );
+
     // Register Prometheus metrics
     register_metrics().expect("Failed to register metrics");
 
@@ -98,18 +142,20 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     tracing::info!("Connected to Kubernetes API server");
 
-    // Create shared context
-    let ctx = Arc::new(Context::new(
+    // Create shared context with explicit managed-runtime config.
+    let ctx = Arc::new(Context::with_controller_config(
         client.clone(),
         args.namespace.clone(),
         args.watch_all_namespaces,
         args.config_configmap_name.clone(),
         config_configmap_namespace.clone(),
+        DEFAULT_TLS_CERT_DIR.to_string(),
+        controller_config,
     ));
 
     // Set up leader election if enabled
     let is_leader = Arc::new(AtomicBool::new(false));
-    let is_leader_clone = is_leader.clone();
+    let _is_leader_clone = is_leader.clone();
 
     if args.leader_election {
         // Get pod name from environment (set by Kubernetes downward API)

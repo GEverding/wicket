@@ -94,43 +94,35 @@ impl MockBackend {
     /// Returns a JoinHandle that can be awaited or aborted.
     pub fn accept_background(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            loop {
-                match self.listener.accept().await {
-                    Ok((mut socket, client_addr)) => {
-                        debug!(
-                            "MockBackend (background) accepted connection from {}",
-                            client_addr
-                        );
+            while let Ok((mut socket, client_addr)) = self.listener.accept().await {
+                debug!(
+                    "MockBackend (background) accepted connection from {}",
+                    client_addr
+                );
 
-                        let connections = Arc::clone(&self.connections);
+                let connections = Arc::clone(&self.connections);
 
-                        // Increment connection count immediately
-                        let log = ConnectionLog {
-                            client_addr,
-                            received_bytes: Vec::new(),
-                            proxy_protocol: None,
-                        };
-                        connections.lock().await.push(log.clone());
+                // Increment connection count immediately
+                let log = ConnectionLog {
+                    client_addr,
+                    received_bytes: Vec::new(),
+                    proxy_protocol: None,
+                };
+                connections.lock().await.push(log.clone());
 
-                        // Read data in background (don't block counter increment)
-                        tokio::spawn(async move {
-                            let mut received_bytes = Vec::new();
-                            let _ = socket.read_to_end(&mut received_bytes).await;
+                // Read data in background (don't block counter increment)
+                tokio::spawn(async move {
+                    let mut received_bytes = Vec::new();
+                    let _ = socket.read_to_end(&mut received_bytes).await;
 
-                            let _proxy_protocol =
-                                ParsedProxyProtocol::parse(&received_bytes).map(|(pp, _)| pp);
+                    let _proxy_protocol =
+                        ParsedProxyProtocol::parse(&received_bytes).map(|(pp, _)| pp);
 
-                            // Update the log with received data
-                            // Note: This is a simplified version - in a real implementation
-                            // we'd update the existing log entry, but for these tests
-                            // we only care about connection count
-                        });
-                    }
-                    Err(_) => {
-                        // Listener closed
-                        break;
-                    }
-                }
+                    // Update the log with received data
+                    // Note: This is a simplified version - in a real implementation
+                    // we'd update the existing log entry, but for these tests
+                    // we only care about connection count
+                });
             }
         })
     }

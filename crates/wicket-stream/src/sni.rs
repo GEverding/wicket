@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_sni_extractor_default() {
-        let extractor = SniExtractor::default();
+        let extractor = SniExtractor;
         let result = extractor.extract(TLS12_CLIENT_HELLO).unwrap();
         assert_eq!(result, Some("www.example.com".to_string()));
     }

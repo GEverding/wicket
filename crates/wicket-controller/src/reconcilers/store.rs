@@ -896,8 +896,8 @@ impl SharedStore {
 mod tests {
     use super::*;
     use crate::crds::{
-        BackendRef, GatewaySpec, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec, Listener,
-        ParentReference, ProtocolType, TCPRoute, TLSRoute,
+        BackendRef, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec, ParentReference, TCPRoute,
+        TLSRoute,
     };
     use kube::core::ObjectMeta;
 
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_gateway_class() {
-        use crate::crds::{GatewayClassSpec, GatewayClassStatus};
+        use crate::crds::GatewayClassSpec;
         let store = SharedStore::new();
         store.mark_ready().await;
 
@@ -1813,7 +1813,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_planner_snapshot_includes_gateway_classes() {
-        use crate::crds::{GatewayClassSpec, GatewayClassStatus};
+        use crate::crds::GatewayClassSpec;
         let store = SharedStore::new();
 
         let gc = GatewayClass {
@@ -2279,7 +2279,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tcp_routes_for_gateway_namespace_defaults_to_route_ns() {
-        use crate::crds::{TCPRouteRule, TCPRouteSpec};
+        use crate::crds::TCPRouteSpec;
         let store = SharedStore::new();
 
         let route = TCPRoute {
@@ -2364,7 +2364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tls_routes_for_gateway_namespace_defaults_to_route_ns() {
-        use crate::crds::{TLSRouteRule, TLSRouteSpec};
+        use crate::crds::TLSRouteSpec;
         let store = SharedStore::new();
 
         let route = TLSRoute {

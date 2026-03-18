@@ -1,6 +1,5 @@
 //! Common types shared across Gateway API resources.
 
-use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -169,6 +168,16 @@ impl Condition {
         }
     }
 
+    /// Set `observed_generation` on this condition and return `self`.
+    ///
+    /// Accepts `Option<i64>` so callers can pass `gateway.metadata.generation`
+    /// directly without unwrapping.  When `None`, the field is left unset.
+    #[must_use]
+    pub fn with_observed_generation(mut self, gen: Option<i64>) -> Self {
+        self.observed_generation = gen;
+        self
+    }
+
     pub fn accepted() -> Self {
         Self::new("Accepted", true, "Accepted", "Resource has been accepted")
     }
@@ -188,6 +197,52 @@ impl Condition {
             true,
             "ResolvedRefs",
             "All references resolved",
+        )
+    }
+
+    /// `Programmed=False` because the managed Deployment rollout has not
+    /// fully converged.  This covers both "no ready replicas" and "rollout
+    /// in progress" (updated_replicas < desired_replicas).
+    pub fn not_programmed() -> Self {
+        Self::new(
+            "Programmed",
+            false,
+            "DeploymentNotReady",
+            "Managed runtime Deployment rollout has not converged",
+        )
+    }
+
+    /// `Programmed=False` because the controller store is still warming up
+    /// after restart.  The data plane may already be healthy; this condition
+    /// clears once the informer cache is populated.
+    pub fn not_programmed_warming_up() -> Self {
+        Self::new(
+            "Programmed",
+            false,
+            "ControllerStoreNotReady",
+            "Controller store is warming up after restart; status will be updated shortly",
+        )
+    }
+
+    /// `Programmed=False` because a non-404 Kubernetes API error occurred
+    /// while observing the owned Deployment or ConfigMap.  This is distinct
+    /// from `DeploymentNotReady` and indicates an RBAC fault or transient API
+    /// server error rather than a genuine deployment failure.
+    pub fn not_programmed_observation_fault(detail: &str) -> Self {
+        Self::new(
+            "Programmed",
+            false,
+            "ObservationFault",
+            &format!("Failed to observe owned runtime objects: {}", detail),
+        )
+    }
+
+    pub fn not_accepted() -> Self {
+        Self::new(
+            "Accepted",
+            false,
+            "ListenerProtocolConflict",
+            "Listener protocol is not supported",
         )
     }
 
@@ -215,3 +270,112 @@ pub type PortNumber = u16;
 
 /// Duration string (e.g., "5s", "1m").
 pub type Duration = String;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_programmed_has_deployment_not_ready_reason() {
+        let c = Condition::not_programmed();
+        assert_eq!(c.type_, "Programmed");
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason, "DeploymentNotReady");
+        assert!(
+            !c.message.is_empty(),
+            "message must not be empty, got: {}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn not_programmed_observation_fault_has_observation_fault_reason() {
+        let c = Condition::not_programmed_observation_fault("403 Forbidden");
+        assert_eq!(c.type_, "Programmed");
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason, "ObservationFault");
+        assert!(
+            c.message.contains("403 Forbidden"),
+            "message must include the fault detail, got: {}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn observation_fault_reason_distinct_from_deployment_not_ready() {
+        let fault = Condition::not_programmed_observation_fault("rbac");
+        let not_ready = Condition::not_programmed();
+        assert_ne!(
+            fault.reason, not_ready.reason,
+            "ObservationFault and DeploymentNotReady must be distinct reasons"
+        );
+    }
+
+    #[test]
+    fn with_observed_generation_sets_field() {
+        let c = Condition::programmed().with_observed_generation(Some(42));
+        assert_eq!(c.observed_generation, Some(42));
+    }
+
+    #[test]
+    fn with_observed_generation_none_leaves_field_unset() {
+        let c = Condition::programmed().with_observed_generation(None);
+        assert_eq!(c.observed_generation, None);
+    }
+
+    #[test]
+    fn with_observed_generation_is_chainable() {
+        let c = Condition::not_programmed().with_observed_generation(Some(7));
+        assert_eq!(c.observed_generation, Some(7));
+        assert_eq!(c.type_, "Programmed");
+        assert_eq!(c.status, "False");
+    }
+
+    #[test]
+    fn not_programmed_warming_up_has_controller_store_not_ready_reason() {
+        let c = Condition::not_programmed_warming_up();
+        assert_eq!(c.type_, "Programmed");
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason, "ControllerStoreNotReady");
+        assert!(
+            c.message.contains("warming up"),
+            "message must mention warming up, got: {}",
+            c.message
+        );
+    }
+
+    #[test]
+    fn not_programmed_and_warming_up_have_distinct_reasons() {
+        let deployment_not_ready = Condition::not_programmed();
+        let warming_up = Condition::not_programmed_warming_up();
+        assert_ne!(
+            deployment_not_ready.reason, warming_up.reason,
+            "DeploymentNotReady and ControllerStoreNotReady must be distinct reasons"
+        );
+        assert_ne!(
+            deployment_not_ready.message, warming_up.message,
+            "messages must differ so operators can distinguish the two cases"
+        );
+    }
+
+    #[test]
+    fn programmed_condition_has_true_status() {
+        let c = Condition::programmed();
+        assert_eq!(c.type_, "Programmed");
+        assert_eq!(c.status, "True");
+    }
+
+    #[test]
+    fn accepted_condition_has_true_status() {
+        let c = Condition::accepted();
+        assert_eq!(c.type_, "Accepted");
+        assert_eq!(c.status, "True");
+    }
+
+    #[test]
+    fn not_accepted_condition_has_false_status() {
+        let c = Condition::not_accepted();
+        assert_eq!(c.type_, "Accepted");
+        assert_eq!(c.status, "False");
+    }
+}

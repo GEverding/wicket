@@ -6,7 +6,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::common::{BackendRef, Condition, ParentReference, RouteParentStatus};
+use super::common::{BackendRef, ParentReference, RouteParentStatus};
 
 /// TCPRouteSpec defines the desired state of TCPRoute.
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]

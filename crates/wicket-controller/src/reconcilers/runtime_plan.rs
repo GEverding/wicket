@@ -115,6 +115,43 @@ impl Default for ControllerConfig {
     }
 }
 
+impl ControllerConfig {
+    /// Explicit constructor for callsites that know all managed-runtime defaults.
+    ///
+    /// Prefer this over `Default` in production paths so that the effective
+    /// configuration is always visible at the callsite.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if:
+    /// - `default_replicas` is 0 (must be >= 1).
+    /// - `default_replicas` exceeds `i32::MAX` (Kubernetes replica field is i32).
+    /// - `default_service_type` is not a valid `ServiceType` string.
+    pub fn new(
+        proxy_image: String,
+        default_replicas: u32,
+        default_service_type: ServiceType,
+    ) -> Result<Self, String> {
+        if default_replicas == 0 {
+            return Err("default_replicas must be >= 1".to_string());
+        }
+        if default_replicas > i32::MAX as u32 {
+            return Err(format!(
+                "default_replicas {} exceeds i32::MAX ({})",
+                default_replicas,
+                i32::MAX
+            ));
+        }
+        Ok(Self {
+            proxy_image,
+            default_replicas,
+            default_service_type,
+            default_resources: BTreeMap::new(),
+            default_node_selector: BTreeMap::new(),
+        })
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Observed runtime state
 // ─────────────────────────────────────────────────────────────────────────────
@@ -127,6 +164,12 @@ impl Default for ControllerConfig {
 ///
 /// The planner uses this to determine whether a plan represents a change
 /// (config update, rollout) or a no-op.
+///
+/// The rollout-convergence fields (`deploy_observed_generation`,
+/// `updated_replicas`, `available_replicas`, `desired_replicas`) are used by
+/// `is_rollout_converged()` to determine whether a Deployment rollout has
+/// fully completed.  They are populated from `DeploymentStatus` fields
+/// available in the Kubernetes API without pod-level observation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ObservedRuntimeState {
     /// The `wicket.io/config-revision` annotation currently on the owned
@@ -140,6 +183,98 @@ pub struct ObservedRuntimeState {
     /// Number of ready replicas in the owned Deployment.  `None` means the
     /// Deployment does not exist or its status has not been observed yet.
     pub ready_replicas: Option<u32>,
+
+    // ── Rollout-convergence inputs (from DeploymentStatus) ────────────────────
+    //
+    // These fields are used by `is_rollout_converged()` to gate
+    // `Programmed=True` on full rollout completion, not just `ready_replicas > 0`.
+    //
+    // All are `None` when the Deployment does not exist.
+    /// `DeploymentStatus.observed_generation`: the generation the Deployment
+    /// controller has processed.  Must equal `Deployment.metadata.generation`
+    /// for the rollout to be considered converged.
+    pub deploy_observed_generation: Option<i64>,
+
+    /// `Deployment.metadata.generation`: the current desired generation of the
+    /// Deployment spec.  Used to verify that `deploy_observed_generation` is
+    /// current.
+    pub deploy_generation: Option<i64>,
+
+    /// `DeploymentStatus.updated_replicas`: pods running the current pod
+    /// template spec.  Must equal `desired_replicas` for convergence.
+    pub updated_replicas: Option<u32>,
+
+    /// `DeploymentStatus.available_replicas`: pods available for at least
+    /// `minReadySeconds`.  Must be >= 1 for convergence.
+    pub available_replicas: Option<u32>,
+
+    /// `DeploymentSpec.replicas`: the desired replica count.  Used to verify
+    /// that `updated_replicas` has caught up.
+    pub desired_replicas: Option<u32>,
+}
+
+/// Returns `true` when the Deployment rollout has fully converged.
+///
+/// ## Convergence criteria
+///
+/// All of the following must hold:
+///
+/// 1. `deploy_observed_generation == deploy_generation`: the Deployment
+///    controller has processed the current spec generation.
+/// 2. `updated_replicas >= desired_replicas`: all pods are running the current
+///    pod template (no old-revision pods remain).
+/// 3. `available_replicas >= 1`: at least one pod is available (ready for at
+///    least `minReadySeconds`).
+/// 4. `ready_replicas >= 1`: at least one pod passes the readiness probe.
+///
+/// When any field is `None` (Deployment absent or status not yet populated),
+/// the function returns `false` -- a missing Deployment is not converged.
+///
+/// ## Why not just `ready_replicas > 0`
+///
+/// `ready_replicas > 0` is insufficient during a rolling update: old pods may
+/// still be ready while new pods are starting.  The combination of
+/// `updated_replicas == desired_replicas` and `available_replicas >= 1`
+/// ensures that the rollout has completed and the new revision is serving.
+#[must_use]
+pub fn is_rollout_converged(obs: &ObservedRuntimeState) -> bool {
+    // All fields must be present; absence means Deployment does not exist.
+    let Some(deploy_obs_gen) = obs.deploy_observed_generation else {
+        return false;
+    };
+    let Some(deploy_gen) = obs.deploy_generation else {
+        return false;
+    };
+    let Some(updated) = obs.updated_replicas else {
+        return false;
+    };
+    let Some(available) = obs.available_replicas else {
+        return false;
+    };
+    let Some(desired) = obs.desired_replicas else {
+        return false;
+    };
+    let Some(ready) = obs.ready_replicas else {
+        return false;
+    };
+
+    // 1. Controller has processed the current generation.
+    if deploy_obs_gen < deploy_gen {
+        return false;
+    }
+    // 2. All pods are on the current template.
+    if updated < desired {
+        return false;
+    }
+    // 3. At least one pod is available.
+    if available < 1 {
+        return false;
+    }
+    // 4. At least one pod is ready.
+    if ready < 1 {
+        return false;
+    }
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -733,6 +868,14 @@ pub fn config_plan_from_runtime_plan(plan: &GatewayRuntimePlan) -> ConfigPlan {
 /// this function so that `GatewayRuntimePlan.listener_statuses` carries
 /// accurate counts rather than the `0` placeholder.
 ///
+/// ## Non-accepted listeners
+///
+/// Listeners that are not accepted (e.g. UDP listeners) always report
+/// `attached_routes = 0` regardless of what the attachment plan returns.
+/// Reporting non-zero attached routes for a listener that is not accepted
+/// is misleading to operators and violates the Gateway API spec intent
+/// (routes cannot be meaningfully attached to a listener that is not accepted).
+///
 /// ## Fallback
 ///
 /// When `attachment_plan` is `None` (e.g., the attachment planner has not yet
@@ -759,8 +902,13 @@ pub fn listener_status_intents_with_attachment(
 
     base.into_iter()
         .map(|mut intent| {
-            if let Some(summary) = ap.listener_summary(&intent.name) {
-                intent.attached_routes = summary.attached_routes;
+            // Non-accepted listeners must always report zero attached routes.
+            // A listener that is not accepted cannot have routes meaningfully
+            // attached to it, so reporting a non-zero count would be misleading.
+            if intent.accepted {
+                if let Some(summary) = ap.listener_summary(&intent.name) {
+                    intent.attached_routes = summary.attached_routes;
+                }
             }
             intent
         })
@@ -846,8 +994,24 @@ impl Planner for GatewayRuntimePlanner {
         // ── 8. Compute config_hash ────────────────────────────────────────────
         let config_hash = sha256_hex(&config_toml);
 
-        // ── 9. Derive listener status intents ─────────────────────────────────
-        let listener_statuses = listener_status_intents(gateway);
+        // ── 9. Derive listener status intents (with real attached-route counts) ──
+        //
+        // Run the attachment planner to get per-listener attached-route counts.
+        // On failure (e.g. gateway not in snapshot -- already checked above, so
+        // this should not happen) fall back to the zero-count baseline so the
+        // planner never returns an error solely because of attachment counting.
+        let attachment_plan_opt = {
+            use crate::reconcilers::attachment_planner::{AttachmentPlanInput, AttachmentPlanner};
+            let ap_input = AttachmentPlanInput {
+                gateway_namespace: input.gateway_namespace.clone(),
+                gateway_name: input.gateway_name.clone(),
+                gateway_generation,
+                snapshot: input.snapshot.clone(),
+            };
+            AttachmentPlanner.plan(&ap_input).ok()
+        };
+        let listener_statuses =
+            listener_status_intents_with_attachment(gateway, attachment_plan_opt.as_ref());
 
         // ── 10. Compute change signals ────────────────────────────────────────
         let config_changed = input
@@ -1474,6 +1638,7 @@ mod tests {
                 current_config_hash: None,
                 current_spec_hash: None,
                 ready_replicas: None,
+                ..Default::default()
             },
         );
         let plan = GatewayRuntimePlanner.plan(&input).unwrap();
@@ -1503,6 +1668,7 @@ mod tests {
                 current_config_hash: Some(plan0.config_hash.clone()),
                 current_spec_hash: Some(plan0.spec_hash.clone()),
                 ready_replicas: Some(1),
+                ..Default::default()
             },
         );
         let plan = GatewayRuntimePlanner.plan(&input).unwrap();
@@ -1532,6 +1698,7 @@ mod tests {
                 current_config_hash: Some("stale-config-hash".to_string()),
                 current_spec_hash: Some(plan0.spec_hash.clone()),
                 ready_replicas: Some(1),
+                ..Default::default()
             },
         );
         let plan = GatewayRuntimePlanner.plan(&input).unwrap();
@@ -1789,6 +1956,7 @@ mod tests {
                 current_config_hash: Some(plan1.config_hash.clone()),
                 current_spec_hash: Some(plan1.spec_hash.clone()),
                 ready_replicas: Some(1),
+                ..Default::default()
             },
         );
         input2.controller_config.default_service_type = ServiceType::LoadBalancer;
@@ -1956,6 +2124,88 @@ mod tests {
         );
     }
 
+    // ── Planner uses attachment counts (not zero baseline) ────────────────────
+
+    #[test]
+    fn planner_listener_statuses_use_attachment_counts_when_routes_present() {
+        // Build a gateway with one HTTP listener and one attached HTTPRoute.
+        // The planner must populate attached_routes from the AttachmentPlanner,
+        // not leave it at 0.
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let snapshot = make_snapshot_with_routes(gw.clone(), &["route-a"]);
+        let input = make_input("prod", "my-gw", snapshot, ObservedRuntimeState::default());
+
+        let plan = GatewayRuntimePlanner.plan(&input).unwrap();
+
+        let http_status = plan
+            .listener_statuses
+            .iter()
+            .find(|s| s.name == "http")
+            .expect("http listener status must be present");
+
+        assert_eq!(
+            http_status.attached_routes, 1,
+            "planner must populate attached_routes from AttachmentPlanner (got {})",
+            http_status.attached_routes
+        );
+    }
+
+    #[test]
+    fn planner_listener_statuses_zero_when_no_routes() {
+        // No routes => attachment planner returns 0 for all listeners.
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let snapshot = make_snapshot(gw);
+        let input = make_input("prod", "my-gw", snapshot, ObservedRuntimeState::default());
+
+        let plan = GatewayRuntimePlanner.plan(&input).unwrap();
+
+        let http_status = plan
+            .listener_statuses
+            .iter()
+            .find(|s| s.name == "http")
+            .expect("http listener status must be present");
+
+        assert_eq!(
+            http_status.attached_routes, 0,
+            "no routes => attached_routes must be 0"
+        );
+    }
+
+    #[test]
+    fn planner_listener_statuses_count_multiple_routes() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let snapshot = make_snapshot_with_routes(gw.clone(), &["route-a", "route-b", "route-c"]);
+        let input = make_input("prod", "my-gw", snapshot, ObservedRuntimeState::default());
+
+        let plan = GatewayRuntimePlanner.plan(&input).unwrap();
+
+        let http_status = plan
+            .listener_statuses
+            .iter()
+            .find(|s| s.name == "http")
+            .expect("http listener status must be present");
+
+        assert_eq!(
+            http_status.attached_routes, 3,
+            "three routes => attached_routes must be 3"
+        );
+    }
+
     #[test]
     fn planner_is_deterministic_with_routes() {
         // Full plan equality with non-empty route maps.
@@ -2027,6 +2277,7 @@ mod tests {
                 current_config_hash: Some(plan0.config_hash.clone()),
                 current_spec_hash: Some(plan0.spec_hash.clone()),
                 ready_replicas: Some(1),
+                ..Default::default()
             },
         );
         let plan = GatewayRuntimePlanner.plan(&input).unwrap();
@@ -2178,8 +2429,12 @@ mod tests {
 
         let intents = listener_status_intents_with_attachment(&gw, Some(&ap));
         assert_eq!(intents.len(), 1);
-        // attached_routes is merged from the attachment plan.
-        assert_eq!(intents[0].attached_routes, 99);
+        // Non-accepted listeners must always report zero attached_routes,
+        // regardless of what the attachment plan says.
+        assert_eq!(
+            intents[0].attached_routes, 0,
+            "non-accepted listener must report 0 attached_routes even if attachment plan says 99"
+        );
         // accepted/rejection_reason come from listener_status_intents (gateway protocol).
         assert!(
             !intents[0].accepted,
@@ -2264,5 +2519,201 @@ mod tests {
             result.is_ok(),
             "missing gateway must still produce a serializable (empty) config"
         );
+    }
+
+    // ── is_rollout_converged ──────────────────────────────────────────────────
+
+    fn converged_obs() -> ObservedRuntimeState {
+        ObservedRuntimeState {
+            current_config_hash: None,
+            current_spec_hash: None,
+            ready_replicas: Some(1),
+            deploy_observed_generation: Some(2),
+            deploy_generation: Some(2),
+            updated_replicas: Some(1),
+            available_replicas: Some(1),
+            desired_replicas: Some(1),
+        }
+    }
+
+    #[test]
+    fn rollout_converged_when_all_fields_satisfied() {
+        assert!(is_rollout_converged(&converged_obs()));
+    }
+
+    #[test]
+    fn rollout_not_converged_when_deployment_absent() {
+        assert!(!is_rollout_converged(&ObservedRuntimeState::default()));
+    }
+
+    #[test]
+    fn rollout_not_converged_when_observed_generation_stale() {
+        let obs = ObservedRuntimeState {
+            deploy_observed_generation: Some(1), // stale
+            deploy_generation: Some(2),
+            ..converged_obs()
+        };
+        assert!(!is_rollout_converged(&obs));
+    }
+
+    #[test]
+    fn rollout_not_converged_when_updated_replicas_less_than_desired() {
+        let obs = ObservedRuntimeState {
+            updated_replicas: Some(0),
+            desired_replicas: Some(2),
+            ..converged_obs()
+        };
+        assert!(!is_rollout_converged(&obs));
+    }
+
+    #[test]
+    fn rollout_not_converged_when_available_replicas_zero() {
+        let obs = ObservedRuntimeState {
+            available_replicas: Some(0),
+            ..converged_obs()
+        };
+        assert!(!is_rollout_converged(&obs));
+    }
+
+    #[test]
+    fn rollout_not_converged_when_ready_replicas_zero() {
+        let obs = ObservedRuntimeState {
+            ready_replicas: Some(0),
+            ..converged_obs()
+        };
+        assert!(!is_rollout_converged(&obs));
+    }
+
+    #[test]
+    fn rollout_converged_when_observed_generation_ahead_of_desired() {
+        // observed_generation > deploy_generation is allowed (controller
+        // processed a newer generation than we expect -- safe).
+        let obs = ObservedRuntimeState {
+            deploy_observed_generation: Some(3),
+            deploy_generation: Some(2),
+            ..converged_obs()
+        };
+        assert!(is_rollout_converged(&obs));
+    }
+
+    #[test]
+    fn rollout_converged_with_multiple_replicas() {
+        let obs = ObservedRuntimeState {
+            ready_replicas: Some(3),
+            deploy_observed_generation: Some(5),
+            deploy_generation: Some(5),
+            updated_replicas: Some(3),
+            available_replicas: Some(3),
+            desired_replicas: Some(3),
+            ..Default::default()
+        };
+        assert!(is_rollout_converged(&obs));
+    }
+
+    #[test]
+    fn rollout_not_converged_when_partial_update_in_progress() {
+        // 2 of 3 replicas updated: rollout in progress.
+        let obs = ObservedRuntimeState {
+            ready_replicas: Some(3), // old pods still ready
+            deploy_observed_generation: Some(5),
+            deploy_generation: Some(5),
+            updated_replicas: Some(2), // not all updated yet
+            available_replicas: Some(3),
+            desired_replicas: Some(3),
+            ..Default::default()
+        };
+        assert!(!is_rollout_converged(&obs));
+    }
+
+    // ── ControllerConfig::new validation ─────────────────────────────────────
+
+    #[test]
+    fn controller_config_new_valid() {
+        let cfg = ControllerConfig::new(
+            "ghcr.io/example/proxy:v1".to_string(),
+            3,
+            ServiceType::LoadBalancer,
+        );
+        assert!(cfg.is_ok());
+        let cfg = cfg.unwrap();
+        assert_eq!(cfg.proxy_image, "ghcr.io/example/proxy:v1");
+        assert_eq!(cfg.default_replicas, 3);
+        assert_eq!(cfg.default_service_type, ServiceType::LoadBalancer);
+    }
+
+    #[test]
+    fn controller_config_new_rejects_zero_replicas() {
+        let err = ControllerConfig::new("img".to_string(), 0, ServiceType::ClusterIP);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains(">="));
+    }
+
+    #[test]
+    fn controller_config_new_rejects_replicas_exceeding_i32_max() {
+        let err = ControllerConfig::new(
+            "img".to_string(),
+            i32::MAX as u32 + 1,
+            ServiceType::ClusterIP,
+        );
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("i32::MAX"));
+    }
+
+    #[test]
+    fn controller_config_new_accepts_replicas_at_i32_max() {
+        let cfg = ControllerConfig::new("img".to_string(), i32::MAX as u32, ServiceType::ClusterIP);
+        assert!(cfg.is_ok());
+    }
+
+    // ── ServiceType FromStr ───────────────────────────────────────────────────
+
+    #[test]
+    fn service_type_from_str_valid_variants() {
+        use std::str::FromStr;
+        assert_eq!(
+            ServiceType::from_str("ClusterIP").unwrap(),
+            ServiceType::ClusterIP
+        );
+        assert_eq!(
+            ServiceType::from_str("LoadBalancer").unwrap(),
+            ServiceType::LoadBalancer
+        );
+        assert_eq!(
+            ServiceType::from_str("NodePort").unwrap(),
+            ServiceType::NodePort
+        );
+    }
+
+    #[test]
+    fn service_type_from_str_rejects_invalid() {
+        use std::str::FromStr;
+        let err = ServiceType::from_str("clusterip");
+        assert!(err.is_err());
+        let msg = err.unwrap_err();
+        assert!(
+            msg.contains("ClusterIP"),
+            "error should list valid values: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn service_type_from_str_rejects_empty() {
+        use std::str::FromStr;
+        assert!(ServiceType::from_str("").is_err());
+    }
+
+    #[test]
+    fn service_type_display_roundtrips() {
+        use std::str::FromStr;
+        for svc in [
+            ServiceType::ClusterIP,
+            ServiceType::LoadBalancer,
+            ServiceType::NodePort,
+        ] {
+            let s = svc.to_string();
+            let parsed = ServiceType::from_str(&s).unwrap();
+            assert_eq!(parsed, svc);
+        }
     }
 }
