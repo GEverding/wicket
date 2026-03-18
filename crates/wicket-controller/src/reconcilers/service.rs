@@ -11,7 +11,7 @@ use kube::{
         controller::{Action, Controller},
         watcher::Config,
     },
-    Client, Resource, ResourceExt,
+    Client, ResourceExt,
 };
 
 use crate::crds::{HTTPRoute, TCPRoute, TLSRoute};
@@ -546,11 +546,8 @@ mod tests {
     /// (cache path) when the store is ready and a route references the service.
     #[tokio::test]
     async fn test_is_service_referenced_uses_store_when_ready() {
-        use crate::crds::{
-            BackendRef, GatewaySpec, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec, Listener,
-            ProtocolType,
-        };
-        use crate::crds::{Gateway, GatewayClass, HTTPRoute};
+        use crate::crds::HTTPRoute;
+        use crate::crds::{BackendRef, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec};
         use kube::core::ObjectMeta;
 
         let store = SharedStore::new();

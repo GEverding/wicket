@@ -6,9 +6,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::common::{
-    BackendRef, Condition, Duration, Hostname, ParentReference, RouteParentStatus,
-};
+use super::common::{BackendRef, Duration, Hostname, ParentReference, RouteParentStatus};
 
 /// HTTPRouteSpec defines the desired state of HTTPRoute.
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]

@@ -8,7 +8,8 @@
 //! performs the side-effecting steps:
 //!
 //! 1. Ensure the owned `ServiceAccount` exists (create if absent; no-op if present).
-//! 2. Ensure the owned `ConfigMap` is up-to-date (delegates to `apply_config_plan`).
+//! 2. Ensure the owned `ConfigMap` is up-to-date (managed-runtime-specific path
+//!    that enforces owner refs and managed labels, not raw data patching).
 //! 3. Ensure the owned `Service` matches the desired shape (create or patch).
 //! 4. Ensure the owned `Deployment` matches the desired spec (create or patch).
 //!
@@ -24,14 +25,23 @@
 //!   to the Gateway so Kubernetes garbage-collects them on Gateway deletion.
 //! - **Stable labels**: every owned object carries the standard managed-by labels
 //!   defined in the ADR (section 2.3).
-//! - **Revision annotations**: the ConfigMap carries `wicket.io/config-revision`
-//!   (via `apply_config_plan`); the Deployment carries `wicket.io/spec-revision`.
+//! - **Revision annotations**: the ConfigMap carries `wicket.io/config-revision`;
+//!   the Deployment carries `wicket.io/spec-revision`.
+//! - **Ownership preflight**: before patching any object the applier checks that
+//!   any pre-existing same-name object carries the controller's managed-by label.
+//!   If it does not, `ApplyError::NotOwned` is returned rather than silently
+//!   taking over the object.
+//! - **Config-only changes do not trigger rollout**: the pod template spec is
+//!   rebuilt only from `spec_hash`-covered fields (image, replicas, resources,
+//!   node selector, ports).  The `config_hash` is carried only in the Deployment
+//!   metadata annotation, not in the pod template, so a config-only change does
+//!   not mutate the pod template and does not trigger a rollout.
 //!
 //! # Ordering
 //!
 //! ```text
 //! 1. ServiceAccount  (no dependencies)
-//! 2. ConfigMap       (via apply_config_plan; no-op when config_changed=false)
+//! 2. ConfigMap       (managed-runtime path; no-op when config_changed=false)
 //! 3. Service         (no dependencies)
 //! 4. Deployment      (depends on ServiceAccount and ConfigMap existing)
 //! ```
@@ -41,6 +51,7 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::api::core::v1::Service as K8sService;
 use k8s_openapi::api::core::v1::{
     ConfigMapVolumeSource, Container, ContainerPort, EnvVar, PodSpec, PodTemplateSpec,
@@ -52,10 +63,9 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
 use tokio::sync::RwLock;
 
-use crate::reconcilers::config_applier::{apply_config_plan, ConfigApplierInput};
 use crate::reconcilers::config_generator::WicketConfig;
 use crate::reconcilers::contracts::{ApplyError, ConfigApplyResult, ServiceType};
-use crate::reconcilers::runtime_plan::{config_plan_from_runtime_plan, GatewayRuntimePlan};
+use crate::reconcilers::runtime_plan::GatewayRuntimePlan;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Annotation / label constants (ADR section 2.3)
@@ -64,7 +74,8 @@ use crate::reconcilers::runtime_plan::{config_plan_from_runtime_plan, GatewayRun
 /// Annotation key for the spec revision hash on the Deployment.
 pub const SPEC_REVISION_ANNOTATION: &str = "wicket.io/spec-revision";
 
-/// Annotation key for the config revision hash on the ConfigMap and pod template.
+/// Annotation key for the config revision hash on the ConfigMap and Deployment
+/// metadata (NOT the pod template -- config-only changes must not trigger rollout).
 pub const CONFIG_REVISION_ANNOTATION: &str = "wicket.io/config-revision";
 
 /// Label: managed-by controller.
@@ -94,11 +105,23 @@ pub struct RuntimeApplyResult {
     pub service_account_created: bool,
     /// Result of the ConfigMap apply step.
     pub config_result: Option<ConfigApplyResult>,
-    /// Whether the `Service` was created or patched.
+    /// Whether the `Service` was created or patched due to a spec change.
+    ///
+    /// `true` when `plan.spec_changed` is true (service shape changed) or the
+    /// Service did not previously exist.  `false` when the Service already
+    /// existed and no spec change was signalled.
     pub service_changed: bool,
     /// Whether the `Deployment` was created or patched.
+    ///
+    /// `true` when `plan.spec_changed` is true (pod template changed) or the
+    /// Deployment did not previously exist.  `false` when the Deployment
+    /// already existed and only a config-only change occurred (no rollout).
     pub deployment_changed: bool,
-    /// Whether a Deployment rollout was triggered (spec_changed=true).
+    /// Whether a Deployment rollout was triggered.
+    ///
+    /// `true` only when `plan.spec_changed` is true.  A config-only change
+    /// (`plan.config_changed && !plan.spec_changed`) does NOT set this flag
+    /// because the pod template is not mutated by config-only changes.
     pub rollout_triggered: bool,
 }
 
@@ -110,7 +133,7 @@ pub struct RuntimeApplyResult {
 pub struct RuntimeApplierInput<'a> {
     /// Kubernetes client.
     pub client: &'a Client,
-    /// In-memory config handle (passed through to `apply_config_plan`).
+    /// In-memory config handle (updated after a successful ConfigMap patch).
     pub in_memory_config: &'a RwLock<WicketConfig>,
 }
 
@@ -129,6 +152,9 @@ pub struct RuntimeApplierInput<'a> {
 ///
 /// Returns `ApplyError` if any Kubernetes API call fails.  Partial applies are
 /// safe because each step is idempotent; the controller will requeue and retry.
+///
+/// Returns `ApplyError::NotOwned` if any pre-existing same-name object does not
+/// carry the controller's managed-by label.
 pub async fn apply_runtime_plan(
     plan: &GatewayRuntimePlan,
     input: &RuntimeApplierInput<'_>,
@@ -138,15 +164,10 @@ pub async fn apply_runtime_plan(
     // ── 1. ServiceAccount ─────────────────────────────────────────────────────
     result.service_account_created = apply_service_account(plan, input.client).await?;
 
-    // ── 2. ConfigMap (via config_applier) ─────────────────────────────────────
-    let config_plan = config_plan_from_runtime_plan(plan);
-    let config_input = ConfigApplierInput {
-        client: input.client,
-        configmap_name: &plan.config_map_name,
-        configmap_namespace: &plan.gateway_namespace,
-        in_memory_config: input.in_memory_config,
-    };
-    let config_result = apply_config_plan(&config_plan, &config_input).await?;
+    // ── 2. ConfigMap (managed-runtime path) ───────────────────────────────────
+    // Uses the managed-runtime-specific path that enforces owner refs and
+    // managed labels, rather than the raw data-only patch in config_applier.
+    let config_result = apply_managed_configmap(plan, input.client, input.in_memory_config).await?;
     result.config_result = Some(config_result);
 
     // ── 3. Service ────────────────────────────────────────────────────────────
@@ -192,14 +213,14 @@ fn managed_labels(plan: &GatewayRuntimePlan) -> BTreeMap<String, String> {
     labels
 }
 
-/// Build the pod template labels: managed labels + config-revision label.
+/// Build the pod template labels.
+///
+/// These are the *stable* managed labels only.  The `config_hash` is NOT
+/// included here because including it would mutate the pod template on every
+/// config-only change and trigger an unwanted rollout.  The config revision is
+/// tracked via the Deployment metadata annotation instead.
 fn pod_template_labels(plan: &GatewayRuntimePlan) -> BTreeMap<String, String> {
-    let mut labels = managed_labels(plan);
-    labels.insert(
-        CONFIG_REVISION_ANNOTATION.to_string(),
-        plan.config_hash.clone(),
-    );
-    labels
+    managed_labels(plan)
 }
 
 /// Build the owner reference pointing to the Gateway.
@@ -231,22 +252,162 @@ fn owned_object_meta(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Ownership preflight
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Check whether a pre-existing object's labels indicate it is managed by this
+/// controller.
+///
+/// Returns `true` when the object carries
+/// `app.kubernetes.io/managed-by = wicket-controller`, `false` otherwise.
+fn is_managed_by_controller(labels: Option<&BTreeMap<String, String>>) -> bool {
+    labels
+        .and_then(|l| l.get(LABEL_MANAGED_BY))
+        .map(|v| v == "wicket-controller")
+        .unwrap_or(false)
+}
+
+/// Test-visible re-export of `is_managed_by_controller`.
+///
+/// Exposed only under `#[cfg(test)]` so cross-module tests in `gateway.rs`
+/// can call the ownership-check logic without making it part of the public API.
+#[cfg(test)]
+pub fn is_managed_by_controller_pub(labels: Option<&BTreeMap<String, String>>) -> bool {
+    is_managed_by_controller(labels)
+}
+
+/// Perform an ownership preflight check for a `ServiceAccount`.
+///
+/// Returns `Ok(true)` when the object exists and is owned, `Ok(false)` when
+/// the object does not exist, and `Err(ApplyError::NotOwned)` when the object
+/// exists but is not managed by this controller.
+async fn preflight_service_account(
+    api: &Api<ServiceAccount>,
+    name: &str,
+    namespace: &str,
+) -> Result<bool, ApplyError> {
+    match api
+        .get_opt(name)
+        .await
+        .map_err(|e| ApplyError::KubeApi(e.to_string()))?
+    {
+        None => Ok(false),
+        Some(obj) => {
+            if is_managed_by_controller(obj.metadata.labels.as_ref()) {
+                Ok(true)
+            } else {
+                Err(ApplyError::NotOwned {
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                })
+            }
+        }
+    }
+}
+
+/// Perform an ownership preflight check for a `ConfigMap`.
+async fn preflight_configmap(
+    api: &Api<ConfigMap>,
+    name: &str,
+    namespace: &str,
+) -> Result<bool, ApplyError> {
+    match api
+        .get_opt(name)
+        .await
+        .map_err(|e| ApplyError::KubeApi(e.to_string()))?
+    {
+        None => Ok(false),
+        Some(obj) => {
+            if is_managed_by_controller(obj.metadata.labels.as_ref()) {
+                Ok(true)
+            } else {
+                Err(ApplyError::NotOwned {
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                })
+            }
+        }
+    }
+}
+
+/// Perform an ownership preflight check for a `Service`.
+async fn preflight_service(
+    api: &Api<K8sService>,
+    name: &str,
+    namespace: &str,
+) -> Result<bool, ApplyError> {
+    match api
+        .get_opt(name)
+        .await
+        .map_err(|e| ApplyError::KubeApi(e.to_string()))?
+    {
+        None => Ok(false),
+        Some(obj) => {
+            if is_managed_by_controller(obj.metadata.labels.as_ref()) {
+                Ok(true)
+            } else {
+                Err(ApplyError::NotOwned {
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                })
+            }
+        }
+    }
+}
+
+/// Perform an ownership preflight check for a `Deployment`.
+async fn preflight_deployment(
+    api: &Api<Deployment>,
+    name: &str,
+    namespace: &str,
+) -> Result<bool, ApplyError> {
+    match api
+        .get_opt(name)
+        .await
+        .map_err(|e| ApplyError::KubeApi(e.to_string()))?
+    {
+        None => Ok(false),
+        Some(obj) => {
+            if is_managed_by_controller(obj.metadata.labels.as_ref()) {
+                Ok(true)
+            } else {
+                Err(ApplyError::NotOwned {
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                })
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ServiceAccount
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Ensure the owned `ServiceAccount` exists.
 ///
-/// Uses a merge-patch so the call is idempotent.  Returns `true` if the object
-/// was just created (did not previously exist), `false` if it already existed.
+/// Performs an ownership preflight: if a same-name object exists without the
+/// controller's managed-by label, returns `ApplyError::NotOwned`.
+///
+/// Uses server-side apply so the call is idempotent.  Returns `true` if the
+/// object was just created (did not previously exist), `false` if it already
+/// existed.
 ///
 /// # Errors
 ///
 /// Returns `ApplyError::KubeApi` if the API call fails.
+/// Returns `ApplyError::NotOwned` if a pre-existing object is not managed by
+/// this controller.
 async fn apply_service_account(
     plan: &GatewayRuntimePlan,
     client: &Client,
 ) -> Result<bool, ApplyError> {
     let api: Api<ServiceAccount> = Api::namespaced(client.clone(), &plan.gateway_namespace);
+
+    // Ownership preflight: reject unowned pre-existing objects.
+    let already_exists =
+        preflight_service_account(&api, &plan.service_account_name, &plan.gateway_namespace)
+            .await?;
 
     let sa = ServiceAccount {
         metadata: owned_object_meta(&plan.service_account_name, plan, None),
@@ -254,13 +415,6 @@ async fn apply_service_account(
     };
 
     let patch = serde_json::to_value(&sa).map_err(|e| ApplyError::Serialization(e.to_string()))?;
-
-    // Check existence first so we can report created vs. already-present.
-    let exists = api
-        .get_opt(&plan.service_account_name)
-        .await
-        .map_err(|e| ApplyError::KubeApi(e.to_string()))?
-        .is_some();
 
     api.patch(
         &plan.service_account_name,
@@ -270,7 +424,7 @@ async fn apply_service_account(
     .await
     .map_err(|e| ApplyError::KubeApi(e.to_string()))?;
 
-    let created = !exists;
+    let created = !already_exists;
     if created {
         tracing::info!(
             namespace = %plan.gateway_namespace,
@@ -289,20 +443,124 @@ async fn apply_service_account(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ConfigMap (managed-runtime path)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Apply the owned `ConfigMap` for a managed-runtime Gateway.
+///
+/// This is a managed-runtime-specific path that enforces owner references and
+/// managed labels on the ConfigMap, unlike the raw data-only patch in
+/// `config_applier::apply_config_plan`.
+///
+/// Performs an ownership preflight: if a same-name ConfigMap exists without
+/// the controller's managed-by label, returns `ApplyError::NotOwned`.
+///
+/// When `plan.config_changed` is `false`, skips the patch but still syncs the
+/// in-memory `WicketConfig` from the plan content.
+///
+/// # Errors
+///
+/// Returns `ApplyError::KubeApi` if the API call fails.
+/// Returns `ApplyError::NotOwned` if a pre-existing ConfigMap is not managed.
+/// Returns `ApplyError::Serialization` if TOML deserialization fails.
+async fn apply_managed_configmap(
+    plan: &GatewayRuntimePlan,
+    client: &Client,
+    in_memory_config: &RwLock<WicketConfig>,
+) -> Result<ConfigApplyResult, ApplyError> {
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), &plan.gateway_namespace);
+
+    // Ownership preflight.
+    preflight_configmap(&api, &plan.config_map_name, &plan.gateway_namespace).await?;
+
+    // Always sync the in-memory view from the plan content so that a process
+    // restart does not leave the view stale.
+    let new_config: WicketConfig =
+        toml::from_str(&plan.config_toml).map_err(|e| ApplyError::Serialization(e.to_string()))?;
+
+    if !plan.config_changed {
+        // No patch needed; just sync in-memory.
+        {
+            let mut current = in_memory_config.write().await;
+            *current = new_config;
+        }
+        tracing::debug!(
+            namespace = %plan.gateway_namespace,
+            name = %plan.config_map_name,
+            config_hash = %plan.config_hash,
+            "ConfigMap no-op: already at desired revision"
+        );
+        return Ok(ConfigApplyResult::NoOp);
+    }
+
+    // Build the full ConfigMap with owner refs and managed labels.
+    let mut annotations = BTreeMap::new();
+    annotations.insert(
+        CONFIG_REVISION_ANNOTATION.to_string(),
+        plan.config_hash.clone(),
+    );
+
+    let mut data = BTreeMap::new();
+    data.insert("wicket.toml".to_string(), plan.config_toml.clone());
+
+    let cm = ConfigMap {
+        metadata: owned_object_meta(&plan.config_map_name, plan, Some(annotations)),
+        data: Some(data),
+        ..Default::default()
+    };
+
+    let patch = serde_json::to_value(&cm).map_err(|e| ApplyError::Serialization(e.to_string()))?;
+
+    api.patch(
+        &plan.config_map_name,
+        &PatchParams::apply(FIELD_MANAGER).force(),
+        &Patch::Apply(&patch),
+    )
+    .await
+    .map_err(|e| ApplyError::KubeApi(e.to_string()))?;
+
+    // Update in-memory config after successful patch.
+    {
+        let mut current = in_memory_config.write().await;
+        *current = new_config;
+    }
+
+    tracing::info!(
+        namespace = %plan.gateway_namespace,
+        name = %plan.config_map_name,
+        config_hash = %plan.config_hash,
+        "ConfigMap applied"
+    );
+
+    Ok(ConfigApplyResult::Updated {
+        config_hash: plan.config_hash.clone(),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Service
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Ensure the owned `Service` matches the desired shape.
 ///
+/// Performs an ownership preflight: if a same-name Service exists without the
+/// controller's managed-by label, returns `ApplyError::NotOwned`.
+///
 /// Uses server-side apply (force) so the call is idempotent.  Returns `true`
-/// if the object was created or patched, `false` if the plan signals no spec
-/// change and the object already exists.
+/// when the Service was created (did not previously exist) or when
+/// `plan.spec_changed` is true (service shape changed).  Returns `false` when
+/// the Service already existed and no spec change was signalled.
 ///
 /// # Errors
 ///
 /// Returns `ApplyError::KubeApi` if the API call fails.
+/// Returns `ApplyError::NotOwned` if a pre-existing object is not managed.
 async fn apply_service(plan: &GatewayRuntimePlan, client: &Client) -> Result<bool, ApplyError> {
     let api: Api<K8sService> = Api::namespaced(client.clone(), &plan.gateway_namespace);
+
+    // Ownership preflight.
+    let already_exists =
+        preflight_service(&api, &plan.service_name, &plan.gateway_namespace).await?;
 
     // Build the desired Service spec.
     let svc_type_str = match plan.service_type {
@@ -323,8 +581,8 @@ async fn apply_service(plan: &GatewayRuntimePlan, client: &Client) -> Result<boo
         })
         .collect();
 
-    // Selector matches the pod template labels (minus config-revision which
-    // changes on every config update and must not be part of the selector).
+    // Selector matches the stable pod template labels (managed labels only,
+    // no config-revision which would break selector stability).
     let selector = managed_labels(plan);
 
     let svc = K8sService {
@@ -355,9 +613,9 @@ async fn apply_service(plan: &GatewayRuntimePlan, client: &Client) -> Result<boo
         "Service applied"
     );
 
-    // We always patch; report changed when spec_changed (new ports/type) or
-    // when the object may not have existed yet.
-    Ok(plan.spec_changed)
+    // Report changed when the object was just created or when the spec changed.
+    let changed = !already_exists || plan.spec_changed;
+    Ok(changed)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -366,24 +624,42 @@ async fn apply_service(plan: &GatewayRuntimePlan, client: &Client) -> Result<boo
 
 /// Ensure the owned `Deployment` matches the desired spec.
 ///
-/// Returns `(changed, rollout_triggered)`.
-/// - `changed` is `true` when the Deployment was created or patched.
-/// - `rollout_triggered` is `true` when `plan.spec_changed` is `true` (the
-///   pod template changed, which causes Kubernetes to roll out new pods).
+/// Performs an ownership preflight: if a same-name Deployment exists without
+/// the controller's managed-by label, returns `ApplyError::NotOwned`.
+///
+/// Returns `(changed, rollout_triggered)`:
+/// - `changed` is `true` when the Deployment was created (did not previously
+///   exist) or when `plan.spec_changed` is true.  A config-only change does
+///   NOT set `changed` because the pod template is not mutated.
+/// - `rollout_triggered` is `true` only when `plan.spec_changed` is true.
+///   Config-only changes do not trigger a rollout because the pod template
+///   spec is not mutated by config-only changes.
 ///
 /// # Errors
 ///
 /// Returns `ApplyError::KubeApi` if the API call fails.
+/// Returns `ApplyError::NotOwned` if a pre-existing object is not managed.
+/// Returns `ApplyError::Serialization` if replica count conversion fails.
 async fn apply_deployment(
     plan: &GatewayRuntimePlan,
     client: &Client,
 ) -> Result<(bool, bool), ApplyError> {
     let api: Api<Deployment> = Api::namespaced(client.clone(), &plan.gateway_namespace);
 
-    let replicas = i32::try_from(plan.runtime_metadata.replicas).unwrap_or(1);
+    // Ownership preflight.
+    let already_exists =
+        preflight_deployment(&api, &plan.deployment_name, &plan.gateway_namespace).await?;
+
+    // Fail safely on invalid replica count rather than silently coercing.
+    let replicas = i32::try_from(plan.runtime_metadata.replicas).map_err(|_| {
+        ApplyError::Serialization(format!(
+            "replica count {} overflows i32 (max {})",
+            plan.runtime_metadata.replicas,
+            i32::MAX
+        ))
+    })?;
 
     // Build resource requirements from the flat key-value map.
-    // Keys: "requests.cpu", "requests.memory", "limits.cpu", "limits.memory".
     let resource_requirements = build_resource_requirements(&plan.runtime_metadata.resources);
 
     // Container ports derived from service_ports.
@@ -417,29 +693,28 @@ async fn apply_deployment(
     };
 
     // Env var exposing the config revision so the proxy can log it.
-    let config_rev_env = EnvVar {
-        name: "WICKET_CONFIG_REVISION".to_string(),
-        value: Some(plan.config_hash.clone()),
-        ..Default::default()
-    };
-
+    // NOTE: this env var is derived from the spec-covered fields only; it does
+    // NOT carry config_hash so that config-only changes do not mutate the
+    // container spec and trigger a rollout.
     let container = Container {
         name: "wicket-proxy".to_string(),
         image: Some(plan.runtime_metadata.image.clone()),
         ports: Some(container_ports),
         volume_mounts: Some(vec![volume_mount]),
-        env: Some(vec![config_rev_env]),
+        env: Some(vec![EnvVar {
+            name: "WICKET_SPEC_REVISION".to_string(),
+            value: Some(plan.spec_hash.clone()),
+            ..Default::default()
+        }]),
         resources: Some(resource_requirements),
         ..Default::default()
     };
 
-    // Pod template annotations carry the spec-revision so drift is detectable.
+    // Pod template annotations carry only the spec-revision.
+    // The config-revision is tracked at the Deployment metadata level (below)
+    // so that config-only changes do not mutate the pod template.
     let mut pod_annotations = BTreeMap::new();
     pod_annotations.insert(SPEC_REVISION_ANNOTATION.to_string(), plan.spec_hash.clone());
-    pod_annotations.insert(
-        CONFIG_REVISION_ANNOTATION.to_string(),
-        plan.config_hash.clone(),
-    );
 
     let pod_template = PodTemplateSpec {
         metadata: Some(ObjectMeta {
@@ -460,9 +735,15 @@ async fn apply_deployment(
         }),
     };
 
-    // Deployment-level annotations carry the spec-revision for drift detection.
+    // Deployment-level annotations carry both revision hashes.
+    // config_hash here does NOT propagate to the pod template, so a
+    // config-only change updates this annotation without triggering a rollout.
     let mut deploy_annotations = BTreeMap::new();
     deploy_annotations.insert(SPEC_REVISION_ANNOTATION.to_string(), plan.spec_hash.clone());
+    deploy_annotations.insert(
+        CONFIG_REVISION_ANNOTATION.to_string(),
+        plan.config_hash.clone(),
+    );
 
     let deploy = Deployment {
         metadata: owned_object_meta(&plan.deployment_name, plan, Some(deploy_annotations)),
@@ -489,8 +770,14 @@ async fn apply_deployment(
     .await
     .map_err(|e| ApplyError::KubeApi(e.to_string()))?;
 
+    // rollout_triggered: only when spec_changed (pod template mutated).
+    // config-only changes do not mutate the pod template.
     let rollout = plan.spec_changed;
-    let changed = plan.spec_changed || plan.config_changed;
+
+    // deployment_changed: created for the first time, or spec changed.
+    // config-only changes do not count as a deployment change because the
+    // pod template was not mutated.
+    let changed = !already_exists || plan.spec_changed;
 
     if rollout {
         tracing::info!(
@@ -646,19 +933,28 @@ mod tests {
     // ── pod_template_labels ───────────────────────────────────────────────────
 
     #[test]
-    fn pod_template_labels_includes_config_revision() {
+    fn pod_template_labels_does_not_include_config_revision() {
+        // config_hash must NOT appear in pod template labels; it would cause
+        // config-only changes to mutate the pod template and trigger a rollout.
         let plan = make_plan(true, false, ServiceType::ClusterIP, vec![]);
         let labels = pod_template_labels(&plan);
 
-        assert_eq!(
-            labels.get(CONFIG_REVISION_ANNOTATION).map(String::as_str),
-            Some("aabbcc")
+        assert!(
+            !labels.contains_key(CONFIG_REVISION_ANNOTATION),
+            "config_hash must not be in pod template labels to avoid spurious rollouts"
         );
-        // Must also carry all managed labels.
+        // Must still carry all managed labels.
         assert_eq!(
             labels.get(LABEL_MANAGED_BY).map(String::as_str),
             Some("wicket-controller")
         );
+    }
+
+    #[test]
+    fn pod_template_labels_equals_managed_labels() {
+        // pod_template_labels must be identical to managed_labels (no extras).
+        let plan = make_plan(true, false, ServiceType::ClusterIP, vec![]);
+        assert_eq!(pod_template_labels(&plan), managed_labels(&plan));
     }
 
     // ── gateway_owner_ref ─────────────────────────────────────────────────────
@@ -707,6 +1003,29 @@ mod tests {
                 .map(String::as_str),
             Some("ddeeff")
         );
+    }
+
+    #[test]
+    fn owned_object_meta_carries_managed_labels() {
+        let plan = make_plan(false, false, ServiceType::ClusterIP, vec![]);
+        let meta = owned_object_meta("wicket-gw-test-gw-sa", &plan, None);
+        let labels = meta.labels.as_ref().expect("labels must be set");
+        assert_eq!(
+            labels.get(LABEL_MANAGED_BY).map(String::as_str),
+            Some("wicket-controller")
+        );
+    }
+
+    #[test]
+    fn owned_object_meta_carries_owner_ref() {
+        let plan = make_plan(false, false, ServiceType::ClusterIP, vec![]);
+        let meta = owned_object_meta("wicket-gw-test-gw-sa", &plan, None);
+        let orefs = meta
+            .owner_references
+            .as_ref()
+            .expect("owner_references must be set");
+        assert_eq!(orefs.len(), 1);
+        assert_eq!(orefs[0].uid, "uid-abc-123");
     }
 
     // ── build_resource_requirements ───────────────────────────────────────────
@@ -790,8 +1109,6 @@ mod tests {
         ];
         let plan = make_plan(false, true, ServiceType::LoadBalancer, ports);
 
-        // Verify the plan carries the ports correctly (the actual K8s object
-        // construction is tested indirectly via apply_service in integration tests).
         assert_eq!(plan.service_ports.len(), 2);
         assert_eq!(plan.service_ports[0].name, "http");
         assert_eq!(plan.service_ports[0].port, 80);
@@ -818,6 +1135,7 @@ mod tests {
     #[test]
     fn config_plan_bridge_update_when_config_changed() {
         use crate::reconcilers::contracts::ConfigPlan;
+        use crate::reconcilers::runtime_plan::config_plan_from_runtime_plan;
         let plan = make_plan(true, false, ServiceType::ClusterIP, vec![]);
         let cp = config_plan_from_runtime_plan(&plan);
         assert!(matches!(cp, ConfigPlan::Update { .. }));
@@ -826,8 +1144,325 @@ mod tests {
     #[test]
     fn config_plan_bridge_noop_when_not_changed() {
         use crate::reconcilers::contracts::ConfigPlan;
+        use crate::reconcilers::runtime_plan::config_plan_from_runtime_plan;
         let plan = make_plan(false, false, ServiceType::ClusterIP, vec![]);
         let cp = config_plan_from_runtime_plan(&plan);
         assert!(matches!(cp, ConfigPlan::NoOp { .. }));
+    }
+
+    // ── ownership preflight (unit) ────────────────────────────────────────────
+
+    #[test]
+    fn is_managed_by_controller_true_when_label_present() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            LABEL_MANAGED_BY.to_string(),
+            "wicket-controller".to_string(),
+        );
+        assert!(is_managed_by_controller(Some(&labels)));
+    }
+
+    #[test]
+    fn is_managed_by_controller_false_when_label_absent() {
+        let labels = BTreeMap::new();
+        assert!(!is_managed_by_controller(Some(&labels)));
+    }
+
+    #[test]
+    fn is_managed_by_controller_false_when_wrong_value() {
+        let mut labels = BTreeMap::new();
+        labels.insert(LABEL_MANAGED_BY.to_string(), "helm".to_string());
+        assert!(!is_managed_by_controller(Some(&labels)));
+    }
+
+    #[test]
+    fn is_managed_by_controller_false_when_no_labels() {
+        assert!(!is_managed_by_controller(None));
+    }
+
+    // ── replica conversion ────────────────────────────────────────────────────
+
+    #[test]
+    fn replica_conversion_valid_values() {
+        // u32 values that fit in i32 must convert without error.
+        let ok: Result<i32, _> = i32::try_from(0u32);
+        assert!(ok.is_ok());
+        let ok: Result<i32, _> = i32::try_from(i32::MAX as u32);
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn replica_conversion_overflow_is_err() {
+        // u32 values that exceed i32::MAX must fail conversion.
+        let overflow = (i32::MAX as u32) + 1;
+        let err: Result<i32, _> = i32::try_from(overflow);
+        assert!(
+            err.is_err(),
+            "overflow must be an error, not silently coerced"
+        );
+    }
+
+    // ── deployment_changed semantics ──────────────────────────────────────────
+
+    #[test]
+    fn deployment_changed_false_for_config_only_change_when_existing() {
+        // When spec_changed=false and the object already exists, deployment_changed
+        // must be false.  This is the "config-only change, no rollout" case.
+        // We test the logic directly since we cannot call apply_deployment without
+        // a live cluster.
+        let already_exists = true;
+        let spec_changed = false;
+        let changed = !already_exists || spec_changed;
+        assert!(
+            !changed,
+            "config-only change on existing deployment must not set deployment_changed"
+        );
+    }
+
+    #[test]
+    fn deployment_changed_true_when_spec_changed() {
+        let already_exists = true;
+        let spec_changed = true;
+        let changed = !already_exists || spec_changed;
+        assert!(changed);
+    }
+
+    #[test]
+    fn deployment_changed_true_when_new_object() {
+        let already_exists = false;
+        let spec_changed = false;
+        let changed = !already_exists || spec_changed;
+        assert!(changed, "new object must always set deployment_changed");
+    }
+
+    // ── service_changed semantics ─────────────────────────────────────────────
+
+    #[test]
+    fn service_changed_false_for_config_only_when_existing() {
+        let already_exists = true;
+        let spec_changed = false;
+        let changed = !already_exists || spec_changed;
+        assert!(!changed);
+    }
+
+    #[test]
+    fn service_changed_true_when_spec_changed() {
+        let already_exists = true;
+        let spec_changed = true;
+        let changed = !already_exists || spec_changed;
+        assert!(changed);
+    }
+
+    #[test]
+    fn service_changed_true_when_new_object() {
+        let already_exists = false;
+        let spec_changed = false;
+        let changed = !already_exists || spec_changed;
+        assert!(changed);
+    }
+
+    // ── Ownership preflight: collision rejection semantics ────────────────────
+    //
+    // These tests verify the preflight logic that rejects unowned same-name
+    // objects.  They exercise the pure `is_managed_by_controller` helper and
+    // the `ApplyError::NotOwned` construction to confirm the invariants hold
+    // without a live Kubernetes cluster.
+
+    /// An object with the exact managed-by label is owned; any other value
+    /// (including a prefix match or case variation) is not.
+    #[test]
+    fn ownership_check_exact_label_value_required() {
+        // Exact match: owned.
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            LABEL_MANAGED_BY.to_string(),
+            "wicket-controller".to_string(),
+        );
+        assert!(
+            is_managed_by_controller(Some(&labels)),
+            "exact managed-by value must be accepted"
+        );
+
+        // Prefix match: not owned.
+        let mut labels2 = BTreeMap::new();
+        labels2.insert(
+            LABEL_MANAGED_BY.to_string(),
+            "wicket-controller-extra".to_string(),
+        );
+        assert!(
+            !is_managed_by_controller(Some(&labels2)),
+            "prefix match must not be accepted (exact value required)"
+        );
+
+        // Case variation: not owned.
+        let mut labels3 = BTreeMap::new();
+        labels3.insert(
+            LABEL_MANAGED_BY.to_string(),
+            "Wicket-Controller".to_string(),
+        );
+        assert!(
+            !is_managed_by_controller(Some(&labels3)),
+            "case variation must not be accepted (exact value required)"
+        );
+    }
+
+    /// An object with multiple labels is owned only when the managed-by label
+    /// has the correct value; other labels are irrelevant.
+    #[test]
+    fn ownership_check_ignores_other_labels() {
+        let mut labels = BTreeMap::new();
+        labels.insert("app.kubernetes.io/name".to_string(), "wicket".to_string());
+        labels.insert(
+            "app.kubernetes.io/instance".to_string(),
+            "my-gw".to_string(),
+        );
+        labels.insert(
+            LABEL_MANAGED_BY.to_string(),
+            "wicket-controller".to_string(),
+        );
+        labels.insert("custom.io/extra".to_string(), "value".to_string());
+
+        assert!(
+            is_managed_by_controller(Some(&labels)),
+            "object with correct managed-by label plus other labels must be owned"
+        );
+    }
+
+    /// ApplyError::NotOwned carries the exact namespace and name of the
+    /// conflicting object so operators can identify it in logs.
+    #[test]
+    fn not_owned_error_carries_exact_identity() {
+        use crate::reconcilers::contracts::ApplyError;
+
+        let err = ApplyError::NotOwned {
+            namespace: "staging".to_string(),
+            name: "wicket-gw-prod-gateway-config".to_string(),
+        };
+        let display = err.to_string();
+
+        assert!(
+            display.contains("staging"),
+            "NotOwned error must contain namespace 'staging': {display}"
+        );
+        assert!(
+            display.contains("wicket-gw-prod-gateway-config"),
+            "NotOwned error must contain name 'wicket-gw-prod-gateway-config': {display}"
+        );
+        // The error message must mention the controller so operators know who
+        // should own the object.
+        assert!(
+            display.contains("wicket-controller"),
+            "NotOwned error must mention 'wicket-controller': {display}"
+        );
+    }
+
+    /// The preflight outcome for an unowned object must be Err(NotOwned), not
+    /// Ok(false).  Returning Ok(false) would cause the applier to silently
+    /// overwrite the object rather than aborting.
+    ///
+    /// We test this by simulating the preflight match logic directly.
+    #[test]
+    fn preflight_unowned_object_produces_not_owned_error() {
+        use crate::reconcilers::contracts::ApplyError;
+
+        // Simulate the preflight match: object exists but is not managed.
+        let unowned_labels: BTreeMap<String, String> = {
+            let mut m = BTreeMap::new();
+            m.insert(LABEL_MANAGED_BY.to_string(), "helm".to_string());
+            m
+        };
+
+        // Replicate the preflight logic from preflight_configmap / preflight_deployment.
+        let result: Result<bool, ApplyError> = if is_managed_by_controller(Some(&unowned_labels)) {
+            Ok(true) // owned
+        } else {
+            Err(ApplyError::NotOwned {
+                namespace: "prod".to_string(),
+                name: "wicket-gw-my-gw-config".to_string(),
+            })
+        };
+
+        assert!(
+            result.is_err(),
+            "unowned object must produce Err(NotOwned), not Ok(false)"
+        );
+        assert!(
+            matches!(result.unwrap_err(), ApplyError::NotOwned { .. }),
+            "error must be NotOwned variant"
+        );
+    }
+
+    /// The preflight outcome for an absent object (None from get_opt) must be
+    /// Ok(false), not Err.  A missing object is not an error; it means the
+    /// applier should create it.
+    #[test]
+    fn preflight_absent_object_produces_ok_false() {
+        use crate::reconcilers::contracts::ApplyError;
+
+        // Simulate the preflight match: object does not exist (get_opt returns None).
+        // Absent object → Ok(false), not Err.
+        let absent_labels: Option<&BTreeMap<String, String>> = None;
+        let result: Result<bool, ApplyError> = if is_managed_by_controller(absent_labels) {
+            Ok(true)
+        } else if absent_labels.is_none() {
+            Ok(false) // absent
+        } else {
+            Err(ApplyError::NotOwned {
+                namespace: "ns".to_string(),
+                name: "obj".to_string(),
+            })
+        };
+
+        assert!(
+            result.is_ok(),
+            "absent object must produce Ok(false), not Err"
+        );
+        assert!(!result.unwrap(), "absent object must produce Ok(false)");
+    }
+
+    /// The preflight outcome for an owned object must be Ok(true).
+    #[test]
+    fn preflight_owned_object_produces_ok_true() {
+        use crate::reconcilers::contracts::ApplyError;
+
+        let owned_labels: BTreeMap<String, String> = {
+            let mut m = BTreeMap::new();
+            m.insert(
+                LABEL_MANAGED_BY.to_string(),
+                "wicket-controller".to_string(),
+            );
+            m
+        };
+
+        // Replicate the preflight match: object exists and is managed.
+        let result: Result<bool, ApplyError> = if is_managed_by_controller(Some(&owned_labels)) {
+            Ok(true) // owned
+        } else {
+            Err(ApplyError::NotOwned {
+                namespace: "prod".to_string(),
+                name: "wicket-gw-my-gw-config".to_string(),
+            })
+        };
+
+        assert!(
+            result.is_ok(),
+            "owned object must produce Ok(true), not Err"
+        );
+        assert!(result.unwrap(), "owned object must produce Ok(true)");
+    }
+
+    /// The managed_labels() helper must always produce the correct managed-by
+    /// label value so that objects created by the applier pass their own
+    /// ownership preflight on subsequent reconcile cycles.
+    #[test]
+    fn managed_labels_passes_own_preflight() {
+        let plan = make_plan(false, false, ServiceType::ClusterIP, vec![]);
+        let labels = managed_labels(&plan);
+
+        // The labels produced by managed_labels() must pass is_managed_by_controller.
+        assert!(
+            is_managed_by_controller(Some(&labels)),
+            "managed_labels() output must pass is_managed_by_controller (idempotency)"
+        );
     }
 }

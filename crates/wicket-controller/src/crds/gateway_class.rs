@@ -6,7 +6,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::common::{Condition, GATEWAY_API_GROUP, GATEWAY_API_VERSION};
+use super::common::Condition;
 
 /// GatewayClassSpec defines the desired state of GatewayClass.
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]

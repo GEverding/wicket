@@ -363,6 +363,32 @@ pub enum ServiceType {
     NodePort,
 }
 
+impl std::fmt::Display for ServiceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServiceType::ClusterIP => write!(f, "ClusterIP"),
+            ServiceType::LoadBalancer => write!(f, "LoadBalancer"),
+            ServiceType::NodePort => write!(f, "NodePort"),
+        }
+    }
+}
+
+impl std::str::FromStr for ServiceType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ClusterIP" => Ok(ServiceType::ClusterIP),
+            "LoadBalancer" => Ok(ServiceType::LoadBalancer),
+            "NodePort" => Ok(ServiceType::NodePort),
+            other => Err(format!(
+                "invalid service type {:?}; expected one of: ClusterIP, LoadBalancer, NodePort",
+                other
+            )),
+        }
+    }
+}
+
 /// A single port entry for the owned Service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServicePortSpec {

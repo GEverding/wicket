@@ -323,6 +323,37 @@ impl AttachmentPlan {
             })
             .collect()
     }
+
+    /// Returns the attachment result for a specific route / parentRef combination.
+    ///
+    /// This is the targeted query used by the HTTPRoute status writer to look up
+    /// the planner outcome for a single `(route_namespace, route_name,
+    /// section_name, port)` tuple.
+    ///
+    /// `section_name` **must** be `Some` — callers that have a gateway-wide
+    /// parentRef (no `sectionName`) should not call this method; the planner
+    /// result for gateway-wide refs is ambiguous across multiple listeners and
+    /// the status writer falls back to the existing flat `Accepted=True` path.
+    ///
+    /// When the planner produced multiple results for the same parentRef (which
+    /// can happen if the same `sectionName` appears more than once in the
+    /// Gateway spec — an invalid Gateway, but defensively handled), the first
+    /// match is returned.
+    #[must_use]
+    pub fn result_for_route_parent_ref(
+        &self,
+        route_namespace: &str,
+        route_name: &str,
+        section_name: &str,
+        port: Option<u16>,
+    ) -> Option<&RouteAttachmentResult> {
+        self.route_results.iter().find(|r| {
+            r.route_namespace == route_namespace
+                && r.route_name == route_name
+                && r.parent_ref_section_name.as_deref() == Some(section_name)
+                && r.parent_ref_port == port
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3358,5 +3389,142 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.route_results[0].status, AttachmentStatus::Attached);
+    }
+
+    // ── result_for_route_parent_ref helper ────────────────────────────────────
+
+    /// `result_for_route_parent_ref` finds the correct result by
+    /// `(route_ns, route_name, section_name, port)`.
+    #[test]
+    fn result_for_route_parent_ref_finds_matching_result() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let route = make_http_route(
+            "prod",
+            "my-route",
+            vec![make_parent_ref("prod", "my-gw", Some("http"))],
+            vec![],
+        );
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route)
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input("prod", "my-gw", snapshot))
+            .unwrap();
+
+        let result = plan.result_for_route_parent_ref("prod", "my-route", "http", None);
+        assert!(result.is_some(), "should find result for matching triple");
+        assert_eq!(result.unwrap().status, AttachmentStatus::Attached);
+    }
+
+    /// `result_for_route_parent_ref` finds a `NoMatchingParent` result when
+    /// the route's parentRef specifies an unknown `sectionName`.
+    ///
+    /// The planner emits a `NoMatchingParent` result whose
+    /// `parent_ref_section_name` is set to the unknown name, so the lookup
+    /// still finds it.  A `None` return only happens when the route itself
+    /// is absent from the plan (different route name / namespace).
+    #[test]
+    fn result_for_route_parent_ref_returns_none_for_unknown_section() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        // Route's parentRef uses "nonexistent" as sectionName.
+        let route = make_http_route(
+            "prod",
+            "my-route",
+            vec![make_parent_ref("prod", "my-gw", Some("nonexistent"))],
+            vec![],
+        );
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route)
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input("prod", "my-gw", snapshot))
+            .unwrap();
+
+        // The planner emits a NoMatchingParent result with
+        // parent_ref_section_name = Some("nonexistent"), so the lookup finds it.
+        let result = plan.result_for_route_parent_ref("prod", "my-route", "nonexistent", None);
+        assert!(result.is_some(), "should find NoMatchingParent result");
+        assert_eq!(result.unwrap().status, AttachmentStatus::NoMatchingParent);
+
+        // A lookup for a section name that was never in any parentRef returns None.
+        let not_found =
+            plan.result_for_route_parent_ref("prod", "my-route", "completely-different", None);
+        assert!(
+            not_found.is_none(),
+            "should return None for section name not in any parentRef"
+        );
+    }
+
+    /// `result_for_route_parent_ref` returns `None` when the route name
+    /// does not match.
+    #[test]
+    fn result_for_route_parent_ref_returns_none_for_wrong_route_name() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let route = make_http_route(
+            "prod",
+            "my-route",
+            vec![make_parent_ref("prod", "my-gw", Some("http"))],
+            vec![],
+        );
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route)
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input("prod", "my-gw", snapshot))
+            .unwrap();
+
+        let result = plan.result_for_route_parent_ref("prod", "other-route", "http", None);
+        assert!(result.is_none(), "should return None for wrong route name");
+    }
+
+    /// `result_for_route_parent_ref` distinguishes by port when set.
+    #[test]
+    fn result_for_route_parent_ref_distinguishes_by_port() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let route = make_http_route(
+            "prod",
+            "my-route",
+            vec![make_parent_ref_with_port("prod", "my-gw", Some("http"), 80)],
+            vec![],
+        );
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route)
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input("prod", "my-gw", snapshot))
+            .unwrap();
+
+        // Correct port → finds result.
+        let found = plan.result_for_route_parent_ref("prod", "my-route", "http", Some(80));
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().status, AttachmentStatus::Attached);
+
+        // Wrong port → no match.
+        let not_found = plan.result_for_route_parent_ref("prod", "my-route", "http", Some(9999));
+        assert!(not_found.is_none());
     }
 }

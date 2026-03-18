@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn test_upstream_many_servers() {
-        let servers: Vec<_> = (1..=100).map(|p| addr(p)).collect();
+        let servers: Vec<_> = (1..=100).map(addr).collect();
         let upstream = Upstream::new("test".into(), servers.clone());
 
         for (i, expected) in servers.iter().enumerate() {
