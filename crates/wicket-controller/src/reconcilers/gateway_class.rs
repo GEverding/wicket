@@ -14,7 +14,7 @@ use kube::{
 };
 
 use crate::crds::{Condition, GatewayClass, GatewayClassStatus};
-use crate::metrics::{ReconcileMetrics, GATEWAY_CLASSES_TOTAL};
+use crate::metrics::{ReconcileMetrics, GATEWAY_CLASSES};
 
 use super::context::Context;
 
@@ -133,7 +133,7 @@ async fn update_gateway_class_metrics(client: &Client) {
                 .iter()
                 .filter(|gc| gc.is_wicket_managed())
                 .count();
-            GATEWAY_CLASSES_TOTAL.set(wicket_managed as i64);
+            GATEWAY_CLASSES.set(wicket_managed as i64);
         }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to list GatewayClasses for metrics");

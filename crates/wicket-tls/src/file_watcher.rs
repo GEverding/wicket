@@ -59,7 +59,7 @@ impl FileWatcher {
                         if let Some(expiry_timestamp) = extract_cert_expiry(cert_der) {
                             // Emit metric for each domain
                             for domain in &cert_config.domains {
-                                tls_metrics::certificate_expiry_timestamp_seconds(
+                                tls_metrics::wicket_tls_certificate_expiry_timestamp_seconds(
                                     cert_config.name.clone(),
                                     domain.clone(),
                                 )
@@ -205,11 +205,11 @@ impl FileWatcher {
         match self.build_store() {
             Ok(store) => {
                 self.manager.reload(store);
-                tls_metrics::cert_reload_total(CertReloadStatus::Success).inc();
+                tls_metrics::wicket_cert_reload_total(CertReloadStatus::Success).inc();
                 info!("certificates reloaded successfully");
             }
             Err(e) => {
-                tls_metrics::cert_reload_total(CertReloadStatus::Failure).inc();
+                tls_metrics::wicket_cert_reload_total(CertReloadStatus::Failure).inc();
                 error!(error = %e, "failed to reload certificates, keeping old");
             }
         }

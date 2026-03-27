@@ -16,7 +16,7 @@ use kube::{
 
 use crate::crds::{HTTPRoute, TCPRoute, TLSRoute};
 use crate::metrics::{
-    ReconcileMetrics, BACKENDS_TOTAL, BACKEND_ENDPOINTS_HEALTHY, BACKEND_ENDPOINTS_UNHEALTHY,
+    ReconcileMetrics, BACKENDS, BACKEND_ENDPOINTS_HEALTHY, BACKEND_ENDPOINTS_UNHEALTHY,
 };
 
 use super::config_generator::{GatewayState, ServiceEndpoints};
@@ -284,7 +284,7 @@ pub async fn load_all_service_endpoints(client: &Client, state: &mut GatewayStat
         *ns_counts.entry(ns.to_string()).or_insert(0) += 1;
     }
     for (ns, count) in ns_counts {
-        BACKENDS_TOTAL.with_label_values(&[&ns]).set(count);
+        BACKENDS.with_label_values(&[&ns]).set(count);
     }
 
     // Load endpoints for each referenced service

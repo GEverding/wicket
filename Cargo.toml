@@ -8,8 +8,6 @@ members = [
     "crates/wicket-stream",
     "crates/wicket-tls",
 ]
-exclude = ["volt"]
-
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -22,6 +20,7 @@ wicket-config = { path = "crates/wicket-config" }
 wicket-core = { path = "crates/wicket-core" }
 
 # eBPF sockmap (optional, Linux only)
+# TODO: Update once volt-sockmap crate is published in https://github.com/GEverding/volt
 volt-sockmap = { path = "volt/crates/volt-sockmap", features = ["embedded-bpf"] }
 
 # Pingora framework

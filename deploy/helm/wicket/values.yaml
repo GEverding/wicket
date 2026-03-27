@@ -54,4 +54,42 @@ crds:
 rbac:
   create: true
 
+# Monitoring: PrometheusRules, ServiceMonitors, Grafana dashboards
+monitoring:
+  # Prometheus alerting rules
+  prometheusRules:
+    enabled: false
+    # Additional labels for PrometheusRule resources (e.g. to match Prometheus selector)
+    labels: {}
+    # Proxy alert thresholds
+    proxy:
+      # Error rate threshold (fraction, e.g. 0.01 = 1%)
+      errorRateThreshold: 0.01
+      # p99 latency threshold in seconds
+      latencyP99Threshold: 1.0
+      # Certificate expiry warning threshold in seconds (default: 7 days)
+      certExpiryWarningSeconds: 604800
+    # Controller alert thresholds
+    controller:
+      # Reconciliation error rate threshold (fraction)
+      reconcileErrorRateThreshold: 0.05
+      # Config sync lag threshold in seconds (default: 5 minutes)
+      configSyncLagThreshold: 300
+
+  # Grafana dashboards (deployed as ConfigMaps with grafana_dashboard label)
+  grafanaDashboards:
+    enabled: false
+    # Additional labels for dashboard ConfigMaps
+    labels: {}
+    # Grafana sidecar folder
+    folder: "Wicket"
+    # Prometheus datasource name used in dashboard queries
+    datasource: "Prometheus"
+
+  # Proxy ServiceMonitor (controller already has one above)
+  proxyServiceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+
 createNamespace: false
