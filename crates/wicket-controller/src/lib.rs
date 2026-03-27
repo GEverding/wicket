@@ -56,9 +56,9 @@
 //!
 //! The controller exposes Prometheus metrics on port 8081:
 //!
-//! - `wicket_gateway_classes_total` - Number of GatewayClass resources
-//! - `wicket_gateways_total{namespace, gateway_class}` - Number of Gateways
-//! - `wicket_httproutes_total{namespace}` - Number of HTTPRoutes
+//! - `wicket_gateway_classes` - Number of GatewayClass resources
+//! - `wicket_gateways{namespace, gateway_class}` - Number of Gateways
+//! - `wicket_httproutes{namespace}` - Number of HTTPRoutes
 //! - `wicket_reconcile_total{resource_type, result}` - Reconciliation counts
 //! - `wicket_reconcile_duration_seconds{resource_type}` - Reconciliation latency
 //! - `wicket_backend_endpoints_healthy{namespace, service}` - Healthy endpoints

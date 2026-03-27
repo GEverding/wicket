@@ -16,38 +16,38 @@ lazy_static! {
     // ============================================================
 
     /// Number of GatewayClass resources.
-    pub static ref GATEWAY_CLASSES_TOTAL: IntGauge = IntGauge::new(
-        "wicket_gateway_classes_total",
-        "Total number of GatewayClass resources"
+    pub static ref GATEWAY_CLASSES: IntGauge = IntGauge::new(
+        "wicket_gateway_classes",
+        "Number of GatewayClass resources"
     ).expect("metric can be created");
 
     /// Number of Gateway resources by namespace and class.
-    pub static ref GATEWAYS_TOTAL: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("wicket_gateways_total", "Total number of Gateway resources"),
+    pub static ref GATEWAYS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_gateways", "Number of Gateway resources"),
         &["namespace", "gateway_class"]
     ).expect("metric can be created");
 
     /// Number of HTTPRoute resources by namespace.
-    pub static ref HTTPROUTES_TOTAL: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("wicket_httproutes_total", "Total number of HTTPRoute resources"),
+    pub static ref HTTPROUTES: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_httproutes", "Number of HTTPRoute resources"),
         &["namespace"]
     ).expect("metric can be created");
 
     /// Number of TCPRoute resources by namespace.
-    pub static ref TCPROUTES_TOTAL: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("wicket_tcproutes_total", "Total number of TCPRoute resources"),
+    pub static ref TCPROUTES: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_tcproutes", "Number of TCPRoute resources"),
         &["namespace"]
     ).expect("metric can be created");
 
     /// Number of TLSRoute resources by namespace.
-    pub static ref TLSROUTES_TOTAL: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("wicket_tlsroutes_total", "Total number of TLSRoute resources"),
+    pub static ref TLSROUTES: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_tlsroutes", "Number of TLSRoute resources"),
         &["namespace"]
     ).expect("metric can be created");
 
     /// Number of ReferenceGrant resources by namespace.
-    pub static ref REFERENCE_GRANTS_TOTAL: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("wicket_reference_grants_total", "Total number of ReferenceGrant resources"),
+    pub static ref REFERENCE_GRANTS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_reference_grants", "Number of ReferenceGrant resources"),
         &["namespace"]
     ).expect("metric can be created");
 
@@ -87,8 +87,8 @@ lazy_static! {
     // ============================================================
 
     /// Number of backend services being watched.
-    pub static ref BACKENDS_TOTAL: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("wicket_backends_total", "Total number of backend services"),
+    pub static ref BACKENDS: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_backends", "Number of backend services"),
         &["namespace"]
     ).expect("metric can be created");
 
@@ -122,8 +122,8 @@ lazy_static! {
 
     /// Current configuration generation/version.
     pub static ref CONFIG_GENERATION: IntGauge = IntGauge::new(
-        "wicket_config_generation",
-        "Current configuration generation"
+        "wicket_controller_config_generation",
+        "Current controller configuration generation"
     ).expect("metric can be created");
 
     // ============================================================
@@ -131,8 +131,8 @@ lazy_static! {
     // ============================================================
 
     /// Number of TLS certificates being managed.
-    pub static ref TLS_CERTIFICATES_TOTAL: IntGaugeVec = IntGaugeVec::new(
-        Opts::new("wicket_tls_certificates_total", "Total number of TLS certificates"),
+    pub static ref TLS_CERTIFICATES: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("wicket_tls_certificates", "Number of TLS certificates"),
         &["namespace", "type"]
     ).expect("metric can be created");
 
@@ -158,11 +158,11 @@ lazy_static! {
         "Controller uptime in seconds"
     ).expect("metric can be created");
 
-    /// Kubernetes API request latency.
-    pub static ref K8S_API_LATENCY_SECONDS: HistogramVec = HistogramVec::new(
+    /// Kubernetes API request duration.
+    pub static ref K8S_API_DURATION_SECONDS: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
-            "wicket_k8s_api_latency_seconds",
-            "Kubernetes API request latency"
+            "wicket_k8s_api_duration_seconds",
+            "Kubernetes API request duration"
         ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
         &["operation", "resource"]
     ).expect("metric can be created");
@@ -283,27 +283,27 @@ lazy_static! {
 
 /// Register all metrics with the global registry.
 pub fn register_metrics() -> Result<(), prometheus::Error> {
-    REGISTRY.register(Box::new(GATEWAY_CLASSES_TOTAL.clone()))?;
-    REGISTRY.register(Box::new(GATEWAYS_TOTAL.clone()))?;
-    REGISTRY.register(Box::new(HTTPROUTES_TOTAL.clone()))?;
-    REGISTRY.register(Box::new(TCPROUTES_TOTAL.clone()))?;
-    REGISTRY.register(Box::new(TLSROUTES_TOTAL.clone()))?;
-    REGISTRY.register(Box::new(REFERENCE_GRANTS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(GATEWAY_CLASSES.clone()))?;
+    REGISTRY.register(Box::new(GATEWAYS.clone()))?;
+    REGISTRY.register(Box::new(HTTPROUTES.clone()))?;
+    REGISTRY.register(Box::new(TCPROUTES.clone()))?;
+    REGISTRY.register(Box::new(TLSROUTES.clone()))?;
+    REGISTRY.register(Box::new(REFERENCE_GRANTS.clone()))?;
     REGISTRY.register(Box::new(RECONCILE_TOTAL.clone()))?;
     REGISTRY.register(Box::new(RECONCILE_DURATION_SECONDS.clone()))?;
     REGISTRY.register(Box::new(RECONCILE_ERRORS_TOTAL.clone()))?;
     REGISTRY.register(Box::new(RECONCILE_QUEUE_DEPTH.clone()))?;
-    REGISTRY.register(Box::new(BACKENDS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(BACKENDS.clone()))?;
     REGISTRY.register(Box::new(BACKEND_ENDPOINTS_HEALTHY.clone()))?;
     REGISTRY.register(Box::new(BACKEND_ENDPOINTS_UNHEALTHY.clone()))?;
     REGISTRY.register(Box::new(CONFIG_UPDATES_TOTAL.clone()))?;
     REGISTRY.register(Box::new(CONFIG_LAST_UPDATE_TIMESTAMP.clone()))?;
     REGISTRY.register(Box::new(CONFIG_GENERATION.clone()))?;
-    REGISTRY.register(Box::new(TLS_CERTIFICATES_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(TLS_CERTIFICATES.clone()))?;
     REGISTRY.register(Box::new(TLS_CERTIFICATE_EXPIRY_TIMESTAMP.clone()))?;
     REGISTRY.register(Box::new(CONTROLLER_IS_LEADER.clone()))?;
     REGISTRY.register(Box::new(CONTROLLER_UPTIME_SECONDS.clone()))?;
-    REGISTRY.register(Box::new(K8S_API_LATENCY_SECONDS.clone()))?;
+    REGISTRY.register(Box::new(K8S_API_DURATION_SECONDS.clone()))?;
     REGISTRY.register(Box::new(K8S_API_ERRORS_TOTAL.clone()))?;
 
     // TLS Secret metrics

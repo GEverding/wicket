@@ -1,0 +1,169 @@
+{{- if .Values.monitoring.prometheusRules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "wicket.controller.name" . }}
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.controller.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRules.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    # ================================================================
+    # Reconciliation health
+    # ================================================================
+    - name: wicket-controller-reconciliation
+      rules:
+        - alert: WicketReconcileErrorRate
+          expr: |
+            (
+              sum(rate(wicket_reconcile_total{result="error"}[5m]))
+              /
+              sum(rate(wicket_reconcile_total[5m]))
+            ) > {{ .Values.monitoring.prometheusRules.controller.reconcileErrorRateThreshold }}
+          for: 5m
+          labels:
+            severity: warning
+            component: controller
+          annotations:
+            summary: "Wicket controller reconciliation error rate above {{ mul (int (mulf .Values.monitoring.prometheusRules.controller.reconcileErrorRateThreshold 100)) 1 }}%"
+            description: >-
+              Reconciliation error rate is {{`{{ $value | humanizePercentage }}`}}.
+
+        - alert: WicketReconcileErrorRateByType
+          expr: |
+            (
+              sum by (resource_type) (rate(wicket_reconcile_total{result="error"}[5m]))
+              /
+              sum by (resource_type) (rate(wicket_reconcile_total[5m]))
+            ) > {{ .Values.monitoring.prometheusRules.controller.reconcileErrorRateThreshold }}
+          for: 10m
+          labels:
+            severity: warning
+            component: controller
+          annotations:
+            summary: "High reconciliation errors for {{`{{ $labels.resource_type }}`}}"
+            description: >-
+              Error rate for {{`{{ $labels.resource_type }}`}} is {{`{{ $value | humanizePercentage }}`}}.
+
+        - alert: WicketReconcileQueueBacklog
+          expr: wicket_reconcile_queue_depth > 50
+          for: 10m
+          labels:
+            severity: warning
+            component: controller
+          annotations:
+            summary: "Reconciliation queue backlog for {{`{{ $labels.resource_type }}`}}"
+            description: >-
+              Queue depth is {{`{{ $value }}`}} for {{`{{ $labels.resource_type }}`}}.
+
+    # ================================================================
+    # Config sync health
+    # ================================================================
+    - name: wicket-controller-config
+      rules:
+        - alert: WicketConfigSyncLag
+          expr: wicket_config_sync_lag_seconds > {{ .Values.monitoring.prometheusRules.controller.configSyncLagThreshold }}
+          for: 2m
+          labels:
+            severity: warning
+            component: controller
+          annotations:
+            summary: "Wicket controller config sync is lagging"
+            description: >-
+              Config has not been synced for {{`{{ $value | humanizeDuration }}`}}.
+
+        - alert: WicketConfigSyncLagCritical
+          expr: wicket_config_sync_lag_seconds > {{ mulf .Values.monitoring.prometheusRules.controller.configSyncLagThreshold 3 }}
+          for: 2m
+          labels:
+            severity: critical
+            component: controller
+          annotations:
+            summary: "Wicket controller config sync critically stale"
+            description: >-
+              Config has not been synced for {{`{{ $value | humanizeDuration }}`}} (3x threshold).
+
+        - alert: WicketConfigUpdatesFailing
+          expr: |
+            rate(wicket_config_updates_total{result="failure"}[5m]) > 0
+            and rate(wicket_config_updates_total{result="success"}[5m]) == 0
+          for: 5m
+          labels:
+            severity: warning
+            component: controller
+          annotations:
+            summary: "Wicket config updates are failing"
+            description: >-
+              Config updates have been failing with no successes for the last 5 minutes.
+
+    # ================================================================
+    # Leader election and availability
+    # ================================================================
+    - name: wicket-controller-health
+      rules:
+        - alert: WicketControllerNotLeader
+          expr: wicket_controller_is_leader == 0
+          for: 5m
+          labels:
+            severity: warning
+            component: controller
+          annotations:
+            summary: "Wicket controller has lost leader election"
+            description: >-
+              No controller instance has held the leader lock for the last 5 minutes.
+
+        - alert: WicketNoHealthyBackends
+          expr: wicket_backend_endpoints_healthy == 0
+          for: 2m
+          labels:
+            severity: critical
+            component: controller
+          annotations:
+            summary: "No healthy endpoints for {{`{{ $labels.service }}`}}"
+            description: >-
+              Service {{`{{ $labels.namespace }}`}}/{{`{{ $labels.service }}`}} has zero healthy endpoints.
+
+    # ================================================================
+    # Kubernetes API health
+    # ================================================================
+    - name: wicket-controller-k8s
+      rules:
+        - alert: WicketK8sApiErrors
+          expr: rate(wicket_k8s_api_errors_total[5m]) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            component: controller
+          annotations:
+            summary: "Elevated Kubernetes API errors"
+            description: >-
+              K8s API errors for {{`{{ $labels.operation }}`}} on {{`{{ $labels.resource }}`}}: {{`{{ $value }}`}}/s.
+
+        - alert: WicketK8sApiSlow
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le, operation) (rate(wicket_k8s_api_duration_seconds_bucket[5m]))
+            ) > 5
+          for: 5m
+          labels:
+            severity: warning
+            component: controller
+          annotations:
+            summary: "Kubernetes API calls are slow"
+            description: >-
+              p99 latency for {{`{{ $labels.operation }}`}} is {{`{{ $value | humanizeDuration }}`}}.
+
+        - alert: WicketWatchErrors
+          expr: rate(wicket_watch_errors_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            component: controller
+          annotations:
+            summary: "Watch errors for {{`{{ $labels.resource_type }}`}}"
+            description: >-
+              Watch connection errors detected for {{`{{ $labels.resource_type }}`}}.
+{{- end }}

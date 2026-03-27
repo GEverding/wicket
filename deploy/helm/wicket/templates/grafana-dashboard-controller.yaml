@@ -1,0 +1,250 @@
+{{- if .Values.monitoring.grafanaDashboards.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "wicket.fullname" . }}-grafana-controller
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+    {{- with .Values.monitoring.grafanaDashboards.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    grafana-folder: {{ .Values.monitoring.grafanaDashboards.folder | quote }}
+data:
+  wicket-controller.json: |-
+    {
+      "annotations": { "list": [] },
+      "description": "Wicket Controller Reconciliation and Health Metrics",
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "title": "Reconciliation Rate",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (resource_type) (rate(wicket_reconcile_total[5m]))",
+              "legendFormat": "{{`{{ resource_type }}`}}"
+            }
+          ]
+        },
+        {
+          "title": "Reconciliation Error Rate",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "value": null, "color": "green" },
+                  { "value": 0.05, "color": "yellow" },
+                  { "value": 0.1, "color": "red" }
+                ]
+              }
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (resource_type) (rate(wicket_reconcile_total{result=\"error\"}[5m])) / sum by (resource_type) (rate(wicket_reconcile_total[5m]))",
+              "legendFormat": "{{`{{ resource_type }}`}}"
+            }
+          ]
+        },
+        {
+          "title": "Reconciliation Duration (p99)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le, resource_type) (rate(wicket_reconcile_duration_seconds_bucket[5m])))",
+              "legendFormat": "{{`{{ resource_type }}`}}"
+            }
+          ]
+        },
+        {
+          "title": "Leader Status",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 0, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "Follower", "color": "yellow" }, "1": { "text": "Leader", "color": "green" } } }
+              ]
+            }
+          },
+          "targets": [
+            { "expr": "wicket_controller_is_leader", "legendFormat": "Status" }
+          ]
+        },
+        {
+          "title": "Config Sync Lag",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 4, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "value": null, "color": "green" },
+                  { "value": 60, "color": "yellow" },
+                  { "value": 300, "color": "red" }
+                ]
+              }
+            }
+          },
+          "targets": [
+            { "expr": "wicket_config_sync_lag_seconds", "legendFormat": "Lag" }
+          ]
+        },
+        {
+          "title": "Config Generation",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 8, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "targets": [
+            { "expr": "wicket_controller_config_generation", "legendFormat": "Generation" }
+          ]
+        },
+        {
+          "title": "Queue Depth",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 12, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "targets": [
+            { "expr": "sum by (resource_type) (wicket_reconcile_queue_depth)", "legendFormat": "{{`{{ resource_type }}`}}" }
+          ]
+        },
+        {
+          "title": "Uptime",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 16, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "fieldConfig": {
+            "defaults": { "unit": "s" }
+          },
+          "targets": [
+            { "expr": "wicket_controller_uptime_seconds", "legendFormat": "Uptime" }
+          ]
+        },
+        {
+          "title": "Resources Pending Sync",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 20, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "targets": [
+            { "expr": "sum by (resource_type) (wicket_resources_pending_sync)", "legendFormat": "{{`{{ resource_type }}`}}" }
+          ]
+        },
+        {
+          "title": "Resource Counts",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          },
+          "targets": [
+            { "expr": "wicket_gateway_classes", "legendFormat": "GatewayClasses" },
+            { "expr": "sum(wicket_gateways)", "legendFormat": "Gateways" },
+            { "expr": "sum(wicket_httproutes)", "legendFormat": "HTTPRoutes" },
+            { "expr": "sum(wicket_tcproutes)", "legendFormat": "TCPRoutes" },
+            { "expr": "sum(wicket_tlsroutes)", "legendFormat": "TLSRoutes" },
+            { "expr": "sum(wicket_reference_grants)", "legendFormat": "ReferenceGrants" }
+          ]
+        },
+        {
+          "title": "Backend Endpoint Health",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (service) (wicket_backend_endpoints_healthy)",
+              "legendFormat": "{{`{{ service }}`}} healthy"
+            },
+            {
+              "expr": "sum by (service) (wicket_backend_endpoints_unhealthy)",
+              "legendFormat": "{{`{{ service }}`}} unhealthy"
+            }
+          ]
+        },
+        {
+          "title": "K8s API Duration (p99)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le, operation) (rate(wicket_k8s_api_duration_seconds_bucket[5m])))",
+              "legendFormat": "{{`{{ operation }}`}}"
+            }
+          ]
+        },
+        {
+          "title": "K8s API Errors",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "drawStyle": "bars", "fillOpacity": 50 }
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (operation, error_type) (rate(wicket_k8s_api_errors_total[5m]))",
+              "legendFormat": "{{`{{ operation }}`}} - {{`{{ error_type }}`}}"
+            }
+          ]
+        }
+      ],
+      "schemaVersion": 39,
+      "tags": ["wicket", "controller", "kubernetes"],
+      "templating": { "list": [] },
+      "time": { "from": "now-1h", "to": "now" },
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "Wicket Controller - Reconciliation & Health",
+      "uid": "wicket-controller"
+    }
+{{- end }}

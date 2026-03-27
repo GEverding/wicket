@@ -20,7 +20,7 @@ use crate::crds::{
     ListenerStatus, RouteGroupKind,
 };
 use crate::metrics::{
-    ReconcileMetrics, GATEWAYS_TOTAL, GATEWAY_LISTENER_ATTACHED_ROUTES, GATEWAY_PROGRAMMED,
+    ReconcileMetrics, GATEWAYS, GATEWAY_LISTENER_ATTACHED_ROUTES, GATEWAY_PROGRAMMED,
 };
 use crate::reconcilers::attachment_planner::{AttachmentPlanInput, AttachmentPlanner};
 use crate::reconcilers::contracts::Planner;
@@ -1159,7 +1159,7 @@ async fn update_gateway_metrics(client: &Client) {
             }
 
             for ((ns, class), count) in counts {
-                GATEWAYS_TOTAL.with_label_values(&[&ns, &class]).set(count);
+                GATEWAYS.with_label_values(&[&ns, &class]).set(count);
             }
         }
         Err(e) => {

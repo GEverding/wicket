@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::health::BackendHealth;
 use crate::metrics::{
-    STREAM_BACKEND_HEALTH, STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL, STREAM_BYTES_TOTAL,
+    STREAM_UPSTREAM_HEALTH, STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL, STREAM_BYTES_TOTAL,
     STREAM_CONFIG_RELOADS_TOTAL, STREAM_CONNECTIONS_ACTIVE, STREAM_CONNECTIONS_REJECTED_TOTAL,
     STREAM_CONNECTIONS_TOTAL, STREAM_CONNECTION_DURATION_SECONDS, STREAM_CONNECTION_ERRORS_TOTAL,
     STREAM_CONNECT_DURATION_SECONDS, STREAM_PROXY_PATH_TOTAL, STREAM_SNI_EXTRACTIONS_TOTAL,
@@ -120,7 +120,7 @@ impl Upstream {
             let was_healthy = h.is_healthy();
             h.record_success();
             if !was_healthy {
-                STREAM_BACKEND_HEALTH
+                STREAM_UPSTREAM_HEALTH
                     .with_label_values(&[&self.name, &addr.to_string()])
                     .set(1);
                 STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL
@@ -136,7 +136,7 @@ impl Upstream {
             let was_healthy = h.is_healthy();
             h.record_failure();
             if was_healthy {
-                STREAM_BACKEND_HEALTH
+                STREAM_UPSTREAM_HEALTH
                     .with_label_values(&[&self.name, &addr.to_string()])
                     .set(0);
                 STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL

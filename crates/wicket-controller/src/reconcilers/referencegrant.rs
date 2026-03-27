@@ -17,7 +17,7 @@ use kube::{
 
 use crate::crds::ReferenceGrant;
 use crate::metrics::{
-    ReconcileMetrics, REFERENCE_GRANTS_TOTAL, WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL,
+    ReconcileMetrics, REFERENCE_GRANTS, WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL,
     WATCH_EVENTS_TOTAL,
 };
 
@@ -114,7 +114,7 @@ async fn update_referencegrant_metrics(client: &Client) {
             }
 
             for (ns, count) in counts {
-                REFERENCE_GRANTS_TOTAL.with_label_values(&[&ns]).set(count);
+                REFERENCE_GRANTS.with_label_values(&[&ns]).set(count);
             }
         }
         Err(e) => {
