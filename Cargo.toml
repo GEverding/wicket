@@ -5,11 +5,10 @@ members = [
     "crates/wicket-config",
     "crates/wicket-controller",
     "crates/wicket-core",
+    "crates/wicket-sockmap",
     "crates/wicket-stream",
     "crates/wicket-tls",
 ]
-exclude = ["volt"]
-
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -22,7 +21,7 @@ wicket-config = { path = "crates/wicket-config" }
 wicket-core = { path = "crates/wicket-core" }
 
 # eBPF sockmap (optional, Linux only)
-volt-sockmap = { path = "volt/crates/volt-sockmap", features = ["embedded-bpf"] }
+wicket-sockmap = { path = "crates/wicket-sockmap" }
 
 # Pingora framework
 pingora = { version = "0.6", features = ["lb"] }

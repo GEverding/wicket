@@ -342,7 +342,7 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
 
         #[cfg(all(target_os = "linux", feature = "ebpf"))]
         {
-            use volt_sockmap::{SocketMap, SocketMapConfig};
+            use wicket_sockmap::{SocketMap, SocketMapConfig};
 
             let sockmap_config = SocketMapConfig {
                 bpf_object_path: None, // Use embedded BPF bytecode

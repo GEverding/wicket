@@ -192,11 +192,11 @@ impl AcmeProvider {
                     Ok(stored) => {
                         let key = self.load_stored_cert(&stored)?;
                         store.insert(&cert_config.domains, key);
-                        tls_metrics::acme_renewal_total(AcmeRenewalStatus::Success).inc();
+                        tls_metrics::wicket_acme_renewal_total(AcmeRenewalStatus::Success).inc();
                         any_renewed = true;
                     }
                     Err(e) => {
-                        tls_metrics::acme_renewal_total(AcmeRenewalStatus::Failure).inc();
+                        tls_metrics::wicket_acme_renewal_total(AcmeRenewalStatus::Failure).inc();
                         error!(domain = %primary_domain, error = %e, "renewal failed");
                         // Keep using existing cert
                         if let Ok(Some(stored)) = self.storage.load_cert(primary_domain) {
@@ -208,7 +208,7 @@ impl AcmeProvider {
             } else {
                 // Load existing cert
                 if let Some(stored) = self.storage.load_cert(primary_domain)? {
-                    tls_metrics::acme_renewal_total(AcmeRenewalStatus::Skipped).inc();
+                    tls_metrics::wicket_acme_renewal_total(AcmeRenewalStatus::Skipped).inc();
                     let key = self.load_stored_cert(&stored)?;
                     store.insert(&cert_config.domains, key);
                 }

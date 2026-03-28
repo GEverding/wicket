@@ -98,9 +98,9 @@ lazy_static! {
     // ============================================================
 
     /// Backend health status (1=healthy, 0=unhealthy), labelled by upstream and backend.
-    pub static ref STREAM_BACKEND_HEALTH: IntGaugeVec = register_int_gauge_vec!(
-        "wicket_stream_backend_healthy",
-        "Backend health status (1=healthy, 0=unhealthy)",
+    pub static ref STREAM_UPSTREAM_HEALTH: IntGaugeVec = register_int_gauge_vec!(
+        "wicket_stream_upstream_health",
+        "Upstream backend health status (1=healthy, 0=unhealthy)",
         &["upstream", "backend"]
     )
     .expect("metric can be created");
@@ -162,7 +162,7 @@ pub fn register_stream_metrics() {
     let _ = &*STREAM_BYTES_TOTAL;
     let _ = &*STREAM_SNI_EXTRACTIONS_TOTAL;
     let _ = &*STREAM_CONNECT_DURATION_SECONDS;
-    let _ = &*STREAM_BACKEND_HEALTH;
+    let _ = &*STREAM_UPSTREAM_HEALTH;
     let _ = &*STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL;
     let _ = &*STREAM_CONNECTIONS_REJECTED_TOTAL;
     let _ = &*STREAM_CONFIG_RELOADS_TOTAL;

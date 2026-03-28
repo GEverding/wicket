@@ -1,0 +1,169 @@
+{{- if .Values.monitoring.prometheusRules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "wicket.proxy.name" . }}
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.proxy.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRules.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    # ================================================================
+    # RED: Error rate alerts (multi-window burn rate)
+    # ================================================================
+    - name: wicket-proxy-errors
+      rules:
+        - alert: WicketHighErrorRate
+          expr: |
+            (
+              sum(rate(wicket_http_errors_total{error_type="server_error"}[5m]))
+              /
+              sum(rate(wicket_http_requests_total[5m]))
+            ) > {{ .Values.monitoring.prometheusRules.proxy.errorRateThreshold }}
+          for: 5m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "Wicket proxy 5xx error rate above {{ mul (int (mulf .Values.monitoring.prometheusRules.proxy.errorRateThreshold 100)) 1 }}%"
+            description: >-
+              Error rate is {{`{{ $value | humanizePercentage }}`}} over the last 5 minutes.
+
+        - alert: WicketHighErrorRateCritical
+          expr: |
+            (
+              sum(rate(wicket_http_errors_total{error_type="server_error"}[5m]))
+              /
+              sum(rate(wicket_http_requests_total[5m]))
+            ) > {{ mulf .Values.monitoring.prometheusRules.proxy.errorRateThreshold 5 }}
+          for: 2m
+          labels:
+            severity: critical
+            component: proxy
+          annotations:
+            summary: "Wicket proxy 5xx error rate critically high"
+            description: >-
+              Error rate is {{`{{ $value | humanizePercentage }}`}} over the last 5 minutes (5x threshold).
+
+    # ================================================================
+    # RED: Latency alerts
+    # ================================================================
+    - name: wicket-proxy-latency
+      rules:
+        - alert: WicketHighLatencyP99
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(wicket_http_request_duration_seconds_bucket[5m])) by (le)
+            ) > {{ .Values.monitoring.prometheusRules.proxy.latencyP99Threshold }}
+          for: 5m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "Wicket proxy p99 latency above {{ .Values.monitoring.prometheusRules.proxy.latencyP99Threshold }}s"
+            description: >-
+              p99 latency is {{`{{ $value | humanizeDuration }}`}}.
+
+        - alert: WicketHighUpstreamLatency
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(wicket_upstream_duration_seconds_bucket[5m])) by (le, upstream)
+            ) > {{ .Values.monitoring.prometheusRules.proxy.latencyP99Threshold }}
+          for: 5m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "Upstream p99 latency above threshold"
+            description: >-
+              Upstream {{`{{ $labels.upstream }}`}} p99 latency is {{`{{ $value | humanizeDuration }}`}}.
+
+    # ================================================================
+    # Upstream health alerts
+    # ================================================================
+    - name: wicket-proxy-upstreams
+      rules:
+        - alert: WicketAllBackendsDown
+          expr: wicket_upstream_healthy_backends == 0
+          for: 1m
+          labels:
+            severity: critical
+            component: proxy
+          annotations:
+            summary: "All backends down for upstream {{`{{ $labels.upstream }}`}}"
+            description: >-
+              Upstream {{`{{ $labels.upstream }}`}} has zero healthy backends.
+
+        - alert: WicketUpstreamDegraded
+          expr: |
+            wicket_upstream_healthy_backends
+            < 2
+            and wicket_upstream_healthy_backends > 0
+          for: 5m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "Upstream {{`{{ $labels.upstream }}`}} degraded"
+            description: >-
+              Only {{`{{ $value }}`}} healthy backend(s) remaining.
+
+        - alert: WicketCircuitBreakerTripping
+          expr: rate(wicket_circuit_breaker_trips_total[5m]) > 0
+          for: 2m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "Circuit breaker tripping for {{`{{ $labels.upstream }}`}}"
+            description: >-
+              Circuit breaker has been tripping for the last 2 minutes.
+
+    # ================================================================
+    # TLS certificate alerts
+    # ================================================================
+    - name: wicket-proxy-tls
+      rules:
+        - alert: WicketCertificateExpiringSoon
+          expr: |
+            (wicket_tls_certificate_expiry_timestamp_seconds - time())
+            < {{ .Values.monitoring.prometheusRules.proxy.certExpiryWarningSeconds }}
+          for: 1h
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "TLS certificate expiring soon for {{`{{ $labels.domain }}`}}"
+            description: >-
+              Certificate expires in {{`{{ $value | humanizeDuration }}`}}.
+
+        - alert: WicketCertificateExpired
+          expr: wicket_tls_certificate_expiry_timestamp_seconds < time()
+          for: 5m
+          labels:
+            severity: critical
+            component: proxy
+          annotations:
+            summary: "TLS certificate expired for {{`{{ $labels.domain }}`}}"
+
+    # ================================================================
+    # Config reload alerts
+    # ================================================================
+    - name: wicket-proxy-config
+      rules:
+        - alert: WicketConfigReloadFailing
+          expr: |
+            rate(wicket_config_reloads_total{result="failure"}[5m]) > 0
+            and rate(wicket_config_reloads_total{result="success"}[5m]) == 0
+          for: 5m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "Wicket proxy config reloads are failing"
+            description: >-
+              Config reloads have been failing with no successes for the last 5 minutes.
+{{- end }}

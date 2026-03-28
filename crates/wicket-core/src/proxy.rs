@@ -33,7 +33,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Mutex;
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-use volt_sockmap::SocketMap;
+use wicket_sockmap::SocketMap;
 
 /// Per-request context for the Wicket proxy.
 ///

@@ -18,7 +18,7 @@ use crate::crds::{
     Condition, Gateway, GatewayClass, RouteParentStatus, TCPRoute, TCPRouteStatus,
     WICKET_CONTROLLER_NAME,
 };
-use crate::metrics::{ReconcileMetrics, ROUTES_ACCEPTED, ROUTES_REJECTED_TOTAL, TCPROUTES_TOTAL};
+use crate::metrics::{ReconcileMetrics, ROUTES_ACCEPTED, ROUTES_REJECTED_TOTAL, TCPROUTES};
 
 use super::attachment_planner::{
     AttachmentPlan, AttachmentPlanInput, AttachmentPlanner, AttachmentStatus,
@@ -653,7 +653,7 @@ async fn update_tcproute_metrics(client: &Client) {
             }
 
             for (ns, count) in counts {
-                TCPROUTES_TOTAL.with_label_values(&[&ns]).set(count);
+                TCPROUTES.with_label_values(&[&ns]).set(count);
             }
         }
         Err(e) => {
