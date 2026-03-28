@@ -119,7 +119,7 @@ pub fn error_policy_gateway_class(
         .with_label_values(&["GatewayClass", "reconcile_error"])
         .inc();
 
-    Action::requeue(Duration::from_secs(60))
+    Action::requeue(Duration::from_secs(5))
 }
 
 /// Update GatewayClass metrics.
