@@ -1082,7 +1082,6 @@ mod tests {
                 ServiceEndpoints {
                     namespace: "default".to_string(),
                     name: "my-svc".to_string(),
-                    port: 80,
                     endpoints: vec!["10.0.0.1:80".to_string()],
                 },
             )

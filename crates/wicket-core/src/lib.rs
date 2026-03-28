@@ -7,6 +7,6 @@ pub mod proxy;
 pub mod routing;
 
 pub use metrics::{register_metrics, RequestMetrics};
-pub use proxy::{WicketCtx, WicketProxy};
+pub use proxy::{HttpReloadHandle, WicketCtx, WicketProxy};
 pub use routing::{RouteMatch as MatchedRoute, Router};
 pub use wicket_tls;
