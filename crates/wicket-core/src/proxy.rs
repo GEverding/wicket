@@ -18,7 +18,9 @@ use pingora_core::Result as PingoraResult;
 use pingora_load_balancing::selection::consistent::KetamaHashing;
 use pingora_load_balancing::selection::RoundRobin;
 use pingora_load_balancing::{health_check::TcpHealthCheck, LoadBalancer};
+use pingora_http::RequestHeader;
 use pingora_proxy::{ProxyHttp, Session};
+use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -338,6 +340,15 @@ impl ProxyHttp for WicketProxy {
     {
         let req_header = session.req_header();
 
+        // Propagate incoming X-Request-Id if present, otherwise keep generated one
+        if let Some(incoming_id) = req_header
+            .headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            ctx.request_id = incoming_id.to_string();
+        }
+
         // Extract request properties
         let host = req_header.headers.get("host").and_then(|v| v.to_str().ok());
 
@@ -443,6 +454,30 @@ impl ProxyHttp for WicketProxy {
         );
 
         Ok(Box::new(peer))
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> PingoraResult<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Inject X-Request-Id header to upstream
+        upstream_request
+            .insert_header("x-request-id", &ctx.request_id)
+            .map_err(|e| {
+                warn!(
+                    request_id = %ctx.request_id,
+                    error = %e,
+                    "Failed to insert X-Request-Id header"
+                );
+                Error::new(ErrorType::InternalError)
+            })?;
+
+        Ok(())
     }
 
     /// Called after successfully connecting to upstream.
@@ -632,16 +667,12 @@ impl ProxyHttp for WicketProxy {
     }
 }
 
-/// Generate a unique request ID.
+/// Generate a unique request ID using a cryptographically random 64-bit value.
+///
+/// Format: `req_<16 hex chars>` (e.g. `req_a1b2c3d4e5f67890`).
 fn generate_request_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-
-    format!("{:x}", timestamp)
+    let value: u64 = rand::thread_rng().gen();
+    format!("req_{:016x}", value)
 }
 
 #[cfg(test)]
