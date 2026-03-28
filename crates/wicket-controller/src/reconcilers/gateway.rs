@@ -3587,4 +3587,314 @@ mod tests {
             );
         }
     }
+
+    // ── Scale-to-zero through the status outcome path ────────────────────────
+    //
+    // When a Deployment is intentionally scaled to 0, the Gateway must still
+    // report Programmed=True (the Deployment is at desired state).
+
+    #[test]
+    fn resolve_outcome_applied_scale_to_zero_is_programmed() {
+        let obs = ObservedRuntimeState {
+            current_config_hash: Some("hash".to_string()),
+            current_spec_hash: Some("spec".to_string()),
+            ready_replicas: Some(0),
+            deploy_observed_generation: Some(3),
+            deploy_generation: Some(3),
+            updated_replicas: Some(0),
+            available_replicas: Some(0),
+            desired_replicas: Some(0),
+        };
+        let noop = RuntimeApplyResult::default();
+        let input = super::ManagedRuntimeInput::Applied(obs, noop);
+
+        let outcome = super::resolve_managed_status_outcome(input, true, Some(1));
+
+        assert!(
+            outcome.programmed,
+            "scale-to-zero Deployment must be Programmed=True"
+        );
+        assert!(!outcome.only_store_not_ready);
+        assert!(outcome.observation_fault.is_none());
+    }
+
+    #[test]
+    fn resolve_outcome_store_not_ready_scale_to_zero_is_programmed() {
+        let obs = ObservedRuntimeState {
+            ready_replicas: Some(0),
+            deploy_observed_generation: Some(2),
+            deploy_generation: Some(2),
+            updated_replicas: Some(0),
+            available_replicas: Some(0),
+            desired_replicas: Some(0),
+            ..Default::default()
+        };
+        let input = super::ManagedRuntimeInput::StoreNotReady(obs);
+
+        let outcome = super::resolve_managed_status_outcome(input, false, Some(1));
+
+        assert!(
+            outcome.programmed,
+            "scale-to-zero + store not ready must still be Programmed=True"
+        );
+        assert!(
+            !outcome.only_store_not_ready,
+            "converged (even at 0) must not set only_store_not_ready"
+        );
+    }
+
+    // ── Exhaustive resolve_managed_status_outcome matrix ─────────────────────
+    //
+    // Test all (input_variant x store_ready x convergence_state) combinations
+    // to ensure the FSM status decisions are complete and correct.
+
+    #[test]
+    fn resolve_outcome_exhaustive_applied_matrix() {
+        let converged_obs = ObservedRuntimeState {
+            ready_replicas: Some(1),
+            deploy_observed_generation: Some(2),
+            deploy_generation: Some(2),
+            updated_replicas: Some(1),
+            available_replicas: Some(1),
+            desired_replicas: Some(1),
+            ..Default::default()
+        };
+        let not_converged_obs = ObservedRuntimeState::default();
+
+        let noop_result = RuntimeApplyResult::default();
+        let rollout_result = RuntimeApplyResult {
+            rollout_triggered: true,
+            deployment_changed: true,
+            ..Default::default()
+        };
+        let deploy_created_result = RuntimeApplyResult {
+            deployment_changed: true,
+            service_account_created: true,
+            ..Default::default()
+        };
+
+        struct Case {
+            label: &'static str,
+            obs: ObservedRuntimeState,
+            result: RuntimeApplyResult,
+            store_ready: bool,
+            expect_programmed: bool,
+            expect_only_snr: bool,
+        }
+
+        let cases = [
+            Case {
+                label: "converged + noop + store ready",
+                obs: converged_obs.clone(),
+                result: noop_result.clone(),
+                store_ready: true,
+                expect_programmed: true,
+                expect_only_snr: false,
+            },
+            Case {
+                label: "converged + noop + store not ready",
+                obs: converged_obs.clone(),
+                result: noop_result.clone(),
+                store_ready: false,
+                expect_programmed: true,
+                expect_only_snr: false,
+            },
+            Case {
+                label: "converged + rollout triggered",
+                obs: converged_obs.clone(),
+                result: rollout_result.clone(),
+                store_ready: true,
+                expect_programmed: false,
+                expect_only_snr: false,
+            },
+            Case {
+                label: "converged + deploy created",
+                obs: converged_obs.clone(),
+                result: deploy_created_result.clone(),
+                store_ready: true,
+                expect_programmed: false,
+                expect_only_snr: false,
+            },
+            Case {
+                label: "not converged + noop + store ready",
+                obs: not_converged_obs.clone(),
+                result: noop_result.clone(),
+                store_ready: true,
+                expect_programmed: false,
+                expect_only_snr: false,
+            },
+            Case {
+                label: "not converged + noop + store not ready",
+                obs: not_converged_obs.clone(),
+                result: noop_result.clone(),
+                store_ready: false,
+                expect_programmed: false,
+                expect_only_snr: true,
+            },
+            Case {
+                label: "not converged + rollout + store not ready",
+                obs: not_converged_obs.clone(),
+                result: rollout_result.clone(),
+                store_ready: false,
+                expect_programmed: false,
+                // Cause is rollout, not store => false
+                expect_only_snr: false,
+            },
+        ];
+
+        for case in &cases {
+            let input =
+                super::ManagedRuntimeInput::Applied(case.obs.clone(), case.result.clone());
+            let outcome =
+                super::resolve_managed_status_outcome(input, case.store_ready, Some(1));
+
+            assert_eq!(
+                outcome.programmed, case.expect_programmed,
+                "'{}': programmed mismatch",
+                case.label
+            );
+            assert_eq!(
+                outcome.only_store_not_ready, case.expect_only_snr,
+                "'{}': only_store_not_ready mismatch",
+                case.label
+            );
+            assert!(
+                outcome.observation_fault.is_none(),
+                "'{}': Applied must never set observation_fault",
+                case.label
+            );
+        }
+    }
+
+    // ── observed_generation threading through all ManagedRuntimeInput variants ──
+
+    #[test]
+    fn resolve_outcome_all_variants_thread_observed_generation() {
+        let gen = Some(42_i64);
+
+        // Applied
+        let input1 = super::ManagedRuntimeInput::Applied(
+            ObservedRuntimeState::default(),
+            RuntimeApplyResult::default(),
+        );
+        let o1 = super::resolve_managed_status_outcome(input1, true, gen);
+        assert_eq!(
+            o1.observed_generation, gen,
+            "Applied must thread observed_generation"
+        );
+
+        // StoreNotReady
+        let input2 = super::ManagedRuntimeInput::StoreNotReady(ObservedRuntimeState::default());
+        let o2 = super::resolve_managed_status_outcome(input2, false, gen);
+        assert_eq!(
+            o2.observed_generation, gen,
+            "StoreNotReady must thread observed_generation"
+        );
+
+        // ObservationFault
+        let input3 = super::ManagedRuntimeInput::ObservationFault("error".to_string());
+        let o3 = super::resolve_managed_status_outcome(input3, false, gen);
+        assert_eq!(
+            o3.observed_generation, gen,
+            "ObservationFault must thread observed_generation"
+        );
+    }
+
+    // ── Legacy vs managed-runtime: FSM mode selection ────────────────────────
+
+    #[test]
+    fn legacy_listener_statuses_always_programmed_and_accepted() {
+        let gw = make_gateway_with_annotation("prod", "my-gw", None);
+        let statuses = super::build_legacy_listener_statuses(&gw);
+
+        for status in &statuses {
+            let has_programmed_true = status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == "Programmed" && c.status == "True");
+            let has_accepted_true = status
+                .conditions
+                .iter()
+                .any(|c| c.type_ == "Accepted" && c.status == "True");
+            assert!(
+                has_programmed_true,
+                "legacy listener '{}' must have Programmed=True",
+                status.name
+            );
+            assert!(
+                has_accepted_true,
+                "legacy listener '{}' must have Accepted=True",
+                status.name
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_listener_statuses_multi_protocol() {
+        use crate::crds::{GatewaySpec, Listener, ProtocolType};
+
+        let gw = Gateway {
+            metadata: ObjectMeta {
+                name: Some("multi-gw".to_string()),
+                namespace: Some("prod".to_string()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![
+                    Listener {
+                        name: "http".to_string(),
+                        hostname: None,
+                        port: 80,
+                        protocol: ProtocolType::HTTP,
+                        tls: None,
+                        allowed_routes: None,
+                    },
+                    Listener {
+                        name: "tcp".to_string(),
+                        hostname: None,
+                        port: 5432,
+                        protocol: ProtocolType::TCP,
+                        tls: None,
+                        allowed_routes: None,
+                    },
+                    Listener {
+                        name: "tls".to_string(),
+                        hostname: None,
+                        port: 443,
+                        protocol: ProtocolType::TLS,
+                        tls: None,
+                        allowed_routes: None,
+                    },
+                ],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        };
+
+        let statuses = super::build_legacy_listener_statuses(&gw);
+        assert_eq!(statuses.len(), 3);
+
+        // HTTP listener supports HTTPRoute
+        let http = statuses.iter().find(|s| s.name == "http").unwrap();
+        assert!(http
+            .supported_kinds
+            .iter()
+            .any(|k| k.kind == "HTTPRoute"));
+
+        // TCP listener supports TCPRoute
+        let tcp = statuses.iter().find(|s| s.name == "tcp").unwrap();
+        assert!(tcp
+            .supported_kinds
+            .iter()
+            .any(|k| k.kind == "TCPRoute"));
+
+        // TLS listener supports TLSRoute
+        let tls = statuses.iter().find(|s| s.name == "tls").unwrap();
+        assert!(tls
+            .supported_kinds
+            .iter()
+            .any(|k| k.kind == "TLSRoute"));
+    }
 }
