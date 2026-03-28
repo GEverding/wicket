@@ -284,6 +284,9 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         info!("TLS certificate manager wired to proxy");
     }
 
+    // Obtain a reload handle before the proxy is consumed by Pingora.
+    let http_reload_handle = wicket_proxy.reload_handle();
+
     // Create HTTP proxy service
     let mut proxy_service = http_proxy_service(&server.configuration, wicket_proxy);
 
@@ -424,7 +427,7 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         signal_shutdown.cancel();
     });
 
-    // Config file watcher: poll every 5s, reload stream proxy on mtime change.
+    // Config file watcher: poll every 2s, reload both HTTP and stream proxies on mtime change.
     let config_path = args.config.clone();
     let stream_reload = stream_proxy.clone();
     tokio::spawn(async move {
@@ -434,7 +437,7 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
             .and_then(|m| m.modified().ok());
 
         loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
             let current_modified = tokio::fs::metadata(&config_path)
                 .await
@@ -445,6 +448,12 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
                 info!("Config file changed, reloading...");
                 match Config::load(&config_path) {
                     Ok(new_config) => {
+                        // Reload HTTP proxy routes and upstreams.
+                        if let Err(e) = http_reload_handle.reload(&new_config) {
+                            error!(error = %e, "Failed to reload HTTP proxy config");
+                        }
+
+                        // Reload stream (L4) proxy if configured.
                         if let Some(ref proxy) = stream_reload {
                             if let Some(ref stream_config) = new_config.stream {
                                 if let Err(e) = proxy.reload(stream_config) {

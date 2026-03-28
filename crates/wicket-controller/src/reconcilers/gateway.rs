@@ -1257,7 +1257,6 @@ pub async fn load_service_endpoints(
                     ServiceEndpoints {
                         namespace: namespace.to_string(),
                         name: name.to_string(),
-                        port: 80, // Default, will be overridden by actual port
                         endpoints: addrs,
                     },
                 );

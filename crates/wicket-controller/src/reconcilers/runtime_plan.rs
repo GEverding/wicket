@@ -2038,7 +2038,6 @@ mod tests {
                 ServiceEndpoints {
                     namespace: gw_ns.clone(),
                     name: backend_name.clone(),
-                    port: 80,
                     endpoints: vec![format!("10.0.1.1:80"), format!("10.0.1.2:80")],
                 },
             );
