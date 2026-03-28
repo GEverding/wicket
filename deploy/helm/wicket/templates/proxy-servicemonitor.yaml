@@ -1,0 +1,18 @@
+{{- if .Values.monitoring.proxyServiceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "wicket.proxy.name" . }}
+  namespace: {{ include "wicket.namespace" . }}
+  labels:
+    {{- include "wicket.proxy.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "wicket.proxy.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.monitoring.proxyServiceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.proxyServiceMonitor.scrapeTimeout }}
+      path: /metrics
+{{- end }}

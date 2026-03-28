@@ -20,7 +20,7 @@ use kube::{
 
 use crate::crds::{Gateway, GatewayClass, ReferenceGrant};
 use crate::metrics::{
-    ReconcileMetrics, TLS_CERTIFICATES_TOTAL, TLS_CERTIFICATE_EXPIRY_TIMESTAMP,
+    ReconcileMetrics, TLS_CERTIFICATES, TLS_CERTIFICATE_EXPIRY_TIMESTAMP,
     TLS_SECRET_EXTRACTIONS_TOTAL, TLS_SECRET_EXTRACTION_DURATION_SECONDS,
 };
 
@@ -178,7 +178,7 @@ pub async fn reconcile_secret(
         .observe(extraction_duration);
 
     // Update TLS certificate count metric
-    TLS_CERTIFICATES_TOTAL
+    TLS_CERTIFICATES
         .with_label_values(&[&namespace, "kubernetes"])
         .inc();
 

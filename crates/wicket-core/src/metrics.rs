@@ -31,13 +31,6 @@ lazy_static! {
         &["route"]
     ).expect("metric can be created");
 
-    /// Requests per second (computed from total, but useful for dashboards).
-    pub static ref HTTP_REQUESTS_PER_SECOND: GaugeVec = register_gauge_vec!(
-        "wicket_http_requests_per_second",
-        "HTTP requests per second",
-        &["route"]
-    ).expect("metric can be created");
-
     // ============================================================
     // RED Metrics - Errors
     // ============================================================
@@ -181,10 +174,10 @@ lazy_static! {
         vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]
     ).expect("metric can be created");
 
-    /// Certificate expiry (days until expiry).
-    pub static ref TLS_CERT_EXPIRY_DAYS: GaugeVec = register_gauge_vec!(
-        "wicket_tls_cert_expiry_days",
-        "Days until certificate expires",
+    /// Certificate expiry (Unix timestamp in seconds).
+    pub static ref TLS_CERTIFICATE_EXPIRY_TIMESTAMP_SECONDS: GaugeVec = register_gauge_vec!(
+        "wicket_tls_certificate_expiry_timestamp_seconds",
+        "Certificate expiration Unix timestamp in seconds",
         &["domain"]
     ).expect("metric can be created");
 
@@ -238,7 +231,7 @@ lazy_static! {
     /// Current config generation.
     pub static ref CONFIG_GENERATION: IntGauge = register_int_gauge!(
         "wicket_proxy_config_generation",
-        "Current configuration generation"
+        "Current proxy configuration generation"
     ).expect("metric can be created");
 
     /// Time since last config reload.
@@ -271,7 +264,6 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     // The register_* macros handle registration with the default global registry
     let _ = &*HTTP_REQUESTS_TOTAL;
     let _ = &*HTTP_REQUESTS_ACTIVE;
-    let _ = &*HTTP_REQUESTS_PER_SECOND;
     let _ = &*HTTP_ERRORS_TOTAL;
     let _ = &*UPSTREAM_ERRORS_TOTAL;
     let _ = &*TLS_HANDSHAKE_ERRORS_TOTAL;
@@ -289,7 +281,7 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     let _ = &*HEALTH_CHECK_TOTAL;
     let _ = &*TLS_HANDSHAKES_TOTAL;
     let _ = &*TLS_HANDSHAKE_DURATION_SECONDS;
-    let _ = &*TLS_CERT_EXPIRY_DAYS;
+    let _ = &*TLS_CERTIFICATE_EXPIRY_TIMESTAMP_SECONDS;
     let _ = &*BYTES_RECEIVED_TOTAL;
     let _ = &*BYTES_SENT_TOTAL;
     let _ = &*ROUTE_MATCH_DURATION_SECONDS;
