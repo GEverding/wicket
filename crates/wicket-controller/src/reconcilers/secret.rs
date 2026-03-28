@@ -251,7 +251,7 @@ pub fn error_policy_secret(secret: Arc<Secret>, error: &SecretError, _ctx: Arc<C
         .with_label_values(&["Secret", "reconcile_error"])
         .inc();
 
-    Action::requeue(Duration::from_secs(60))
+    Action::requeue(Duration::from_secs(5))
 }
 
 /// Find all Gateways that reference a given Secret.

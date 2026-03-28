@@ -32,7 +32,7 @@ use crate::reconcilers::runtime_plan::{
     service_name as owned_service_name, GatewayRuntimePlanner, ObservedRuntimeState,
     RuntimePlanInput,
 };
-use crate::reconcilers::store::SnapshotResult;
+use crate::reconcilers::store::{PlannerSnapshot, SnapshotResult};
 
 use super::context::{trigger_config_update, Context};
 
@@ -77,12 +77,26 @@ pub async fn reconcile_gateway(
         return Ok(Action::await_change());
     }
 
-    // Check if the GatewayClass is managed by Wicket
-    let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
-    let gc = gc_api
-        .get(&gateway.spec.gateway_class_name)
-        .await
-        .map_err(|_| GatewayError::GatewayClassNotFound(gateway.spec.gateway_class_name.clone()))?;
+    // Check if the GatewayClass is managed by Wicket.
+    //
+    // Prefer the shared store over a live API call to avoid redundant reads
+    // and races with the cache.  Fall back to the API only when the store
+    // has not yet been populated (bootstrap / recovery).
+    let gc = match ctx.store.get_gateway_class(&gateway.spec.gateway_class_name).await {
+        Some(gc) => gc,
+        None => {
+            // Store not ready or class absent — fall back to live API.
+            let gc_api: Api<GatewayClass> = Api::all(ctx.client.clone());
+            gc_api
+                .get(&gateway.spec.gateway_class_name)
+                .await
+                .map_err(|_| {
+                    GatewayError::GatewayClassNotFound(
+                        gateway.spec.gateway_class_name.clone(),
+                    )
+                })?
+        }
+    };
 
     if !gc.is_wicket_managed() {
         tracing::debug!(
@@ -131,6 +145,11 @@ pub async fn reconcile_gateway(
     // For legacy (non-managed) Gateways the existing behavior is preserved:
     // attached_routes = 0 and Programmed = True unconditionally.
 
+    // Track whether the managed-runtime path produced a config-affecting change.
+    // When `false`, we skip `trigger_config_update` at the end since the planner
+    // already determined that the generated config is identical to the current one.
+    let mut managed_config_changed = false;
+
     let (listener_statuses, gateway_programmed, only_store_not_ready, gateway_observation_fault) =
         if is_managed_runtime(&gateway) {
             // Resolve the managed-runtime input: observe, plan, apply.
@@ -139,8 +158,16 @@ pub async fn reconcile_gateway(
             let managed_input = match reconcile_managed_runtime(&gateway, &ctx, &namespace, &name)
                 .await
             {
-                Ok((observed, apply_result)) => {
-                    ManagedRuntimeInput::Applied(observed, apply_result)
+                Ok((observed, apply_result, snapshot_result)) => {
+                    // Check if config actually changed via the managed-runtime
+                    // applier.  When NoOp, we can skip the global config trigger.
+                    managed_config_changed = apply_result
+                        .config_result
+                        .as_ref()
+                        .is_some_and(|r| matches!(r, crate::reconcilers::contracts::ConfigApplyResult::Updated { .. }))
+                        || apply_result.service_changed
+                        || apply_result.deployment_changed;
+                    ManagedRuntimeInput::Applied(observed, apply_result, Box::new(snapshot_result))
                 }
                 // StoreNotReady is a safe defer: the store is still warming up.
                 // The observed state is carried so the status path can reuse it
@@ -174,7 +201,7 @@ pub async fn reconcile_gateway(
                 Err(e) => return Err(GatewayError::RuntimeApplyError(e.to_string())),
             };
 
-            build_managed_runtime_status(&gateway, &ctx, &namespace, &name, managed_input).await
+            build_managed_runtime_status(&gateway, &namespace, &name, managed_input)
         } else {
             // Legacy path: zero attached_routes, always programmed, no fault.
             let statuses = build_legacy_listener_statuses(&gateway);
@@ -184,41 +211,14 @@ pub async fn reconcile_gateway(
     // Get addresses from LoadBalancer Service or Gateway spec
     let addresses = get_gateway_addresses(&ctx.client, &namespace, &name, &gateway).await;
 
-    // Build the top-level Gateway conditions.  Thread observed_generation so
-    // operators and tooling can correlate conditions to the Gateway generation
-    // that was observed when the condition was set.
-    //
-    // Priority order (mutually exclusive):
-    //   1. Programmed=True  -- rollout fully converged.
-    //   2. ObservationFault -- non-404 API error reading owned objects; distinct
-    //      from DeploymentNotReady so operators can diagnose RBAC / API issues.
-    //   3. ControllerStoreNotReady -- store still warming up after restart.
-    //   4. DeploymentNotReady -- generic rollout-not-converged fallback.
+    // Build the top-level Gateway conditions using the extracted pure helper.
     let gw_observed_gen = gateway.metadata.generation;
-    let gateway_conditions = if gateway_programmed {
-        vec![
-            Condition::accepted().with_observed_generation(gw_observed_gen),
-            Condition::programmed().with_observed_generation(gw_observed_gen),
-        ]
-    } else if let Some(ref fault) = gateway_observation_fault {
-        // Observation fault: surface explicitly so operators can distinguish
-        // a transient API/RBAC error from a genuine deployment failure.
-        vec![
-            Condition::accepted().with_observed_generation(gw_observed_gen),
-            Condition::not_programmed_observation_fault(fault)
-                .with_observed_generation(gw_observed_gen),
-        ]
-    } else if only_store_not_ready {
-        vec![
-            Condition::accepted().with_observed_generation(gw_observed_gen),
-            Condition::not_programmed_warming_up().with_observed_generation(gw_observed_gen),
-        ]
-    } else {
-        vec![
-            Condition::accepted().with_observed_generation(gw_observed_gen),
-            Condition::not_programmed().with_observed_generation(gw_observed_gen),
-        ]
-    };
+    let gateway_conditions = build_gateway_conditions(
+        gateway_programmed,
+        &gateway_observation_fault,
+        only_store_not_ready,
+        gw_observed_gen,
+    );
 
     // Update Gateway status
     let status = GatewayStatus {
@@ -232,12 +232,13 @@ pub async fn reconcile_gateway(
         "status": status
     });
 
-    api.patch_status(
-        &name,
-        &PatchParams::apply("wicket-controller"),
-        &Patch::Merge(&patch),
-    )
-    .await?;
+    let patched_gateway = api
+        .patch_status(
+            &name,
+            &PatchParams::apply("wicket-controller"),
+            &Patch::Merge(&patch),
+        )
+        .await?;
 
     // Return the deferred observation error now that status has been patched.
     // The requeue-with-backoff and error metrics are handled by
@@ -271,17 +272,29 @@ pub async fn reconcile_gateway(
 
     metrics.record_success();
 
-    // Upsert into shared store so the cache path reflects this Gateway.
+    // Upsert the post-patch Gateway (with updated .status) into the shared
+    // store so other reconcilers see the current status, not the stale input.
     let gw_key = super::config_generator::GatewayState::key(&namespace, &name);
-    ctx.store.upsert_gateway(gw_key, (*gateway).clone()).await;
+    ctx.store.upsert_gateway(gw_key, patched_gateway).await;
 
     // Update metrics
     update_gateway_metrics(&ctx.client).await;
 
-    // Trigger configuration regeneration
-    trigger_config_update(&ctx, "Gateway reconciled")
-        .await
-        .map_err(|e| GatewayError::ConfigError(e.to_string()))?;
+    // Trigger configuration regeneration.
+    //
+    // For managed-runtime Gateways we skip this when the applier already
+    // determined that config, service, and deployment are unchanged (NoOp).
+    // The global planner would reach the same conclusion via hash comparison,
+    // but skipping avoids the unnecessary work of building GatewayState,
+    // serializing TOML, and hashing.
+    //
+    // For legacy (non-managed) Gateways we always trigger since we have no
+    // plan to check against.
+    if !is_managed_runtime(&gateway) || managed_config_changed {
+        trigger_config_update(&ctx, "Gateway reconciled")
+            .await
+            .map_err(|e| GatewayError::ConfigError(e.to_string()))?;
+    }
 
     Ok(Action::requeue(Duration::from_secs(60)))
 }
@@ -306,7 +319,10 @@ pub fn error_policy_gateway(
         .with_label_values(&["Gateway", "reconcile_error"])
         .inc();
 
-    Action::requeue(Duration::from_secs(60))
+    // Use a short error requeue (5s).  The kube-runtime controller re-drives
+    // reconciliation from watches, so this is a safety-net retry.  Persistent
+    // errors are bounded by the watch re-trigger rate, not this duration.
+    Action::requeue(Duration::from_secs(5))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -370,7 +386,7 @@ async fn reconcile_managed_runtime(
     ctx: &Context,
     namespace: &str,
     name: &str,
-) -> Result<(ObservedRuntimeState, RuntimeApplyResult), ManagedRuntimeError> {
+) -> Result<(ObservedRuntimeState, RuntimeApplyResult, SnapshotResult<PlannerSnapshot>), ManagedRuntimeError> {
     // ── 1. Gather ObservedRuntimeState ────────────────────────────────────────
     let observed = observe_runtime_state(gateway, &ctx.client, namespace).await?;
 
@@ -391,6 +407,9 @@ async fn reconcile_managed_runtime(
     };
 
     // ── 3. Plan ───────────────────────────────────────────────────────────────
+    // Clone the snapshot before moving it into the planner input so we can
+    // return it to the caller and avoid a second store read in the status path.
+    let snapshot_for_status: SnapshotResult<PlannerSnapshot> = SnapshotResult::Ready(snapshot.clone());
     let planner = GatewayRuntimePlanner;
     let input = RuntimePlanInput {
         gateway_namespace: namespace.to_string(),
@@ -465,7 +484,7 @@ async fn reconcile_managed_runtime(
     // `is_rollout_converged(&observed)` would return a stale `true` if the old
     // revision was healthy.  The status path must force `Programmed=False` in
     // that case to avoid a one-cycle lie.
-    Ok((observed, apply_result))
+    Ok((observed, apply_result, snapshot_for_status))
 }
 
 /// Gather `ObservedRuntimeState` for a Gateway by reading its owned ConfigMap
@@ -647,10 +666,10 @@ async fn observe_runtime_state(
 /// applies at a time explicit and compiler-checked.
 enum ManagedRuntimeInput {
     /// `reconcile_managed_runtime` succeeded.  Carries the pre-apply
-    /// `ObservedRuntimeState` and the `RuntimeApplyResult` so the status path
-    /// can reuse them without a second Kubernetes API read and can apply the
-    /// rollout-staleness guard.
-    Applied(ObservedRuntimeState, RuntimeApplyResult),
+    /// `ObservedRuntimeState`, the `RuntimeApplyResult`, and the
+    /// `PlannerSnapshot` that was used during planning so the status path
+    /// can reuse them without a second Kubernetes API or store read.
+    Applied(ObservedRuntimeState, RuntimeApplyResult, Box<SnapshotResult<PlannerSnapshot>>),
 
     /// The planner store was not yet ready.  `reconcile_managed_runtime`
     /// observes runtime state BEFORE checking store readiness, so the
@@ -751,7 +770,7 @@ fn resolve_managed_status_outcome(
     gateway_generation: Option<i64>,
 ) -> ManagedStatusOutcome {
     match input {
-        ManagedRuntimeInput::Applied(observed, apply_result) => {
+        ManagedRuntimeInput::Applied(observed, apply_result, _) => {
             // Happy path -- reuse the observation from the sub-reconcile.
             //
             // Staleness guard: a rollout was just triggered or the Deployment was
@@ -805,6 +824,47 @@ fn resolve_managed_status_outcome(
                 observed_generation: gateway_generation,
             }
         }
+    }
+}
+
+/// Build the top-level Gateway conditions from the reconcile outcome.
+///
+/// Pure, synchronous, no I/O.  Extracted from `reconcile_gateway` so the
+/// condition-selection priority logic can be tested independently.
+///
+/// ## Priority order (mutually exclusive)
+///
+/// 1. `Programmed=True`  -- rollout fully converged.
+/// 2. `ObservationFault` -- non-404 API error reading owned objects.
+/// 3. `ControllerStoreNotReady` -- store still warming up after restart.
+/// 4. `DeploymentNotReady` -- generic rollout-not-converged fallback.
+fn build_gateway_conditions(
+    programmed: bool,
+    observation_fault: &Option<String>,
+    only_store_not_ready: bool,
+    observed_generation: Option<i64>,
+) -> Vec<Condition> {
+    if programmed {
+        vec![
+            Condition::accepted().with_observed_generation(observed_generation),
+            Condition::programmed().with_observed_generation(observed_generation),
+        ]
+    } else if let Some(ref fault) = observation_fault {
+        vec![
+            Condition::accepted().with_observed_generation(observed_generation),
+            Condition::not_programmed_observation_fault(fault)
+                .with_observed_generation(observed_generation),
+        ]
+    } else if only_store_not_ready {
+        vec![
+            Condition::accepted().with_observed_generation(observed_generation),
+            Condition::not_programmed_warming_up().with_observed_generation(observed_generation),
+        ]
+    } else {
+        vec![
+            Condition::accepted().with_observed_generation(observed_generation),
+            Condition::not_programmed().with_observed_generation(observed_generation),
+        ]
     }
 }
 
@@ -874,9 +934,8 @@ fn resolve_managed_status_outcome(
 ///   occurred while observing owned objects.  The caller surfaces this as a
 ///   distinct top-level `ObservationFault` condition rather than the generic
 ///   `DeploymentNotReady` condition.
-async fn build_managed_runtime_status(
+fn build_managed_runtime_status(
     gateway: &Gateway,
-    ctx: &super::context::Context,
     namespace: &str,
     name: &str,
     input: ManagedRuntimeInput,
@@ -885,8 +944,18 @@ async fn build_managed_runtime_status(
 
     let gateway_generation = gateway.metadata.generation;
 
-    // ── 1. Read planner snapshot (determines store readiness) ─────────────────
-    let snapshot_result = ctx.store.planner_snapshot().await;
+    // ── 1. Extract the planner snapshot from the input ───────────────────────
+    //
+    // The snapshot was captured by `reconcile_managed_runtime` and threaded
+    // through `ManagedRuntimeInput::Applied` so we avoid a second store read.
+    // For `StoreNotReady` and `ObservationFault` the snapshot is not available
+    // (by definition), so we use `SnapshotResult::NotReady`.
+    let snapshot_result = match &input {
+        ManagedRuntimeInput::Applied(_, _, ref snap) => *snap.clone(),
+        ManagedRuntimeInput::StoreNotReady(_) | ManagedRuntimeInput::ObservationFault(_) => {
+            SnapshotResult::NotReady
+        }
+    };
     let store_ready = snapshot_result.is_ready();
 
     // ── 2. Determine runtime readiness from the typed input ───────────────────
@@ -2084,6 +2153,7 @@ mod tests {
     // ManagedRuntimeInput enum.  Tests now construct the enum variant directly.
 
     use crate::reconcilers::runtime_applier::RuntimeApplyResult;
+    use crate::reconcilers::store::SnapshotResult;
 
     /// When reconcile_managed_runtime succeeds, the managed_input is
     /// ManagedRuntimeInput::Applied carrying the observed state and apply result.
@@ -2101,11 +2171,11 @@ mod tests {
         };
         let result = RuntimeApplyResult::default(); // no-op apply
 
-        let input = super::ManagedRuntimeInput::Applied(obs.clone(), result);
+        let input = super::ManagedRuntimeInput::Applied(obs.clone(), result, Box::new(SnapshotResult::NotReady));
 
         // The variant must be matchable and carry the original observation.
         match input {
-            super::ManagedRuntimeInput::Applied(ref threaded_obs, _) => {
+            super::ManagedRuntimeInput::Applied(ref threaded_obs, _, _) => {
                 assert_eq!(
                     threaded_obs.current_config_hash, obs.current_config_hash,
                     "Applied must carry the original config hash"
@@ -2268,9 +2338,10 @@ mod tests {
         let b1 = super::ManagedRuntimeInput::Applied(
             ObservedRuntimeState::default(),
             RuntimeApplyResult::default(),
+            Box::new(SnapshotResult::NotReady),
         );
         assert!(
-            matches!(b1, super::ManagedRuntimeInput::Applied(_, _)),
+            matches!(b1, super::ManagedRuntimeInput::Applied(_, _, _)),
             "branch 1 must be Applied"
         );
 
@@ -2290,11 +2361,11 @@ mod tests {
 
         // Each variant must not match the others.
         assert!(
-            !matches!(b2, super::ManagedRuntimeInput::Applied(_, _)),
+            !matches!(b2, super::ManagedRuntimeInput::Applied(_, _, _)),
             "ObservationFault must not match Applied"
         );
         assert!(
-            !matches!(b3, super::ManagedRuntimeInput::Applied(_, _)),
+            !matches!(b3, super::ManagedRuntimeInput::Applied(_, _, _)),
             "StoreNotReady must not match Applied"
         );
     }
@@ -2470,7 +2541,7 @@ mod tests {
             desired_replicas: Some(1),
         };
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop);
+        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
 
         let outcome = super::resolve_managed_status_outcome(input, true, Some(1));
 
@@ -2507,7 +2578,7 @@ mod tests {
             deployment_changed: true,
             ..Default::default()
         };
-        let input = super::ManagedRuntimeInput::Applied(obs, rollout);
+        let input = super::ManagedRuntimeInput::Applied(obs, rollout, Box::new(SnapshotResult::NotReady));
 
         // store_ready=false: even with store not ready, only_store_not_ready
         // must be false because the cause is the in-flight rollout.
@@ -2530,7 +2601,7 @@ mod tests {
     fn resolve_outcome_applied_not_converged_store_not_ready() {
         let obs = ObservedRuntimeState::default(); // all None => not converged
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop);
+        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
 
         let outcome = super::resolve_managed_status_outcome(input, false, Some(1));
 
@@ -2548,7 +2619,7 @@ mod tests {
     fn resolve_outcome_applied_not_converged_store_ready() {
         let obs = ObservedRuntimeState::default();
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop);
+        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
 
         let outcome = super::resolve_managed_status_outcome(input, true, Some(1));
 
@@ -3294,7 +3365,7 @@ mod tests {
 
         // Verify this propagates through resolve_managed_status_outcome.
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop);
+        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
         let outcome = super::resolve_managed_status_outcome(input, true, Some(5));
         assert!(
             !outcome.programmed,
@@ -3322,7 +3393,7 @@ mod tests {
 
         // Through the Applied path with no-op apply.
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop);
+        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
         let outcome = super::resolve_managed_status_outcome(input, true, Some(4));
         assert!(
             !outcome.programmed,
@@ -3355,7 +3426,7 @@ mod tests {
             service_account_created: true,
             ..Default::default()
         };
-        let input = super::ManagedRuntimeInput::Applied(converged, result);
+        let input = super::ManagedRuntimeInput::Applied(converged, result, Box::new(SnapshotResult::NotReady));
         let outcome = super::resolve_managed_status_outcome(input, true, Some(2));
 
         assert!(
@@ -3606,7 +3677,7 @@ mod tests {
             desired_replicas: Some(0),
         };
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop);
+        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
 
         let outcome = super::resolve_managed_status_outcome(input, true, Some(1));
 
@@ -3744,7 +3815,7 @@ mod tests {
 
         for case in &cases {
             let input =
-                super::ManagedRuntimeInput::Applied(case.obs.clone(), case.result.clone());
+                super::ManagedRuntimeInput::Applied(case.obs.clone(), case.result.clone(), Box::new(SnapshotResult::NotReady));
             let outcome =
                 super::resolve_managed_status_outcome(input, case.store_ready, Some(1));
 
@@ -3776,6 +3847,7 @@ mod tests {
         let input1 = super::ManagedRuntimeInput::Applied(
             ObservedRuntimeState::default(),
             RuntimeApplyResult::default(),
+            Box::new(SnapshotResult::NotReady),
         );
         let o1 = super::resolve_managed_status_outcome(input1, true, gen);
         assert_eq!(
@@ -3896,5 +3968,81 @@ mod tests {
             .supported_kinds
             .iter()
             .any(|k| k.kind == "TLSRoute"));
+    }
+
+    // ── build_gateway_conditions ──────────���──────────────────────────────────
+
+    #[test]
+    fn gateway_conditions_programmed_true() {
+        let conditions = super::build_gateway_conditions(true, &None, false, Some(5));
+        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions[0].type_, "Accepted");
+        assert_eq!(conditions[0].status, "True");
+        assert_eq!(conditions[1].type_, "Programmed");
+        assert_eq!(conditions[1].status, "True");
+        assert_eq!(conditions[0].observed_generation, Some(5));
+        assert_eq!(conditions[1].observed_generation, Some(5));
+    }
+
+    #[test]
+    fn gateway_conditions_observation_fault() {
+        let fault = Some("RBAC denied".to_string());
+        let conditions = super::build_gateway_conditions(false, &fault, false, Some(3));
+        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions[0].type_, "Accepted");
+        assert_eq!(conditions[0].status, "True");
+        assert_eq!(conditions[1].type_, "Programmed");
+        assert_eq!(conditions[1].status, "False");
+        assert_eq!(conditions[1].reason, "ObservationFault");
+        assert!(
+            conditions[1].message.contains("RBAC denied"),
+            "fault message must be surfaced"
+        );
+    }
+
+    #[test]
+    fn gateway_conditions_store_not_ready() {
+        let conditions = super::build_gateway_conditions(false, &None, true, Some(1));
+        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions[0].type_, "Accepted");
+        assert_eq!(conditions[1].type_, "Programmed");
+        assert_eq!(conditions[1].status, "False");
+        assert_eq!(conditions[1].reason, "ControllerStoreNotReady");
+    }
+
+    #[test]
+    fn gateway_conditions_deployment_not_ready() {
+        let conditions = super::build_gateway_conditions(false, &None, false, Some(2));
+        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions[0].type_, "Accepted");
+        assert_eq!(conditions[1].type_, "Programmed");
+        assert_eq!(conditions[1].status, "False");
+        assert_eq!(conditions[1].reason, "DeploymentNotReady");
+    }
+
+    #[test]
+    fn gateway_conditions_priority_fault_over_store_not_ready() {
+        // When both observation_fault and only_store_not_ready are set,
+        // the observation fault must take priority.
+        let fault = Some("API error".to_string());
+        let conditions = super::build_gateway_conditions(false, &fault, true, Some(1));
+        assert_eq!(conditions[1].reason, "ObservationFault");
+    }
+
+    #[test]
+    fn gateway_conditions_programmed_trumps_all() {
+        // When programmed is true, fault and store_not_ready are irrelevant.
+        let fault = Some("stale fault".to_string());
+        let conditions = super::build_gateway_conditions(true, &fault, true, Some(1));
+        assert_eq!(conditions[1].type_, "Programmed");
+        assert_eq!(conditions[1].status, "True");
+    }
+
+    #[test]
+    fn gateway_conditions_none_generation() {
+        // observed_generation = None should not panic.
+        let conditions = super::build_gateway_conditions(true, &None, false, None);
+        assert_eq!(conditions[0].observed_generation, None);
+        assert_eq!(conditions[1].observed_generation, None);
     }
 }
