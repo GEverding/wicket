@@ -376,6 +376,79 @@ mod tests {
         assert_eq!(encoded[11], 0x0A); // \n
     }
 
+    // ========================================================================
+    // BUG: Mixed IPv4/IPv6 address families produce malformed headers.
+    //
+    // In encode_v2(), the address family is determined by client_addr only.
+    // If proxy_addr has a different family, `if let SocketAddr::V4(addr) = proxy_addr`
+    // silently doesn't match, and the destination address bytes are never written.
+    // This produces a truncated, malformed PROXY protocol v2 header.
+    //
+    // In encode_v1(), the protocol is "TCP4" based on the client, but the proxy
+    // address is printed as IPv6, which violates the v1 spec format.
+    // ========================================================================
+
+    #[test]
+    fn test_v2_mixed_ipv4_client_ipv6_proxy_correct_length() {
+        // BUG: When client is IPv4 and proxy is IPv6, the destination address
+        // bytes are silently omitted, producing a malformed header.
+        let client: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+        let proxy: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let encoded = ProxyProtocolEncoder::encode(ProxyProtocolVersion::V2, client, proxy);
+
+        // With an IPv4 client, the encoder uses IPv4 framing (length = 12).
+        // But proxy is IPv6, so `if let SocketAddr::V4(addr) = proxy_addr` doesn't match,
+        // and the destination IP (4 bytes) is never written.
+        //
+        // Expected: header should be 28 bytes (12 sig + 1 ver + 1 fam + 2 len + 12 addrs)
+        // or the encoder should detect the mismatch and handle it.
+        //
+        // The total buffer should contain: sig(12) + ver(1) + fam(1) + len(2) + src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) = 28
+        assert_eq!(
+            encoded.len(),
+            28,
+            "IPv4 PROXY v2 header must be exactly 28 bytes, \
+             but mixed address families cause missing destination address"
+        );
+    }
+
+    #[test]
+    fn test_v2_mixed_ipv6_client_ipv4_proxy_correct_length() {
+        // BUG: When client is IPv6 and proxy is IPv4, the destination address
+        // bytes are silently omitted, producing a malformed header.
+        let client: SocketAddr = "[2001:db8::1]:1234".parse().unwrap();
+        let proxy: SocketAddr = "192.168.1.1:443".parse().unwrap();
+        let encoded = ProxyProtocolEncoder::encode(ProxyProtocolVersion::V2, client, proxy);
+
+        // Expected: 52 bytes for IPv6 framing
+        assert_eq!(
+            encoded.len(),
+            52,
+            "IPv6 PROXY v2 header must be exactly 52 bytes, \
+             but mixed address families cause missing destination address"
+        );
+    }
+
+    #[test]
+    fn test_v1_mixed_address_families_consistent_protocol() {
+        // BUG: v1 uses client_addr to determine "TCP4" vs "TCP6" but then
+        // prints proxy_addr.ip() which may be a different family.
+        // "PROXY TCP4 192.168.1.1 2001:db8::1 ..." is invalid per the spec.
+        let client: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+        let proxy: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let encoded = ProxyProtocolEncoder::encode(ProxyProtocolVersion::V1, client, proxy);
+        let header = String::from_utf8(encoded).unwrap();
+
+        // The header says TCP4 but includes an IPv6 destination address.
+        // This is malformed. Either both addresses should be IPv4, both IPv6,
+        // or the encoder should detect and handle the mismatch.
+        assert!(
+            !header.contains("TCP4") || !header.contains("2001:db8::1"),
+            "PROXY v1 header must not mix TCP4 protocol with IPv6 address: {}",
+            header
+        );
+    }
+
     #[test]
     fn test_version_enum() {
         // Test enum values
