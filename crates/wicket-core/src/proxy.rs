@@ -458,7 +458,7 @@ impl ProxyHttp for WicketProxy {
 
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> PingoraResult<()>
@@ -476,6 +476,30 @@ impl ProxyHttp for WicketProxy {
                 );
                 Error::new(ErrorType::InternalError)
             })?;
+
+        // Append client IP to X-Forwarded-For header.
+        // If an upstream proxy (e.g. Cloudflare, WAF) already set X-Forwarded-For,
+        // append the connecting address; otherwise create a new header.
+        if let Some(inet_addr) = session.client_addr().and_then(|a| a.as_inet()) {
+            let client_ip = inet_addr.ip().to_string();
+
+            let xff_value = if let Some(existing) = upstream_request.headers.get("x-forwarded-for") {
+                format!("{}, {}", existing.to_str().unwrap_or(""), client_ip)
+            } else {
+                client_ip
+            };
+
+            upstream_request
+                .insert_header("x-forwarded-for", &xff_value)
+                .map_err(|e| {
+                    warn!(
+                        request_id = %ctx.request_id,
+                        error = %e,
+                        "Failed to insert X-Forwarded-For header"
+                    );
+                    Error::new(ErrorType::InternalError)
+                })?;
+        }
 
         Ok(())
     }
