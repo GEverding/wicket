@@ -58,7 +58,7 @@ impl Drop for ConnectionGuard {
 use std::sync::Mutex;
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-use volt_sockmap::SocketMap;
+use wicket_sockmap::SocketMap;
 
 /// Upstream server configuration with passive health tracking.
 #[derive(Debug)]

@@ -7,7 +7,7 @@ description = "Core proxy and routing logic for Wicket"
 
 [features]
 default = []
-ebpf = ["volt-sockmap"]
+ebpf = ["wicket-sockmap"]
 
 [dependencies]
 wicket-config = { workspace = true }
@@ -35,4 +35,4 @@ lazy_static = "1.4"
 
 # eBPF sockmap (optional, Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
-volt-sockmap = { workspace = true, optional = true }
+wicket-sockmap = { workspace = true, optional = true }

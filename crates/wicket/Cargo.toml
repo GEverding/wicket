@@ -11,7 +11,7 @@ name = "wicket"
 path = "src/main.rs"
 
 [features]
-ebpf = ["wicket-stream/ebpf", "volt-sockmap"]
+ebpf = ["wicket-stream/ebpf", "wicket-sockmap"]
 
 [dependencies]
 wicket-config = { workspace = true }
@@ -40,4 +40,4 @@ clap = { workspace = true }
 serde = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-volt-sockmap = { workspace = true, optional = true }
+wicket-sockmap = { workspace = true, optional = true }
