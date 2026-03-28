@@ -7,7 +7,7 @@ description = "L4 TCP stream proxying for Wicket"
 
 [features]
 default = []
-ebpf = ["volt-sockmap"]
+ebpf = ["wicket-sockmap"]
 
 [dependencies]
 # Workspace crates
@@ -28,7 +28,7 @@ arc-swap = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-volt-sockmap = { workspace = true, optional = true }
+wicket-sockmap = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }
