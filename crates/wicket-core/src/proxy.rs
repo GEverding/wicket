@@ -85,10 +85,10 @@ pub struct WicketCtx {
 /// The main Wicket proxy service.
 pub struct WicketProxy {
     /// Router for matching requests to upstreams
-    router: ArcSwap<Router>,
+    router: Arc<ArcSwap<Router>>,
 
     /// Map of upstream name to load balancer
-    upstreams: ArcSwap<HashMap<String, Arc<UpstreamCluster>>>,
+    upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamCluster>>>>,
 
     /// TLS certificate manager (if TLS is enabled)
     cert_manager: Option<Arc<CertManager>>,
@@ -96,6 +96,31 @@ pub struct WicketProxy {
     /// eBPF sockmap for kernel-level proxying (Linux only)
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     sockmap: Option<Arc<Mutex<SocketMap>>>,
+}
+
+/// Handle for reloading HTTP proxy configuration at runtime.
+///
+/// This is obtained via [`WicketProxy::reload_handle`] before the proxy is
+/// consumed by the Pingora service.  The handle shares the same `ArcSwap`
+/// instances, so stores are immediately visible to in-flight request handling.
+#[derive(Clone)]
+pub struct HttpReloadHandle {
+    router: Arc<ArcSwap<Router>>,
+    upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamCluster>>>>,
+}
+
+impl HttpReloadHandle {
+    /// Reload HTTP proxy routes and upstreams from a new config.
+    pub fn reload(&self, config: &Config) -> Result<()> {
+        let router = Router::build(&config.routes)?;
+        let upstreams = WicketProxy::build_upstreams(&config.upstreams)?;
+
+        self.router.store(Arc::new(router));
+        self.upstreams.store(Arc::new(upstreams));
+
+        info!("HTTP proxy configuration reloaded");
+        Ok(())
+    }
 }
 
 /// An upstream cluster with load balancing and health checking.
@@ -132,12 +157,22 @@ impl WicketProxy {
         let upstreams = Self::build_upstreams(&config.upstreams)?;
 
         Ok(WicketProxy {
-            router: ArcSwap::new(Arc::new(router)),
-            upstreams: ArcSwap::new(Arc::new(upstreams)),
+            router: Arc::new(ArcSwap::new(Arc::new(router))),
+            upstreams: Arc::new(ArcSwap::new(Arc::new(upstreams))),
             cert_manager: None,
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             sockmap: None,
         })
+    }
+
+    /// Obtain a reload handle that can update routes and upstreams at runtime.
+    ///
+    /// Call this *before* the proxy is moved into `http_proxy_service`.
+    pub fn reload_handle(&self) -> HttpReloadHandle {
+        HttpReloadHandle {
+            router: Arc::clone(&self.router),
+            upstreams: Arc::clone(&self.upstreams),
+        }
     }
 
     /// Set the TLS certificate manager.

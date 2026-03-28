@@ -1,10 +1,11 @@
-//! Service and Endpoints watcher for dynamic load balancing updates.
+//! Service and EndpointSlice watcher for dynamic load balancing updates.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Endpoints, Service};
+use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::{
     api::Api,
     runtime::{
@@ -32,87 +33,129 @@ pub enum ServiceError {
     ConfigError(String),
 }
 
-/// Reconcile an Endpoints resource.
+/// Reconcile an EndpointSlice resource.
 ///
-/// This is triggered when Service endpoints change (pods scale up/down, health changes).
-pub async fn reconcile_endpoints(
-    endpoints: Arc<Endpoints>,
+/// This is triggered when EndpointSlice changes (pods scale up/down, health changes).
+/// Each EndpointSlice is labelled with `kubernetes.io/service-name` to identify its
+/// parent Service.  Multiple slices may exist per Service; we aggregate them all.
+pub async fn reconcile_endpoint_slice(
+    slice: Arc<EndpointSlice>,
     ctx: Arc<Context>,
 ) -> Result<Action, ServiceError> {
-    let metrics = ReconcileMetrics::new("Endpoints");
-    let namespace = endpoints.namespace().unwrap_or_default();
-    let name = endpoints.name_any();
+    let metrics = ReconcileMetrics::new("EndpointSlice");
+    let namespace = slice.namespace().unwrap_or_default();
 
-    tracing::debug!(namespace = %namespace, name = %name, "Reconciling Endpoints");
+    // EndpointSlices carry the owning Service name in a well-known label.
+    let service_name = slice
+        .labels()
+        .get("kubernetes.io/service-name")
+        .cloned()
+        .unwrap_or_default();
+
+    if service_name.is_empty() {
+        tracing::trace!(
+            namespace = %namespace,
+            slice = %slice.name_any(),
+            "EndpointSlice has no service-name label, skipping"
+        );
+        metrics.record_success();
+        return Ok(Action::await_change());
+    }
+
+    tracing::debug!(
+        namespace = %namespace,
+        service = %service_name,
+        slice = %slice.name_any(),
+        "Reconciling EndpointSlice"
+    );
 
     // Check if this service is referenced by any route
-    let is_referenced = is_service_referenced(&ctx, &namespace, &name).await;
+    let is_referenced = is_service_referenced(&ctx, &namespace, &service_name).await;
 
     if !is_referenced {
         tracing::trace!(
             namespace = %namespace,
-            name = %name,
+            name = %service_name,
             "Service not referenced by any route, skipping"
         );
         metrics.record_success();
         return Ok(Action::await_change());
     }
 
-    // Extract endpoint addresses
-    let mut healthy_count = 0;
-    let mut unhealthy_count = 0;
+    // Aggregate all slices for this service to get the full picture.
+    let slice_api: Api<EndpointSlice> = Api::namespaced(ctx.client.clone(), &namespace);
+    let slices = slice_api
+        .list(&kube::api::ListParams::default().labels(&format!(
+            "kubernetes.io/service-name={}",
+            service_name
+        )))
+        .await?;
+
+    let mut healthy_count: i64 = 0;
+    let mut unhealthy_count: i64 = 0;
     let mut endpoint_addrs = Vec::new();
 
-    if let Some(subsets) = &endpoints.subsets {
-        for subset in subsets {
-            // Ready addresses are healthy
-            if let Some(addresses) = &subset.addresses {
-                for addr in addresses {
-                    if let Some(ports) = &subset.ports {
-                        for port in ports {
-                            endpoint_addrs.push(format!("{}:{}", addr.ip, port.port));
+    for s in &slices.items {
+        // Collect ports from the slice-level ports array.
+        let ports: Vec<i32> = s
+            .ports
+            .as_ref()
+            .map(|pp| pp.iter().filter_map(|p| p.port).collect())
+            .unwrap_or_default();
+
+        for ep in &s.endpoints {
+            let ready = ep
+                .conditions
+                .as_ref()
+                .and_then(|c| c.ready)
+                .unwrap_or(true);
+
+            if ready {
+                for addr in &ep.addresses {
+                    if ports.is_empty() {
+                        endpoint_addrs.push(addr.clone());
+                        healthy_count += 1;
+                    } else {
+                        for port in &ports {
+                            endpoint_addrs.push(format!("{}:{}", addr, port));
                             healthy_count += 1;
                         }
                     }
                 }
-            }
-
-            // NotReady addresses are unhealthy
-            if let Some(not_ready) = &subset.not_ready_addresses {
-                unhealthy_count += not_ready.len();
+            } else {
+                unhealthy_count += ep.addresses.len() as i64;
             }
         }
     }
 
     // Update metrics
     BACKEND_ENDPOINTS_HEALTHY
-        .with_label_values(&[&namespace, &name])
+        .with_label_values(&[&namespace, &service_name])
         .set(healthy_count);
     BACKEND_ENDPOINTS_UNHEALTHY
-        .with_label_values(&[&namespace, &name])
-        .set(unhealthy_count as i64);
+        .with_label_values(&[&namespace, &service_name])
+        .set(unhealthy_count);
 
     tracing::info!(
         namespace = %namespace,
-        name = %name,
+        name = %service_name,
         healthy = healthy_count,
         unhealthy = unhealthy_count,
         endpoints = ?endpoint_addrs,
-        "Service endpoints updated"
+        "Service endpoints updated (via EndpointSlice)"
     );
 
-    // Update the shared store so the cache path reflects this event.
+    // Update the shared store.
     // When endpoints are empty (scale-to-zero), remove the stale entry so
     // config generation does not keep routing to non-existent backends.
-    let key = GatewayState::key(&namespace, &name);
+    let key = GatewayState::key(&namespace, &service_name);
     if !endpoint_addrs.is_empty() {
         ctx.store
             .upsert_endpoints(
                 key,
                 ServiceEndpoints {
                     namespace: namespace.clone(),
-                    name: name.clone(),
-                    port: 80,
+                    name: service_name.clone(),
                     endpoints: endpoint_addrs,
                 },
             )
@@ -120,14 +163,14 @@ pub async fn reconcile_endpoints(
     } else {
         tracing::info!(
             namespace = %namespace,
-            name = %name,
+            name = %service_name,
             "Endpoints empty (scale-to-zero); removing stale entry from store"
         );
         ctx.store.remove_endpoints(&key).await;
     }
 
-    // Trigger configuration regeneration via the shared path.
-    trigger_config_update(&ctx, "Endpoints reconciled")
+    // Trigger configuration regeneration.
+    trigger_config_update(&ctx, "EndpointSlice reconciled")
         .await
         .map_err(|e| ServiceError::ConfigError(e.to_string()))?;
 
@@ -135,24 +178,24 @@ pub async fn reconcile_endpoints(
     Ok(Action::requeue(Duration::from_secs(30)))
 }
 
-/// Handle errors during Endpoints reconciliation.
-pub fn error_policy_endpoints(
-    endpoints: Arc<Endpoints>,
+/// Handle errors during EndpointSlice reconciliation.
+pub fn error_policy_endpoint_slice(
+    slice: Arc<EndpointSlice>,
     error: &ServiceError,
     _ctx: Arc<Context>,
 ) -> Action {
-    let namespace = endpoints.namespace().unwrap_or_default();
-    let name = endpoints.name_any();
+    let namespace = slice.namespace().unwrap_or_default();
+    let name = slice.name_any();
 
     tracing::error!(
         namespace = %namespace,
         name = %name,
         error = %error,
-        "Endpoints reconciliation failed"
+        "EndpointSlice reconciliation failed"
     );
 
     crate::metrics::RECONCILE_ERRORS_TOTAL
-        .with_label_values(&["Endpoints", "reconcile_error"])
+        .with_label_values(&["EndpointSlice", "reconcile_error"])
         .inc();
 
     Action::requeue(Duration::from_secs(30))
@@ -236,7 +279,7 @@ async fn is_service_referenced(ctx: &Context, namespace: &str, name: &str) -> bo
     false
 }
 
-/// Load endpoints for all referenced services.
+/// Load endpoints for all referenced services via EndpointSlices.
 pub async fn load_all_service_endpoints(client: &Client, state: &mut GatewayState) {
     // Collect all referenced services
     let mut referenced_services: std::collections::HashSet<String> =
@@ -287,7 +330,7 @@ pub async fn load_all_service_endpoints(client: &Client, state: &mut GatewayStat
         BACKENDS.with_label_values(&[&ns]).set(count);
     }
 
-    // Load endpoints for each referenced service
+    // Load endpoints for each referenced service via EndpointSlices
     for svc_key in referenced_services {
         let parts: Vec<&str> = svc_key.split('/').collect();
         if parts.len() != 2 {
@@ -295,17 +338,34 @@ pub async fn load_all_service_endpoints(client: &Client, state: &mut GatewayStat
         }
         let (namespace, name) = (parts[0], parts[1]);
 
-        let endpoints_api: Api<Endpoints> = Api::namespaced(client.clone(), namespace);
-        if let Ok(endpoints) = endpoints_api.get(name).await {
+        let slice_api: Api<EndpointSlice> = Api::namespaced(client.clone(), namespace);
+        let label_selector = format!("kubernetes.io/service-name={}", name);
+        let lp = kube::api::ListParams::default().labels(&label_selector);
+
+        if let Ok(slices) = slice_api.list(&lp).await {
             let mut addrs = Vec::new();
 
-            if let Some(subsets) = endpoints.subsets {
-                for subset in subsets {
-                    if let Some(addresses) = subset.addresses {
-                        for addr in addresses {
-                            if let Some(ports) = &subset.ports {
-                                for port in ports {
-                                    addrs.push(format!("{}:{}", addr.ip, port.port));
+            for slice in &slices.items {
+                let ports: Vec<i32> = slice
+                    .ports
+                    .as_ref()
+                    .map(|pp| pp.iter().filter_map(|p| p.port).collect())
+                    .unwrap_or_default();
+
+                for ep in &slice.endpoints {
+                    let ready = ep
+                        .conditions
+                        .as_ref()
+                        .and_then(|c| c.ready)
+                        .unwrap_or(true);
+
+                    if ready {
+                        for addr in &ep.addresses {
+                            if ports.is_empty() {
+                                addrs.push(addr.clone());
+                            } else {
+                                for port in &ports {
+                                    addrs.push(format!("{}:{}", addr, port));
                                 }
                             }
                         }
@@ -319,7 +379,6 @@ pub async fn load_all_service_endpoints(client: &Client, state: &mut GatewayStat
                     ServiceEndpoints {
                         namespace: namespace.to_string(),
                         name: name.to_string(),
-                        port: 80,
                         endpoints: addrs,
                     },
                 );
@@ -328,49 +387,52 @@ pub async fn load_all_service_endpoints(client: &Client, state: &mut GatewayStat
     }
 }
 
-/// Create the Endpoints controller for watching service changes.
+/// Create the EndpointSlice controller for watching service endpoint changes.
+///
+/// EndpointSlices propagate faster than legacy Endpoints and scale better
+/// (each slice holds up to 1000 endpoints vs one monolithic object).
 pub async fn run_endpoints_controller(ctx: Arc<Context>) -> Result<(), kube::Error> {
     use crate::metrics::{WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL, WATCH_EVENTS_TOTAL};
 
-    let api: Api<Endpoints> = if ctx.watch_all_namespaces {
+    let api: Api<EndpointSlice> = if ctx.watch_all_namespaces {
         Api::all(ctx.client.clone())
     } else {
         Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
     };
 
     WATCH_CONNECTIONS_ACTIVE
-        .with_label_values(&["Endpoints"])
+        .with_label_values(&["EndpointSlice"])
         .set(1);
 
     Controller::new(api, Config::default())
-        .run(reconcile_endpoints, error_policy_endpoints, ctx)
+        .run(reconcile_endpoint_slice, error_policy_endpoint_slice, ctx)
         .for_each(|result| async move {
             match result {
                 Ok((obj, _)) => {
                     WATCH_EVENTS_TOTAL
-                        .with_label_values(&["Endpoints", "reconcile_success"])
+                        .with_label_values(&["EndpointSlice", "reconcile_success"])
                         .inc();
                     tracing::trace!(
                         namespace = obj.namespace.as_deref().unwrap_or(""),
                         name = %obj.name,
-                        "Endpoints reconciled"
+                        "EndpointSlice reconciled"
                     );
                 }
                 Err(e) => {
                     WATCH_EVENTS_TOTAL
-                        .with_label_values(&["Endpoints", "reconcile_error"])
+                        .with_label_values(&["EndpointSlice", "reconcile_error"])
                         .inc();
                     WATCH_ERRORS_TOTAL
-                        .with_label_values(&["Endpoints", "controller_error"])
+                        .with_label_values(&["EndpointSlice", "controller_error"])
                         .inc();
-                    tracing::error!(error = %e, "Endpoints controller error");
+                    tracing::error!(error = %e, "EndpointSlice controller error");
                 }
             }
         })
         .await;
 
     WATCH_CONNECTIONS_ACTIVE
-        .with_label_values(&["Endpoints"])
+        .with_label_values(&["EndpointSlice"])
         .set(0);
 
     Ok(())
@@ -521,7 +583,7 @@ mod tests {
         let store = SharedStore::new();
         store.mark_ready().await;
 
-        // Simulate what reconcile_endpoints does after extracting addresses.
+        // Simulate what reconcile_endpoint_slice does after extracting addresses.
         let key = GatewayState::key("default", "my-svc");
         store
             .upsert_endpoints(
@@ -529,7 +591,6 @@ mod tests {
                 ServiceEndpoints {
                     namespace: "default".to_string(),
                     name: "my-svc".to_string(),
-                    port: 80,
                     endpoints: vec!["10.0.0.1:80".to_string()],
                 },
             )

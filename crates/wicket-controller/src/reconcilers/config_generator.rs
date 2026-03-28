@@ -189,11 +189,14 @@ pub struct StreamUpstreamConfig {
 }
 
 /// Endpoint information for a Kubernetes Service.
+///
+/// The `endpoints` vec contains pre-formatted `ip:port` addresses extracted
+/// from EndpointSlice resources.  Ports come from the slice itself, so there
+/// is no separate `port` field here.
 #[derive(Clone, Debug)]
 pub struct ServiceEndpoints {
     pub namespace: String,
     pub name: String,
-    pub port: u16,
     pub endpoints: Vec<String>,
 }
 
@@ -1181,7 +1184,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "api-svc".to_string(),
-                port: 80,
                 endpoints: vec!["10.0.0.1:80".to_string(), "10.0.0.2:80".to_string()],
             },
         );
@@ -1275,7 +1277,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "api-svc".to_string(),
-                port: 80,
                 endpoints: vec!["10.0.0.1:80".to_string(), "10.0.0.2:80".to_string()],
             },
         );
@@ -1391,7 +1392,6 @@ mod tests {
                 ServiceEndpoints {
                     namespace: "default".to_string(),
                     name: backend_name.to_string(),
-                    port: 80,
                     endpoints: vec![format!("10.0.{}.1:80", i + 1)],
                 },
             );
@@ -1518,7 +1518,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "backend".to_string(),
-                port: 80,
                 endpoints: vec!["10.0.0.1:80".to_string()],
             },
         );
@@ -1625,7 +1624,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "backend".to_string(),
-                port: 80,
                 endpoints: vec!["10.0.0.1:80".to_string()],
             },
         );
@@ -1786,7 +1784,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "backend".to_string(),
-                port: 80,
                 endpoints: vec!["10.0.0.1:80".to_string()],
             },
         );
@@ -1908,7 +1905,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "backend".to_string(),
-                port: 80,
                 endpoints: vec!["10.0.0.1:80".to_string()],
             },
         );
@@ -2397,7 +2393,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "api-svc".to_string(),
-                port: 80,
                 endpoints: vec!["10.0.0.1:80".to_string()],
             },
         );
@@ -2438,7 +2433,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "api-svc".to_string(),
-                port: 80,
                 endpoints: vec!["10.0.0.1:80".to_string()],
             },
         );
@@ -2472,7 +2466,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "api-svc".to_string(),
-                port: 80,
                 endpoints: vec!["10.0.0.1:80".to_string()],
             },
         );
@@ -2525,7 +2518,6 @@ mod tests {
                 ServiceEndpoints {
                     namespace: "default".to_string(),
                     name: svc.to_string(),
-                    port: 80,
                     endpoints: vec!["10.0.0.1:80".to_string()],
                 },
             );
@@ -2584,7 +2576,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "db-svc".to_string(),
-                port: 9000,
                 endpoints: vec!["10.0.0.5:9000".to_string()],
             },
         );
@@ -2628,7 +2619,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "db-svc".to_string(),
-                port: 9000,
                 endpoints: vec!["10.0.0.5:9000".to_string()],
             },
         );
@@ -2699,7 +2689,6 @@ mod tests {
             ServiceEndpoints {
                 namespace: "default".to_string(),
                 name: "api-svc".to_string(),
-                port: 80,
                 endpoints: vec!["10.0.0.1:80".to_string()],
             },
         );
