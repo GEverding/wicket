@@ -72,6 +72,10 @@ spec:
             {{- toYaml .Values.proxy.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.proxy.containerSecurityContext | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ .Values.proxy.preStopSleepSeconds | default 5 }}"]
           volumeMounts:
             - name: config
               mountPath: /etc/wicket
@@ -108,7 +112,5 @@ spec:
       {{- if .Values.proxy.priorityClassName }}
       priorityClassName: {{ .Values.proxy.priorityClassName }}
       {{- end }}
-      {{- if .Values.proxy.terminationGracePeriodSeconds }}
-      terminationGracePeriodSeconds: {{ .Values.proxy.terminationGracePeriodSeconds }}
-      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.proxy.terminationGracePeriodSeconds | default 35 }}
 {{- end }}
