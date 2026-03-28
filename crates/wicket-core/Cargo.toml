@@ -17,6 +17,7 @@ wicket-tls = { path = "../wicket-tls" }
 pingora = { workspace = true }
 pingora-core = { workspace = true }
 pingora-proxy = { workspace = true }
+pingora-http = { workspace = true }
 pingora-load-balancing = { workspace = true }
 
 # Async
@@ -26,6 +27,7 @@ async-trait = { workspace = true }
 # Utilities
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }
 
