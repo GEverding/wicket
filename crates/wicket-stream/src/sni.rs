@@ -524,6 +524,99 @@ mod tests {
         assert_eq!(sni, None); // Should fail gracefully
     }
 
+    // ========================================================================
+    // BUG: TLS_NO_SNI constant is truncated — tests wrong codepath.
+    //
+    // The constant declares record_length = 0x40 (64 bytes) but only provides
+    // 45 bytes of record body. extract_sni() returns None because the
+    // truncation check at line 62 fires, NOT because there's no SNI extension.
+    // This test proves the issue by constructing a valid ClientHello with no
+    // SNI extension and the correct lengths.
+    // ========================================================================
+
+    #[test]
+    fn test_extract_sni_valid_no_extension_not_truncated() {
+        // A properly-formed TLS ClientHello with NO extensions at all.
+        // The record length and handshake length must be consistent with the
+        // actual buffer size so we actually test the "no extensions" path,
+        // not the truncation check.
+        let mut client_hello = Vec::new();
+
+        // TLS Record header
+        client_hello.push(0x16); // content_type = Handshake
+        client_hello.extend_from_slice(&[0x03, 0x01]); // TLS 1.0
+
+        // We'll fill in record length later
+        let record_len_pos = client_hello.len();
+        client_hello.extend_from_slice(&[0x00, 0x00]); // placeholder
+
+        // Handshake header
+        let handshake_start = client_hello.len();
+        client_hello.push(0x01); // ClientHello
+
+        // We'll fill in handshake length later
+        let hs_len_pos = client_hello.len();
+        client_hello.extend_from_slice(&[0x00, 0x00, 0x00]); // placeholder
+
+        let hs_body_start = client_hello.len();
+
+        // ClientHello body
+        client_hello.extend_from_slice(&[0x03, 0x03]); // Version TLS 1.2
+        client_hello.extend_from_slice(&[0u8; 32]); // Random
+        client_hello.push(0x00); // Session ID length = 0
+        client_hello.extend_from_slice(&[0x00, 0x02]); // Cipher suites length = 2
+        client_hello.extend_from_slice(&[0x00, 0x3c]); // One cipher suite
+        client_hello.push(0x01); // Compression methods length = 1
+        client_hello.push(0x00); // Null compression
+        // No extensions follow — this is where the handshake body ends.
+
+        let hs_body_len = client_hello.len() - hs_body_start;
+        let record_body_len = client_hello.len() - handshake_start;
+
+        // Fill in handshake length (3 bytes, big-endian)
+        client_hello[hs_len_pos] = ((hs_body_len >> 16) & 0xff) as u8;
+        client_hello[hs_len_pos + 1] = ((hs_body_len >> 8) & 0xff) as u8;
+        client_hello[hs_len_pos + 2] = (hs_body_len & 0xff) as u8;
+
+        // Fill in record length (2 bytes, big-endian)
+        client_hello[record_len_pos] = ((record_body_len >> 8) & 0xff) as u8;
+        client_hello[record_len_pos + 1] = (record_body_len & 0xff) as u8;
+
+        let sni = extract_sni(&client_hello);
+        assert_eq!(
+            sni, None,
+            "Valid ClientHello with no extensions should return None (not truncation error)"
+        );
+
+        // Verify our constant is self-consistent: record length must match actual buffer
+        let declared_record_len =
+            u16::from_be_bytes([client_hello[3], client_hello[4]]) as usize;
+        let actual_record_body = client_hello.len() - 5; // subtract 5-byte header
+        assert_eq!(
+            declared_record_len, actual_record_body,
+            "Record length field must match actual buffer size"
+        );
+    }
+
+    /// Verify that the existing TLS_NO_SNI constant has inconsistent lengths.
+    /// This test documents the bug: the constant is truncated, so the existing
+    /// test_extract_sni_no_extension passes for the wrong reason.
+    #[test]
+    fn test_tls_no_sni_constant_is_truncated() {
+        // The constant declares record length = 0x40 = 64
+        let declared_record_len = u16::from_be_bytes([TLS_NO_SNI[3], TLS_NO_SNI[4]]) as usize;
+        let actual_record_body = TLS_NO_SNI.len() - 5;
+
+        // This should fail if the constant were correct - it proves the constant is broken
+        assert_eq!(
+            declared_record_len, actual_record_body,
+            "TLS_NO_SNI constant has record_length={} but only {} bytes of record body. \
+             The extract_sni test passes due to truncation detection, not because it \
+             correctly identifies a ClientHello without SNI extension.",
+            declared_record_len, actual_record_body
+        );
+    }
+
     #[test]
     fn test_sni_extractor() {
         let extractor = SniExtractor::new();
