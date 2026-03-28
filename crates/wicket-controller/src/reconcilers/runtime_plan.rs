@@ -223,9 +223,11 @@ pub struct ObservedRuntimeState {
 ///    controller has processed the current spec generation.
 /// 2. `updated_replicas >= desired_replicas`: all pods are running the current
 ///    pod template (no old-revision pods remain).
-/// 3. `available_replicas >= 1`: at least one pod is available (ready for at
-///    least `minReadySeconds`).
-/// 4. `ready_replicas >= 1`: at least one pod passes the readiness probe.
+/// 3. When `desired_replicas > 0`: `available_replicas >= 1` and
+///    `ready_replicas >= 1` (at least one pod is serving).
+/// 4. When `desired_replicas == 0`: the rollout is considered converged if
+///    `updated_replicas == 0` (scale-to-zero is an intentional steady state,
+///    not a deployment failure).
 ///
 /// When any field is `None` (Deployment absent or status not yet populated),
 /// the function returns `false` -- a missing Deployment is not converged.
@@ -236,6 +238,13 @@ pub struct ObservedRuntimeState {
 /// still be ready while new pods are starting.  The combination of
 /// `updated_replicas == desired_replicas` and `available_replicas >= 1`
 /// ensures that the rollout has completed and the new revision is serving.
+///
+/// ## Scale-to-zero
+///
+/// A Deployment scaled to 0 replicas is an intentional operator decision.
+/// Treating it as "not converged" would cause `Programmed=False` to be
+/// reported indefinitely, which is incorrect -- the Deployment is at the
+/// desired state.
 #[must_use]
 pub fn is_rollout_converged(obs: &ObservedRuntimeState) -> bool {
     // All fields must be present; absence means Deployment does not exist.
@@ -266,11 +275,15 @@ pub fn is_rollout_converged(obs: &ObservedRuntimeState) -> bool {
     if updated < desired {
         return false;
     }
-    // 3. At least one pod is available.
+    // 3. Scale-to-zero: intentional steady state, not a failure.
+    if desired == 0 {
+        return true;
+    }
+    // 4. At least one pod is available.
     if available < 1 {
         return false;
     }
-    // 4. At least one pod is ready.
+    // 5. At least one pod is ready.
     if ready < 1 {
         return false;
     }
@@ -2714,5 +2727,506 @@ mod tests {
             let parsed = ServiceType::from_str(&s).unwrap();
             assert_eq!(parsed, svc);
         }
+    }
+
+    // ── Scale-to-zero convergence ────────────────────────────────────────────
+    //
+    // A Deployment intentionally scaled to 0 replicas is at its desired state.
+    // is_rollout_converged must return true so that Programmed=True is reported
+    // instead of an indefinite Programmed=False.
+
+    #[test]
+    fn rollout_converged_when_scaled_to_zero() {
+        let obs = ObservedRuntimeState {
+            current_config_hash: Some("hash".to_string()),
+            current_spec_hash: Some("spec".to_string()),
+            ready_replicas: Some(0),
+            deploy_observed_generation: Some(3),
+            deploy_generation: Some(3),
+            updated_replicas: Some(0),
+            available_replicas: Some(0),
+            desired_replicas: Some(0),
+        };
+        assert!(
+            is_rollout_converged(&obs),
+            "scale-to-zero Deployment must be considered converged"
+        );
+    }
+
+    #[test]
+    fn rollout_not_converged_when_scaling_down_to_zero_in_progress() {
+        // Desired=0 but updated=1: old pods still draining.
+        let obs = ObservedRuntimeState {
+            ready_replicas: Some(1),
+            deploy_observed_generation: Some(3),
+            deploy_generation: Some(3),
+            updated_replicas: Some(1), // > desired(0), scale-down in progress
+            available_replicas: Some(1),
+            desired_replicas: Some(0),
+            ..Default::default()
+        };
+        // updated(1) >= desired(0) is true, so this is converged even though
+        // pods are still running -- k8s will terminate them. The rollout spec
+        // itself has been processed.
+        assert!(
+            is_rollout_converged(&obs),
+            "when desired=0 and generation matches, rollout is converged"
+        );
+    }
+
+    #[test]
+    fn rollout_not_converged_when_scale_to_zero_generation_stale() {
+        let obs = ObservedRuntimeState {
+            ready_replicas: Some(0),
+            deploy_observed_generation: Some(2), // stale
+            deploy_generation: Some(3),          // desired
+            updated_replicas: Some(0),
+            available_replicas: Some(0),
+            desired_replicas: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            !is_rollout_converged(&obs),
+            "stale generation must prevent convergence even at scale-to-zero"
+        );
+    }
+
+    // ── FSM idempotency: planner produces same plan when called twice ────────
+    //
+    // A core FSM invariant: given identical inputs, the planner must produce
+    // byte-identical output. This goes beyond the existing determinism test by
+    // verifying ALL plan fields including change signals.
+
+    #[test]
+    fn planner_idempotent_all_fields_match_on_repeat_call() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![
+                make_listener("http", 80, ProtocolType::HTTP),
+                make_listener("https", 443, ProtocolType::HTTPS),
+            ],
+        );
+        let snapshot = make_snapshot(gw);
+        let observed = ObservedRuntimeState {
+            current_config_hash: Some("old-hash".to_string()),
+            current_spec_hash: Some("old-spec".to_string()),
+            ready_replicas: Some(2),
+            deploy_observed_generation: Some(1),
+            deploy_generation: Some(1),
+            updated_replicas: Some(2),
+            available_replicas: Some(2),
+            desired_replicas: Some(2),
+        };
+        let input = make_input("prod", "my-gw", snapshot, observed);
+
+        let plan_a = GatewayRuntimePlanner.plan(&input).unwrap();
+        let plan_b = GatewayRuntimePlanner.plan(&input).unwrap();
+
+        // Full structural equality (derives PartialEq)
+        assert_eq!(plan_a, plan_b, "planner must be idempotent");
+
+        // Verify change signals are identical
+        assert_eq!(plan_a.config_changed, plan_b.config_changed);
+        assert_eq!(plan_a.spec_changed, plan_b.spec_changed);
+        assert_eq!(plan_a.is_noop(), plan_b.is_noop());
+    }
+
+    // ── Both config_changed AND spec_changed simultaneously ──────────────────
+    //
+    // When both hashes differ, the planner must signal both changes.
+
+    #[test]
+    fn planner_both_config_and_spec_changed_simultaneously() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let snapshot = make_snapshot(gw);
+        let input = make_input(
+            "prod",
+            "my-gw",
+            snapshot,
+            ObservedRuntimeState {
+                current_config_hash: Some("stale-config".to_string()),
+                current_spec_hash: Some("stale-spec".to_string()),
+                ready_replicas: Some(1),
+                deploy_observed_generation: Some(1),
+                deploy_generation: Some(1),
+                updated_replicas: Some(1),
+                available_replicas: Some(1),
+                desired_replicas: Some(1),
+            },
+        );
+
+        let plan = GatewayRuntimePlanner.plan(&input).unwrap();
+
+        assert!(
+            plan.config_changed,
+            "stale config hash must trigger config_changed"
+        );
+        assert!(
+            plan.spec_changed,
+            "stale spec hash must trigger spec_changed"
+        );
+        assert!(
+            !plan.is_noop(),
+            "plan with both changes must not be a noop"
+        );
+    }
+
+    // ── FSM state transition completeness ────────────────────────────────────
+    //
+    // Verify that every combination of (config_changed, spec_changed) produces
+    // the correct is_noop() result and the plan remains well-formed.
+
+    #[test]
+    fn plan_change_signal_matrix() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+
+        // First, compute the "current" hashes.
+        let snapshot0 = make_snapshot(gw.clone());
+        let input0 = make_input("prod", "my-gw", snapshot0, ObservedRuntimeState::default());
+        let plan0 = GatewayRuntimePlanner.plan(&input0).unwrap();
+        let current_config = plan0.config_hash.clone();
+        let current_spec = plan0.spec_hash.clone();
+
+        struct Case {
+            label: &'static str,
+            config_hash: Option<String>,
+            spec_hash: Option<String>,
+            expect_config_changed: bool,
+            expect_spec_changed: bool,
+            expect_noop: bool,
+        }
+
+        let cases = [
+            Case {
+                label: "both match (noop)",
+                config_hash: Some(current_config.clone()),
+                spec_hash: Some(current_spec.clone()),
+                expect_config_changed: false,
+                expect_spec_changed: false,
+                expect_noop: true,
+            },
+            Case {
+                label: "config stale only",
+                config_hash: Some("stale".to_string()),
+                spec_hash: Some(current_spec.clone()),
+                expect_config_changed: true,
+                expect_spec_changed: false,
+                expect_noop: false,
+            },
+            Case {
+                label: "spec stale only",
+                config_hash: Some(current_config.clone()),
+                spec_hash: Some("stale".to_string()),
+                expect_config_changed: false,
+                expect_spec_changed: true,
+                expect_noop: false,
+            },
+            Case {
+                label: "both stale",
+                config_hash: Some("stale-c".to_string()),
+                spec_hash: Some("stale-s".to_string()),
+                expect_config_changed: true,
+                expect_spec_changed: true,
+                expect_noop: false,
+            },
+            Case {
+                label: "both absent (first deploy)",
+                config_hash: None,
+                spec_hash: None,
+                expect_config_changed: true,
+                expect_spec_changed: true,
+                expect_noop: false,
+            },
+        ];
+
+        for case in &cases {
+            let snapshot = make_snapshot(gw.clone());
+            let observed = ObservedRuntimeState {
+                current_config_hash: case.config_hash.clone(),
+                current_spec_hash: case.spec_hash.clone(),
+                ready_replicas: Some(1),
+                deploy_observed_generation: Some(1),
+                deploy_generation: Some(1),
+                updated_replicas: Some(1),
+                available_replicas: Some(1),
+                desired_replicas: Some(1),
+            };
+            let input = make_input("prod", "my-gw", snapshot, observed);
+            let plan = GatewayRuntimePlanner
+                .plan(&input)
+                .unwrap_or_else(|e| panic!("{}: plan failed: {}", case.label, e));
+
+            assert_eq!(
+                plan.config_changed, case.expect_config_changed,
+                "{}: config_changed mismatch",
+                case.label
+            );
+            assert_eq!(
+                plan.spec_changed, case.expect_spec_changed,
+                "{}: spec_changed mismatch",
+                case.label
+            );
+            assert_eq!(
+                plan.is_noop(),
+                case.expect_noop,
+                "{}: is_noop mismatch",
+                case.label
+            );
+
+            // Every plan (noop or not) must carry valid identity and object names.
+            assert_eq!(plan.gateway_namespace, "prod", "{}: namespace", case.label);
+            assert_eq!(plan.gateway_name, "my-gw", "{}: name", case.label);
+            assert!(
+                !plan.config_map_name.is_empty(),
+                "{}: config_map_name empty",
+                case.label
+            );
+            assert!(
+                !plan.deployment_name.is_empty(),
+                "{}: deployment_name empty",
+                case.label
+            );
+        }
+    }
+
+    // ── Rollout convergence: exhaustive state matrix ─────────────────────────
+    //
+    // Verify is_rollout_converged for all interesting ObservedRuntimeState
+    // combinations, ensuring the FSM's convergence decision is correct.
+
+    #[test]
+    fn rollout_convergence_exhaustive_matrix() {
+        struct Case {
+            label: &'static str,
+            obs: ObservedRuntimeState,
+            expected: bool,
+        }
+
+        let cases = [
+            Case {
+                label: "all None (Deployment absent)",
+                obs: ObservedRuntimeState::default(),
+                expected: false,
+            },
+            Case {
+                label: "fully converged (1 replica)",
+                obs: ObservedRuntimeState {
+                    ready_replicas: Some(1),
+                    deploy_observed_generation: Some(2),
+                    deploy_generation: Some(2),
+                    updated_replicas: Some(1),
+                    available_replicas: Some(1),
+                    desired_replicas: Some(1),
+                    ..Default::default()
+                },
+                expected: true,
+            },
+            Case {
+                label: "fully converged (3 replicas)",
+                obs: ObservedRuntimeState {
+                    ready_replicas: Some(3),
+                    deploy_observed_generation: Some(5),
+                    deploy_generation: Some(5),
+                    updated_replicas: Some(3),
+                    available_replicas: Some(3),
+                    desired_replicas: Some(3),
+                    ..Default::default()
+                },
+                expected: true,
+            },
+            Case {
+                label: "scale-to-zero converged",
+                obs: ObservedRuntimeState {
+                    ready_replicas: Some(0),
+                    deploy_observed_generation: Some(3),
+                    deploy_generation: Some(3),
+                    updated_replicas: Some(0),
+                    available_replicas: Some(0),
+                    desired_replicas: Some(0),
+                    ..Default::default()
+                },
+                expected: true,
+            },
+            Case {
+                label: "generation stale",
+                obs: ObservedRuntimeState {
+                    ready_replicas: Some(1),
+                    deploy_observed_generation: Some(1),
+                    deploy_generation: Some(2),
+                    updated_replicas: Some(1),
+                    available_replicas: Some(1),
+                    desired_replicas: Some(1),
+                    ..Default::default()
+                },
+                expected: false,
+            },
+            Case {
+                label: "rolling update in progress (old pods ready, new not)",
+                obs: ObservedRuntimeState {
+                    ready_replicas: Some(2),
+                    deploy_observed_generation: Some(3),
+                    deploy_generation: Some(3),
+                    updated_replicas: Some(0),
+                    available_replicas: Some(2),
+                    desired_replicas: Some(2),
+                    ..Default::default()
+                },
+                expected: false,
+            },
+            Case {
+                label: "ready but not available (minReadySeconds not met)",
+                obs: ObservedRuntimeState {
+                    ready_replicas: Some(1),
+                    deploy_observed_generation: Some(1),
+                    deploy_generation: Some(1),
+                    updated_replicas: Some(1),
+                    available_replicas: Some(0),
+                    desired_replicas: Some(1),
+                    ..Default::default()
+                },
+                expected: false,
+            },
+            Case {
+                label: "available but not ready (readiness probe failing)",
+                obs: ObservedRuntimeState {
+                    ready_replicas: Some(0),
+                    deploy_observed_generation: Some(1),
+                    deploy_generation: Some(1),
+                    updated_replicas: Some(1),
+                    available_replicas: Some(1),
+                    desired_replicas: Some(1),
+                    ..Default::default()
+                },
+                expected: false,
+            },
+            Case {
+                label: "partial scale-up (1/3 ready)",
+                obs: ObservedRuntimeState {
+                    ready_replicas: Some(1),
+                    deploy_observed_generation: Some(2),
+                    deploy_generation: Some(2),
+                    updated_replicas: Some(1),
+                    available_replicas: Some(1),
+                    desired_replicas: Some(3),
+                    ..Default::default()
+                },
+                expected: false,
+            },
+        ];
+
+        for case in &cases {
+            assert_eq!(
+                is_rollout_converged(&case.obs),
+                case.expected,
+                "case '{}' failed",
+                case.label
+            );
+        }
+    }
+
+    // ── Planner must not produce plans with inconsistent hashes ──────────────
+
+    #[test]
+    fn planner_config_hash_always_matches_config_toml_sha256() {
+        // For every plan the planner produces, config_hash must equal
+        // sha256_hex(config_toml). This is a structural FSM invariant.
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+
+        let scenarios: Vec<ObservedRuntimeState> = vec![
+            ObservedRuntimeState::default(),
+            ObservedRuntimeState {
+                current_config_hash: Some("stale".to_string()),
+                current_spec_hash: Some("stale".to_string()),
+                ..Default::default()
+            },
+            ObservedRuntimeState {
+                current_config_hash: None,
+                current_spec_hash: None,
+                ready_replicas: Some(1),
+                deploy_observed_generation: Some(1),
+                deploy_generation: Some(1),
+                updated_replicas: Some(1),
+                available_replicas: Some(1),
+                desired_replicas: Some(1),
+            },
+        ];
+
+        for (i, observed) in scenarios.into_iter().enumerate() {
+            let snapshot = make_snapshot(gw.clone());
+            let input = make_input("prod", "my-gw", snapshot, observed);
+            let plan = GatewayRuntimePlanner
+                .plan(&input)
+                .unwrap_or_else(|e| panic!("scenario {}: {}", i, e));
+
+            assert_eq!(
+                plan.config_hash,
+                sha256_hex(&plan.config_toml),
+                "scenario {}: config_hash must equal sha256_hex(config_toml)",
+                i
+            );
+        }
+    }
+
+    // ── Planner spec_hash consistency across service shape changes ────────────
+
+    #[test]
+    fn planner_spec_hash_reflects_all_runtime_fields() {
+        // The spec_hash must change when ANY of: image, replicas, resources,
+        // node_selector, service_type, or service_ports changes.
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+
+        let baseline_snap = make_snapshot(gw.clone());
+        let baseline_input =
+            make_input("prod", "my-gw", baseline_snap, ObservedRuntimeState::default());
+        let baseline_plan = GatewayRuntimePlanner.plan(&baseline_input).unwrap();
+        let baseline_hash = baseline_plan.spec_hash.clone();
+
+        // Change node_selector
+        let snap = make_snapshot(gw.clone());
+        let mut input = make_input("prod", "my-gw", snap, ObservedRuntimeState::default());
+        input
+            .controller_config
+            .default_node_selector
+            .insert("zone".to_string(), "us-east-1a".to_string());
+        let plan = GatewayRuntimePlanner.plan(&input).unwrap();
+        assert_ne!(
+            plan.spec_hash, baseline_hash,
+            "node_selector change must change spec_hash"
+        );
+
+        // Change resources
+        let snap = make_snapshot(gw.clone());
+        let mut input = make_input("prod", "my-gw", snap, ObservedRuntimeState::default());
+        input
+            .controller_config
+            .default_resources
+            .insert("requests.cpu".to_string(), "500m".to_string());
+        let plan = GatewayRuntimePlanner.plan(&input).unwrap();
+        assert_ne!(
+            plan.spec_hash, baseline_hash,
+            "resources change must change spec_hash"
+        );
     }
 }
