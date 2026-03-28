@@ -364,6 +364,108 @@ mod tests {
         assert_eq!(router.match_sni(Some(".example.com")), Some("backend"));
     }
 
+    // ========================================================================
+    // BUG: Wildcard matches multi-level subdomains (RFC 6125 violation).
+    //
+    // `*.example.com` matches `a.b.example.com` because the wildcard only
+    // checks `ends_with(".example.com")`. Per RFC 6125 Section 6.4.3, a
+    // wildcard should match exactly one DNS label. The HTTP router
+    // (wicket-core/src/routing.rs) correctly prevents this with a
+    // `!prefix.contains('.')` check, but the stream SniRouter does not.
+    // ========================================================================
+
+    #[test]
+    fn test_wildcard_must_not_match_multi_level_subdomains() {
+        let mut routes = HashMap::new();
+        routes.insert("*.example.com".into(), "backend".into());
+
+        let router = SniRouter::new(&routes, None);
+
+        // Single-level subdomain should match
+        assert_eq!(
+            router.match_sni(Some("api.example.com")),
+            Some("backend"),
+            "single-level subdomain should match wildcard"
+        );
+
+        // Multi-level subdomain should NOT match per RFC 6125
+        assert_eq!(
+            router.match_sni(Some("sub.api.example.com")),
+            None,
+            "multi-level subdomain must NOT match *.example.com per RFC 6125"
+        );
+
+        assert_eq!(
+            router.match_sni(Some("a.b.c.example.com")),
+            None,
+            "deeply nested subdomain must NOT match *.example.com"
+        );
+    }
+
+    // ========================================================================
+    // BUG: SNI matching is case-sensitive (RFC 1035 violation).
+    //
+    // DNS names are case-insensitive per RFC 1035 Section 2.3.3. The HTTP
+    // router normalizes to lowercase, but SniRouter does exact string
+    // comparison. A client sending "API.EXAMPLE.COM" won't match a route
+    // for "api.example.com".
+    // ========================================================================
+
+    #[test]
+    fn test_sni_matching_must_be_case_insensitive() {
+        let mut routes = HashMap::new();
+        routes.insert("api.example.com".into(), "backend".into());
+        routes.insert("*.example.org".into(), "wildcard-backend".into());
+
+        let router = SniRouter::new(&routes, None);
+
+        // Exact match with different case
+        assert_eq!(
+            router.match_sni(Some("API.EXAMPLE.COM")),
+            Some("backend"),
+            "DNS matching must be case-insensitive per RFC 1035"
+        );
+        assert_eq!(
+            router.match_sni(Some("Api.Example.Com")),
+            Some("backend"),
+            "DNS matching must be case-insensitive per RFC 1035"
+        );
+
+        // Wildcard match with different case
+        assert_eq!(
+            router.match_sni(Some("WWW.EXAMPLE.ORG")),
+            Some("wildcard-backend"),
+            "Wildcard DNS matching must be case-insensitive per RFC 1035"
+        );
+    }
+
+    // ========================================================================
+    // BUG: More specific wildcards don't take priority over less specific ones.
+    //
+    // When both *.prod.example.com and *.example.com exist, a request for
+    // api.prod.example.com should match *.prod.example.com (more specific).
+    // Currently the match order among wildcards depends on HashMap iteration
+    // order, which is nondeterministic.
+    // ========================================================================
+
+    #[test]
+    fn test_more_specific_wildcard_must_win() {
+        let mut routes = HashMap::new();
+        routes.insert("*.example.com".into(), "short-wildcard".into());
+        routes.insert("*.prod.example.com".into(), "long-wildcard".into());
+
+        let router = SniRouter::new(&routes, None);
+
+        // api.prod.example.com matches both wildcards.
+        // The more specific one (*.prod.example.com) must win.
+        assert_eq!(
+            router.match_sni(Some("api.prod.example.com")),
+            Some("long-wildcard"),
+            "more specific wildcard (*.prod.example.com) must take priority \
+             over less specific wildcard (*.example.com)"
+        );
+    }
+
     #[test]
     fn test_empty_routes() {
         let routes = HashMap::new();
