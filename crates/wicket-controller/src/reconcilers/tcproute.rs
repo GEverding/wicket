@@ -634,7 +634,7 @@ pub fn error_policy_tcproute(
         .with_label_values(&["TCPRoute", "reconcile_error"])
         .inc();
 
-    Action::requeue(Duration::from_secs(60))
+    Action::requeue(Duration::from_secs(5))
 }
 
 /// Update TCPRoute metrics.

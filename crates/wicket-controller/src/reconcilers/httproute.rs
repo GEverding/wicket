@@ -644,7 +644,7 @@ pub fn error_policy_httproute(
         .with_label_values(&["HTTPRoute", "reconcile_error"])
         .inc();
 
-    Action::requeue(Duration::from_secs(60))
+    Action::requeue(Duration::from_secs(5))
 }
 
 /// Update HTTPRoute metrics.

@@ -622,6 +622,21 @@ impl SharedStore {
         SnapshotResult::Ready(inner.to_planner_snapshot())
     }
 
+    // ── Targeted lookups ──────────────────────────────────────────────────────
+
+    /// Look up a GatewayClass by name from the store.
+    ///
+    /// Returns `Some(gc)` when the store has been populated and the class exists.
+    /// Returns `None` when the class is not found or the gateway-classes resource
+    /// class has not yet been listed (the caller should fall back to the API).
+    pub async fn get_gateway_class(&self, name: &str) -> Option<GatewayClass> {
+        let inner = self.inner.read().await;
+        if !inner.populated.gateway_classes {
+            return None;
+        }
+        inner.gateway_classes.get(name).cloned()
+    }
+
     // ── Index lookup ─────────────────────────────────────────────────────────
 
     /// Returns `true` if the given service is referenced by at least one route.

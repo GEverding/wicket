@@ -95,7 +95,7 @@ pub fn error_policy_referencegrant(
         .with_label_values(&["ReferenceGrant", "reconcile_error"])
         .inc();
 
-    Action::requeue(Duration::from_secs(60))
+    Action::requeue(Duration::from_secs(5))
 }
 
 /// Update ReferenceGrant metrics.

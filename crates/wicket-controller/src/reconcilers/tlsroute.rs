@@ -638,7 +638,7 @@ pub fn error_policy_tlsroute(
         .with_label_values(&["TLSRoute", "reconcile_error"])
         .inc();
 
-    Action::requeue(Duration::from_secs(60))
+    Action::requeue(Duration::from_secs(5))
 }
 
 /// Update TLSRoute metrics.
