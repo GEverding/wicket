@@ -38,3 +38,7 @@ lazy_static = "1.4"
 # eBPF sockmap (optional, Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
 wicket-sockmap = { workspace = true, optional = true }
+
+[dev-dependencies]
+wicket-config = { workspace = true }
+tokio = { workspace = true }
