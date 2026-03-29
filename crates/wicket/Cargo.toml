@@ -41,3 +41,8 @@ serde = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 wicket-sockmap = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tempfile = "3"
