@@ -4852,7 +4852,9 @@ dependencies = [
  "pingora",
  "pingora-core",
  "pingora-proxy",
+ "reqwest",
  "serde",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -4869,6 +4871,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+ "tempfile",
  "toml",
  "wicket-tls",
 ]
