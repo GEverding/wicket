@@ -304,29 +304,27 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
 
         match select_tls_cert(tls_config, &config) {
             Some((cert_path, key_path, source)) => {
-                let cert_str = cert_path.to_str().unwrap_or("");
-                let key_str = key_path.to_str().unwrap_or("");
+                let cert_str = cert_path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("TLS cert path is not valid UTF-8: {}", cert_path.display())
+                })?;
+                let key_str = key_path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("TLS key path is not valid UTF-8: {}", key_path.display())
+                })?;
 
-                if let Err(e) = proxy_service.add_tls(&https_addr, cert_str, key_str) {
-                    error!(
-                        error = %e,
-                        source = %source,
-                        cert = %cert_path.display(),
-                        "Failed to configure TLS listener, HTTPS disabled"
-                    );
-                } else {
-                    info!(
-                        address = %https_addr,
-                        source = %source,
-                        cert = %cert_path.display(),
-                        "HTTPS proxy listening"
-                    );
-                }
+                proxy_service
+                    .add_tls(&https_addr, cert_str, key_str)
+                    .context("Failed to configure TLS listener")?;
+
+                info!(
+                    address = %https_addr,
+                    source = %source,
+                    cert = %cert_path.display(),
+                    "HTTPS proxy listening"
+                );
             }
             None => {
-                warn!(
-                    "TLS configured but no cert material found (no file certs, no stored ACME certs); \
-                     HTTPS listener skipped"
+                anyhow::bail!(
+                    "TLS configured but no cert material found (no file certs, no stored ACME certs)"
                 );
             }
         }
@@ -482,7 +480,7 @@ fn compute_https_addr(http_addr: SocketAddr) -> String {
     let https_port = if http_addr.port() == 80 {
         443
     } else {
-        http_addr.port().saturating_add(363)
+        http_addr.port().saturating_add(443 - 80)
     };
     // SocketAddr::to_string() already formats IPv6 with brackets: [::1]:port
     SocketAddr::new(http_addr.ip(), https_port).to_string()
