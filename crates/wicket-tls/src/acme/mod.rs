@@ -304,12 +304,7 @@ impl AcmeProvider {
         .await;
 
         if let Err(e) = result {
-            // Cleanup DNS records on error
-            for (name, record_id) in &record_ids {
-                if let Err(cleanup_err) = dns_client.delete_txt_record(&zone_id, record_id).await {
-                    warn!(name = %name, error = %cleanup_err, "failed to cleanup DNS record");
-                }
-            }
+            cleanup_dns_records(&dns_client, &zone_id, &record_ids).await;
             return Err(e);
         }
 
@@ -320,14 +315,7 @@ impl AcmeProvider {
                 break;
             }
             if matches!(order.state().status, OrderStatus::Invalid) {
-                // Cleanup DNS records on error
-                for (name, record_id) in &record_ids {
-                    if let Err(cleanup_err) =
-                        dns_client.delete_txt_record(&zone_id, record_id).await
-                    {
-                        warn!(name = %name, error = %cleanup_err, "failed to cleanup DNS record");
-                    }
-                }
+                cleanup_dns_records(&dns_client, &zone_id, &record_ids).await;
                 return Err(AcmeError::OrderFailed(format!(
                     "{:?}",
                     order.state().status
@@ -351,11 +339,7 @@ impl AcmeProvider {
         };
 
         // Cleanup DNS records
-        for (name, record_id) in &record_ids {
-            if let Err(e) = dns_client.delete_txt_record(&zone_id, record_id).await {
-                warn!(name = %name, error = %e, "failed to cleanup DNS record");
-            }
-        }
+        cleanup_dns_records(&dns_client, &zone_id, &record_ids).await;
 
         // Parse expiry from the actual certificate
         let expiry = parse_certificate_expiry(&cert_pem).unwrap_or_else(|| {
@@ -438,6 +422,19 @@ impl AcmeProvider {
 
         let key = load_certified_key(cert_file.path(), key_file.path())?;
         Ok(key)
+    }
+}
+
+/// Clean up DNS challenge records, logging any failures.
+async fn cleanup_dns_records(
+    dns_client: &CloudflareClient,
+    zone_id: &str,
+    record_ids: &[(String, String)],
+) {
+    for (name, record_id) in record_ids {
+        if let Err(e) = dns_client.delete_txt_record(zone_id, record_id).await {
+            warn!(name = %name, error = %e, "failed to cleanup DNS record");
+        }
     }
 }
 
