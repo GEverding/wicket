@@ -56,19 +56,6 @@ lazy_static! {
         &["listener", "error_type"]
     ).expect("metric can be created");
 
-    /// Request timeouts.
-    pub static ref REQUEST_TIMEOUTS_TOTAL: IntCounterVec = register_int_counter_vec!(
-        "wicket_request_timeouts_total",
-        "Total request timeouts",
-        &["route", "timeout_type"]
-    ).expect("metric can be created");
-
-    /// Circuit breaker trips.
-    pub static ref CIRCUIT_BREAKER_TRIPS_TOTAL: IntCounterVec = register_int_counter_vec!(
-        "wicket_circuit_breaker_trips_total",
-        "Total circuit breaker trips",
-        &["upstream"]
-    ).expect("metric can be created");
 
     // ============================================================
     // RED Metrics - Duration
@@ -90,13 +77,6 @@ lazy_static! {
         vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
     ).expect("metric can be created");
 
-    /// Time to first byte (TTFB).
-    pub static ref TIME_TO_FIRST_BYTE_SECONDS: HistogramVec = register_histogram_vec!(
-        "wicket_time_to_first_byte_seconds",
-        "Time to first byte in seconds",
-        &["route"],
-        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
-    ).expect("metric can be created");
 
     // ============================================================
     // Connection Metrics
@@ -123,12 +103,6 @@ lazy_static! {
         &["upstream"]
     ).expect("metric can be created");
 
-    /// Upstream connection pool size.
-    pub static ref UPSTREAM_POOL_SIZE: IntGaugeVec = register_int_gauge_vec!(
-        "wicket_upstream_pool_size",
-        "Upstream connection pool size",
-        &["upstream"]
-    ).expect("metric can be created");
 
     // ============================================================
     // Upstream Health Metrics
@@ -267,15 +241,11 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     let _ = &*HTTP_ERRORS_TOTAL;
     let _ = &*UPSTREAM_ERRORS_TOTAL;
     let _ = &*TLS_HANDSHAKE_ERRORS_TOTAL;
-    let _ = &*REQUEST_TIMEOUTS_TOTAL;
-    let _ = &*CIRCUIT_BREAKER_TRIPS_TOTAL;
     let _ = &*HTTP_REQUEST_DURATION_SECONDS;
     let _ = &*UPSTREAM_DURATION_SECONDS;
-    let _ = &*TIME_TO_FIRST_BYTE_SECONDS;
     let _ = &*CLIENT_CONNECTIONS_ACTIVE;
     let _ = &*CLIENT_CONNECTIONS_TOTAL;
     let _ = &*UPSTREAM_CONNECTIONS_ACTIVE;
-    let _ = &*UPSTREAM_POOL_SIZE;
     let _ = &*UPSTREAM_HEALTH;
     let _ = &*UPSTREAM_HEALTHY_BACKENDS;
     let _ = &*HEALTH_CHECK_TOTAL;
@@ -295,124 +265,15 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     Ok(())
 }
 
-/// Helper for tracking request metrics.
-pub struct RequestMetrics {
-    route: String,
-    method: String,
-    start_time: std::time::Instant,
-}
-
-impl RequestMetrics {
-    /// Start tracking a new request.
-    pub fn start(route: &str, method: &str) -> Self {
-        HTTP_REQUESTS_ACTIVE.with_label_values(&[route]).inc();
-        Self {
-            route: route.to_string(),
-            method: method.to_string(),
-            start_time: std::time::Instant::now(),
-        }
-    }
-
-    /// Record a successful response.
-    pub fn success(self, status_code: u16, bytes_sent: u64, bytes_received: u64) {
-        let duration = self.start_time.elapsed().as_secs_f64();
-        let status = status_code.to_string();
-
-        HTTP_REQUESTS_TOTAL
-            .with_label_values(&[&self.method, &self.route, &status])
-            .inc();
-        HTTP_REQUEST_DURATION_SECONDS
-            .with_label_values(&[&self.method, &self.route])
-            .observe(duration);
-        HTTP_REQUESTS_ACTIVE.with_label_values(&[&self.route]).dec();
-
-        BYTES_SENT_TOTAL
-            .with_label_values(&[&self.route])
-            .inc_by(bytes_sent);
-        BYTES_RECEIVED_TOTAL
-            .with_label_values(&[&self.route])
-            .inc_by(bytes_received);
-
-        // Track errors (4xx, 5xx)
-        if status_code >= 400 {
-            let error_type = if status_code >= 500 {
-                "server_error"
-            } else {
-                "client_error"
-            };
-            HTTP_ERRORS_TOTAL
-                .with_label_values(&[&self.method, &self.route, &status, error_type])
-                .inc();
-        }
-    }
-
-    /// Record a timeout.
-    pub fn timeout(self, timeout_type: &str) {
-        let duration = self.start_time.elapsed().as_secs_f64();
-
-        HTTP_REQUESTS_TOTAL
-            .with_label_values(&[&self.method, &self.route, "504"])
-            .inc();
-        HTTP_REQUEST_DURATION_SECONDS
-            .with_label_values(&[&self.method, &self.route])
-            .observe(duration);
-        HTTP_REQUESTS_ACTIVE.with_label_values(&[&self.route]).dec();
-        REQUEST_TIMEOUTS_TOTAL
-            .with_label_values(&[&self.route, timeout_type])
-            .inc();
-        HTTP_ERRORS_TOTAL
-            .with_label_values(&[&self.method, &self.route, "504", "timeout"])
-            .inc();
-    }
-
-    /// Record an upstream error.
-    pub fn upstream_error(self, upstream: &str, error_type: &str) {
-        let duration = self.start_time.elapsed().as_secs_f64();
-
-        HTTP_REQUESTS_TOTAL
-            .with_label_values(&[&self.method, &self.route, "502"])
-            .inc();
-        HTTP_REQUEST_DURATION_SECONDS
-            .with_label_values(&[&self.method, &self.route])
-            .observe(duration);
-        HTTP_REQUESTS_ACTIVE.with_label_values(&[&self.route]).dec();
-        UPSTREAM_ERRORS_TOTAL
-            .with_label_values(&[upstream, error_type])
-            .inc();
-        HTTP_ERRORS_TOTAL
-            .with_label_values(&[&self.method, &self.route, "502", "upstream_error"])
-            .inc();
+/// Classify an HTTP status code into an error type label for metrics.
+pub fn classify_http_error(status: u16) -> &'static str {
+    if status >= 500 {
+        "server_error"
+    } else {
+        "client_error"
     }
 }
 
-/// Record upstream response time.
-pub fn record_upstream_duration(upstream: &str, duration_secs: f64) {
-    UPSTREAM_DURATION_SECONDS
-        .with_label_values(&[upstream])
-        .observe(duration_secs);
-}
-
-/// Record time to first byte.
-pub fn record_ttfb(route: &str, duration_secs: f64) {
-    TIME_TO_FIRST_BYTE_SECONDS
-        .with_label_values(&[route])
-        .observe(duration_secs);
-}
-
-/// Update upstream health status.
-pub fn set_upstream_health(upstream: &str, backend: &str, healthy: bool) {
-    UPSTREAM_HEALTH
-        .with_label_values(&[upstream, backend])
-        .set(if healthy { 1 } else { 0 });
-}
-
-/// Record a health check result.
-pub fn record_health_check(upstream: &str, backend: &str, success: bool) {
-    let result = if success { "success" } else { "failure" };
-    HEALTH_CHECK_TOTAL
-        .with_label_values(&[upstream, backend, result])
-        .inc();
-}
 
 #[cfg(test)]
 mod tests {

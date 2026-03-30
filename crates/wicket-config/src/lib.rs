@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
@@ -35,7 +35,7 @@ pub struct Config {
 }
 
 /// Server-level configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Address to listen on (e.g., "0.0.0.0:8080")
     pub listen: SocketAddr,
@@ -58,7 +58,7 @@ pub struct ServerConfig {
 }
 
 /// Configuration for an upstream (backend) service.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamConfig {
     /// List of backend addresses (e.g., ["127.0.0.1:3000", "127.0.0.1:3001"])
     pub backends: Vec<String>,
@@ -73,7 +73,7 @@ pub struct UpstreamConfig {
 }
 
 /// Load balancing strategy.
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalanceStrategy {
     #[default]
@@ -82,7 +82,7 @@ pub enum LoadBalanceStrategy {
 }
 
 /// Health check configuration for upstreams.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
     /// Path to check (e.g., "/health")
     #[serde(default = "default_health_path")]
@@ -648,15 +648,15 @@ impl Config {
             .with_context(|| format!("Invalid stream listen address: {}", stream.listen))?;
 
         // Build upstream name set
-        let upstream_names: HashMap<&str, ()> = stream
+        let upstream_names: HashSet<&str> = stream
             .upstreams
             .iter()
-            .map(|u| (u.name.as_str(), ()))
+            .map(|u| u.name.as_str())
             .collect();
 
         // Validate default_upstream exists if specified
         if let Some(ref default) = stream.default_upstream {
-            if !upstream_names.contains_key(default.as_str()) {
+            if !upstream_names.contains(default.as_str()) {
                 anyhow::bail!(
                     "Stream default_upstream '{}' references undefined upstream",
                     default
@@ -666,7 +666,7 @@ impl Config {
 
         // Validate sni_routes reference defined upstreams
         for (sni, upstream) in &stream.sni_routes {
-            if !upstream_names.contains_key(upstream.as_str()) {
+            if !upstream_names.contains(upstream.as_str()) {
                 anyhow::bail!(
                     "Stream SNI route '{}' references undefined upstream '{}'",
                     sni,

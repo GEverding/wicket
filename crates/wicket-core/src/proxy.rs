@@ -3,10 +3,10 @@
 //! This module implements the core proxy functionality using Pingora's HttpProxy trait.
 
 use crate::metrics::{
-    BYTES_RECEIVED_TOTAL, BYTES_SENT_TOTAL, CLIENT_CONNECTIONS_ACTIVE, CLIENT_CONNECTIONS_TOTAL,
-    HTTP_ERRORS_TOTAL, HTTP_REQUESTS_ACTIVE, HTTP_REQUESTS_TOTAL, HTTP_REQUEST_DURATION_SECONDS,
-    ROUTE_NOT_FOUND_TOTAL, UPSTREAM_CONNECTIONS_ACTIVE, UPSTREAM_DURATION_SECONDS,
-    UPSTREAM_ERRORS_TOTAL,
+    classify_http_error, BYTES_RECEIVED_TOTAL, BYTES_SENT_TOTAL, CLIENT_CONNECTIONS_ACTIVE,
+    CLIENT_CONNECTIONS_TOTAL, HTTP_ERRORS_TOTAL, HTTP_REQUESTS_ACTIVE, HTTP_REQUESTS_TOTAL,
+    HTTP_REQUEST_DURATION_SECONDS, ROUTE_NOT_FOUND_TOTAL, UPSTREAM_CONNECTIONS_ACTIVE,
+    UPSTREAM_DURATION_SECONDS, UPSTREAM_ERRORS_TOTAL,
 };
 use crate::routing::{RouteMatch, Router};
 use anyhow::Result;
@@ -27,6 +27,16 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use wicket_config::{Config, LoadBalanceStrategy, UpstreamConfig};
 use wicket_tls::CertManager;
+
+// Header name constants
+const HEADER_REQUEST_ID: &str = "x-request-id";
+const HEADER_HOST: &str = "host";
+const HEADER_X_FORWARDED_FOR: &str = "x-forwarded-for";
+const HEADER_CONTENT_LENGTH: &str = "content-length";
+
+// Metric label constants
+const LISTENER_DEFAULT: &str = "default";
+const ERROR_NO_HEALTHY_BACKENDS: &str = "no_healthy_backends";
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 use std::os::unix::io::RawFd;
@@ -111,15 +121,26 @@ pub struct HttpReloadHandle {
     upstreams: Arc<ArcSwap<HashMap<String, Arc<UpstreamCluster>>>>,
 }
 
+/// Atomically rebuild and store router + upstreams from a new config.
+fn apply_reload(
+    router_slot: &ArcSwap<Router>,
+    upstreams_slot: &ArcSwap<HashMap<String, Arc<UpstreamCluster>>>,
+    config: &Config,
+) -> Result<()> {
+    // Build both before storing either, so a failure in upstreams
+    // doesn't leave a partially-updated router.
+    let router = Router::build(&config.routes)?;
+    let upstreams = WicketProxy::build_upstreams(&config.upstreams)?;
+
+    router_slot.store(Arc::new(router));
+    upstreams_slot.store(Arc::new(upstreams));
+    Ok(())
+}
+
 impl HttpReloadHandle {
     /// Reload HTTP proxy routes and upstreams from a new config.
     pub fn reload(&self, config: &Config) -> Result<()> {
-        let router = Router::build(&config.routes)?;
-        let upstreams = WicketProxy::build_upstreams(&config.upstreams)?;
-
-        self.router.store(Arc::new(router));
-        self.upstreams.store(Arc::new(upstreams));
-
+        apply_reload(&self.router, &self.upstreams, config)?;
         info!("HTTP proxy configuration reloaded");
         Ok(())
     }
@@ -217,12 +238,7 @@ impl WicketProxy {
 
     /// Reload configuration at runtime.
     pub fn reload(&self, config: &Config) -> Result<()> {
-        let router = Router::build(&config.routes)?;
-        let upstreams = Self::build_upstreams(&config.upstreams)?;
-
-        self.router.store(Arc::new(router));
-        self.upstreams.store(Arc::new(upstreams));
-
+        apply_reload(&self.router, &self.upstreams, config)?;
         info!("Configuration reloaded");
         Ok(())
     }
@@ -285,18 +301,15 @@ impl UpstreamCluster {
 
     /// Select a peer from this upstream cluster.
     fn select_peer(&self, key: &[u8]) -> Option<HttpPeer> {
-        match self.strategy {
+        let backend = match self.strategy {
             LoadBalanceStrategy::RoundRobin => {
-                let lb = self.lb_round_robin.as_ref()?;
-                let backend = lb.select(key, 256)?;
-                Some(HttpPeer::new(backend.addr, false, String::new()))
+                self.lb_round_robin.as_ref()?.select(key, 256)?
             }
             LoadBalanceStrategy::ConsistentHash => {
-                let lb = self.lb_ketama.as_ref()?;
-                let backend = lb.select(key, 256)?;
-                Some(HttpPeer::new(backend.addr, false, String::new()))
+                self.lb_ketama.as_ref()?.select(key, 256)?
             }
-        }
+        };
+        Some(HttpPeer::new(backend.addr, false, String::new()))
     }
 }
 
@@ -308,10 +321,10 @@ impl ProxyHttp for WicketProxy {
         // Increment active connection counter
         // Note: "default" listener since we don't have listener info here
         CLIENT_CONNECTIONS_ACTIVE
-            .with_label_values(&["default"])
+            .with_label_values(&[LISTENER_DEFAULT])
             .inc();
         CLIENT_CONNECTIONS_TOTAL
-            .with_label_values(&["default"])
+            .with_label_values(&[LISTENER_DEFAULT])
             .inc();
 
         WicketCtx {
@@ -343,14 +356,14 @@ impl ProxyHttp for WicketProxy {
         // Propagate incoming X-Request-Id if present, otherwise keep generated one
         if let Some(incoming_id) = req_header
             .headers
-            .get("x-request-id")
+            .get(HEADER_REQUEST_ID)
             .and_then(|v| v.to_str().ok())
         {
             ctx.request_id = incoming_id.to_string();
         }
 
         // Extract request properties
-        let host = req_header.headers.get("host").and_then(|v| v.to_str().ok());
+        let host = req_header.headers.get(HEADER_HOST).and_then(|v| v.to_str().ok());
 
         let path = req_header.uri.path();
         let method = req_header.method.as_str();
@@ -431,7 +444,7 @@ impl ProxyHttp for WicketProxy {
         let peer = self.get_peer(&route_match.upstream, key).ok_or_else(|| {
             // Track upstream error
             UPSTREAM_ERRORS_TOTAL
-                .with_label_values(&[&route_match.upstream, "no_healthy_backends"])
+                .with_label_values(&[&route_match.upstream, ERROR_NO_HEALTHY_BACKENDS])
                 .inc();
 
             error!(
@@ -467,7 +480,7 @@ impl ProxyHttp for WicketProxy {
     {
         // Inject X-Request-Id header to upstream
         upstream_request
-            .insert_header("x-request-id", &ctx.request_id)
+            .insert_header(HEADER_REQUEST_ID, &ctx.request_id)
             .map_err(|e| {
                 warn!(
                     request_id = %ctx.request_id,
@@ -483,14 +496,14 @@ impl ProxyHttp for WicketProxy {
         if let Some(inet_addr) = session.client_addr().and_then(|a| a.as_inet()) {
             let client_ip = inet_addr.ip().to_string();
 
-            let xff_value = if let Some(existing) = upstream_request.headers.get("x-forwarded-for") {
+            let xff_value = if let Some(existing) = upstream_request.headers.get(HEADER_X_FORWARDED_FOR) {
                 format!("{}, {}", existing.to_str().unwrap_or(""), client_ip)
             } else {
                 client_ip
             };
 
             upstream_request
-                .insert_header("x-forwarded-for", &xff_value)
+                .insert_header(HEADER_X_FORWARDED_FOR, &xff_value)
                 .map_err(|e| {
                     warn!(
                         request_id = %ctx.request_id,
@@ -578,22 +591,17 @@ impl ProxyHttp for WicketProxy {
         let path = req_header.uri.path();
         let host = req_header
             .headers
-            .get("host")
+            .get(HEADER_HOST)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("-");
 
-        let route_label = ctx
-            .route_match
-            .as_ref()
-            .and_then(|r| r.route_name.as_deref())
-            .or_else(|| ctx.route_match.as_ref().map(|r| r.upstream.as_str()))
-            .unwrap_or("unknown");
-
-        let upstream = ctx
-            .route_match
-            .as_ref()
-            .map(|r| r.upstream.as_str())
-            .unwrap_or("unknown");
+        let (route_label, upstream) = match ctx.route_match.as_ref() {
+            Some(rm) => (
+                rm.route_name.as_deref().unwrap_or(rm.upstream.as_str()),
+                rm.upstream.as_str(),
+            ),
+            None => ("unknown", "unknown"),
+        };
 
         let status_str = status.to_string();
 
@@ -627,13 +635,8 @@ impl ProxyHttp for WicketProxy {
 
         // Record errors (4xx, 5xx)
         if status >= 400 {
-            let error_type = if status >= 500 {
-                "server_error"
-            } else {
-                "client_error"
-            };
             HTTP_ERRORS_TOTAL
-                .with_label_values(&[method, route_label, &status_str, error_type])
+                .with_label_values(&[method, route_label, &status_str, classify_http_error(status)])
                 .inc();
         }
 
@@ -656,25 +659,31 @@ impl ProxyHttp for WicketProxy {
         // Note: For accurate byte counting, we'd need to track actual bytes in
         // upstream_request_filter and upstream_response_filter
         if let Some(resp) = session.response_written() {
-            if let Some(cl) = resp.headers.get("content-length") {
-                if let Ok(bytes) = cl.to_str().unwrap_or("0").parse::<u64>() {
-                    BYTES_SENT_TOTAL
-                        .with_label_values(&[route_label])
-                        .inc_by(bytes);
-                }
-            }
-        }
-        if let Some(cl) = req_header.headers.get("content-length") {
-            if let Ok(bytes) = cl.to_str().unwrap_or("0").parse::<u64>() {
-                BYTES_RECEIVED_TOTAL
+            if let Some(bytes) = resp
+                .headers
+                .get(HEADER_CONTENT_LENGTH)
+                .and_then(|cl| cl.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                BYTES_SENT_TOTAL
                     .with_label_values(&[route_label])
                     .inc_by(bytes);
             }
         }
+        if let Some(bytes) = req_header
+            .headers
+            .get(HEADER_CONTENT_LENGTH)
+            .and_then(|cl| cl.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            BYTES_RECEIVED_TOTAL
+                .with_label_values(&[route_label])
+                .inc_by(bytes);
+        }
 
         // Decrement connection counter
         CLIENT_CONNECTIONS_ACTIVE
-            .with_label_values(&["default"])
+            .with_label_values(&[LISTENER_DEFAULT])
             .dec();
 
         info!(

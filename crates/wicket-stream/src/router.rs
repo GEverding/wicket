@@ -16,12 +16,13 @@ enum CompiledPattern {
 impl CompiledPattern {
     /// Parse a pattern string into a compiled pattern.
     fn parse(pattern: &str) -> Self {
-        if let Some(suffix) = pattern.strip_prefix("*.") {
+        let pattern_lower = pattern.to_ascii_lowercase();
+        if let Some(suffix) = pattern_lower.strip_prefix("*.") {
             CompiledPattern::Wildcard {
                 suffix: format!(".{}", suffix),
             }
         } else {
-            CompiledPattern::Exact(pattern.to_string())
+            CompiledPattern::Exact(pattern_lower)
         }
     }
 
@@ -29,7 +30,13 @@ impl CompiledPattern {
     fn matches(&self, hostname: &str) -> bool {
         match self {
             CompiledPattern::Exact(exact) => hostname == exact,
-            CompiledPattern::Wildcard { suffix } => hostname.ends_with(suffix),
+            CompiledPattern::Wildcard { suffix } => {
+                if let Some(prefix) = hostname.strip_suffix(suffix.as_str()) {
+                    !prefix.is_empty() && !prefix.contains('.')
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -72,8 +79,19 @@ impl SniRouter {
             .map(|(pattern, upstream)| (CompiledPattern::parse(pattern), upstream.clone()))
             .collect();
 
-        // Sort: exact matches first, then wildcards
-        routes.sort_by_key(|(pattern, _)| pattern.priority());
+        // Sort: exact matches first, then wildcards (longest suffix first)
+        routes.sort_by(|(a, _), (b, _)| {
+            a.priority().cmp(&b.priority()).then_with(|| {
+                // Among wildcards, longer suffixes (more specific) come first
+                match (a, b) {
+                    (
+                        CompiledPattern::Wildcard { suffix: sa },
+                        CompiledPattern::Wildcard { suffix: sb },
+                    ) => sb.len().cmp(&sa.len()),
+                    _ => std::cmp::Ordering::Equal,
+                }
+            })
+        });
 
         Self {
             routes,
@@ -91,8 +109,9 @@ impl SniRouter {
     /// * `sni` - The SNI hostname, or `None` for non-TLS or missing SNI extension
     pub fn match_sni(&self, sni: Option<&str>) -> Option<&str> {
         if let Some(hostname) = sni {
+            let hostname_lower = hostname.to_ascii_lowercase();
             for (pattern, upstream) in &self.routes {
-                if pattern.matches(hostname) {
+                if pattern.matches(&hostname_lower) {
                     return Some(upstream);
                 }
             }
@@ -144,10 +163,8 @@ mod tests {
             router.match_sni(Some("www.example.com")),
             Some("wildcard-backend")
         ); // wildcard
-        assert_eq!(
-            router.match_sni(Some("sub.api.example.com")),
-            Some("wildcard-backend")
-        ); // wildcard
+        // Multi-level subdomains should NOT match per RFC 6125
+        assert_eq!(router.match_sni(Some("sub.api.example.com")), None);
         assert_eq!(router.match_sni(Some("example.com")), None); // no match
     }
 
@@ -229,10 +246,9 @@ mod tests {
         // Exact case matches
         assert_eq!(router.match_sni(Some("api.example.com")), Some("backend"));
 
-        // Different case doesn't match (current behavior)
-        // Note: In production, SNI should be normalized to lowercase
-        assert_eq!(router.match_sni(Some("API.EXAMPLE.COM")), None);
-        assert_eq!(router.match_sni(Some("Api.Example.Com")), None);
+        // Case-insensitive matching per RFC 1035
+        assert_eq!(router.match_sni(Some("API.EXAMPLE.COM")), Some("backend"));
+        assert_eq!(router.match_sni(Some("Api.Example.Com")), Some("backend"));
     }
 
     #[test]
@@ -306,7 +322,7 @@ mod tests {
         };
         assert!(wildcard.matches("api.example.com"));
         assert!(wildcard.matches("www.example.com"));
-        assert!(wildcard.matches("sub.api.example.com"));
+        assert!(!wildcard.matches("sub.api.example.com")); // RFC 6125: no multi-level
         assert!(!wildcard.matches("example.com")); // Doesn't match root
         assert!(!wildcard.matches("example.org"));
         assert!(!wildcard.matches("notexample.com"));
@@ -349,19 +365,20 @@ mod tests {
 
         let router = SniRouter::new(&routes, None);
 
-        // Should match
+        // Should match (single-level subdomain)
         assert_eq!(router.match_sni(Some("a.example.com")), Some("backend"));
+
+        // Should not match (multi-level subdomain per RFC 6125)
         assert_eq!(
             router.match_sni(Some("very.long.subdomain.example.com")),
-            Some("backend")
+            None
         );
 
         // Should not match
         assert_eq!(router.match_sni(Some("example.com")), None);
         assert_eq!(router.match_sni(Some("examplexcom")), None);
-        // Note: ".example.com" actually matches because it ends with ".example.com"
-        // This is current behavior - wildcard matches anything ending with the suffix
-        assert_eq!(router.match_sni(Some(".example.com")), Some("backend"));
+        // ".example.com" has empty prefix, so no match
+        assert_eq!(router.match_sni(Some(".example.com")), None);
     }
 
     // ========================================================================
