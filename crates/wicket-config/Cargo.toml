@@ -7,6 +7,7 @@ description = "Configuration parsing for Wicket proxy"
 
 [dependencies]
 serde = { workspace = true }
+schemars = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
 wicket-tls = { path = "../wicket-tls" }

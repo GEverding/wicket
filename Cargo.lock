@@ -4853,7 +4853,9 @@ dependencies = [
  "pingora-core",
  "pingora-proxy",
  "reqwest",
+ "schemars 0.8.22",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -4870,6 +4872,7 @@ name = "wicket-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "schemars 0.8.22",
  "serde",
  "tempfile",
  "toml",
@@ -4977,6 +4980,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pemfile",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "tempfile",

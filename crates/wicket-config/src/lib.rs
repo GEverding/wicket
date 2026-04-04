@@ -4,6 +4,7 @@
 //! upstreams, routes, server settings, and TLS configuration.
 
 use anyhow::{Context, Result};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -12,7 +13,7 @@ use std::path::Path;
 pub use wicket_tls::TlsConfig;
 
 /// Root configuration structure for Wicket.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct Config {
     /// Server configuration
     pub server: ServerConfig,
@@ -35,7 +36,7 @@ pub struct Config {
 }
 
 /// Server-level configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ServerConfig {
     /// Address to listen on (e.g., "0.0.0.0:8080")
     pub listen: SocketAddr,
@@ -58,7 +59,7 @@ pub struct ServerConfig {
 }
 
 /// Configuration for an upstream (backend) service.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UpstreamConfig {
     /// List of backend addresses (e.g., ["127.0.0.1:3000", "127.0.0.1:3001"])
     pub backends: Vec<String>,
@@ -73,7 +74,7 @@ pub struct UpstreamConfig {
 }
 
 /// Load balancing strategy.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalanceStrategy {
     #[default]
@@ -82,7 +83,7 @@ pub enum LoadBalanceStrategy {
 }
 
 /// Health check configuration for upstreams.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HealthCheckConfig {
     /// Path to check (e.g., "/health")
     #[serde(default = "default_health_path")]
@@ -98,7 +99,7 @@ pub struct HealthCheckConfig {
 }
 
 /// Route configuration for matching and proxying requests.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct RouteConfig {
     /// Optional route name for logging
     pub name: Option<String>,
@@ -124,7 +125,7 @@ pub struct RouteConfig {
 }
 
 /// Filters that can be applied to requests and responses.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct RouteFilters {
     /// Modify request headers
     #[serde(default)]
@@ -148,7 +149,7 @@ pub struct RouteFilters {
 }
 
 /// Header modification filter.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct HeaderModifier {
     /// Headers to add (appends to existing)
     #[serde(default)]
@@ -164,7 +165,7 @@ pub struct HeaderModifier {
 }
 
 /// Redirect filter configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct RedirectFilter {
     /// Scheme to redirect to (http or https)
     #[serde(default)]
@@ -192,7 +193,7 @@ fn default_redirect_status() -> u16 {
 }
 
 /// Path modification for redirects and rewrites.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PathModifier {
     /// Replace the entire path
@@ -202,7 +203,7 @@ pub enum PathModifier {
 }
 
 /// URL rewrite filter configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct UrlRewriteFilter {
     /// Hostname to rewrite to
     #[serde(default)]
@@ -214,7 +215,7 @@ pub struct UrlRewriteFilter {
 }
 
 /// Request mirroring filter configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct MirrorFilter {
     /// Upstream to mirror traffic to
     pub upstream: String,
@@ -235,7 +236,7 @@ fn default_mirror_percent() -> u8 {
 /// - `tls = { auto = "provider-name" }` - Use a named DNS provider
 /// - `tls = { cert = "cert-name" }` - Use a specific certificate
 /// - `tls = "off"` - Disable TLS
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(untagged)]
 pub enum RouteTlsConfig {
     /// Simple string variants: "auto" or "off"
@@ -253,7 +254,7 @@ pub enum RouteTlsConfig {
 }
 
 /// Simple TLS modes that can be specified as strings.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SimpleTlsMode {
     /// Auto-provision certificate via ACME using default_dns
@@ -294,7 +295,7 @@ impl RouteTlsConfig {
 }
 
 /// Matching rules for a route.
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RouteMatch {
     /// Host header to match (supports wildcards like "*.example.com")
@@ -319,7 +320,7 @@ pub struct RouteMatch {
 }
 
 /// Stream (L4) proxy configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct StreamConfig {
     /// Address to listen on (e.g., "0.0.0.0:443")
     pub listen: String,
@@ -374,7 +375,7 @@ pub struct StreamConfig {
 }
 
 /// Configuration for a stream upstream.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct StreamUpstreamConfig {
     /// Upstream name
     pub name: String,
@@ -384,7 +385,7 @@ pub struct StreamUpstreamConfig {
 }
 
 /// PROXY protocol configuration.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyProtocolConfig {
     /// No PROXY protocol

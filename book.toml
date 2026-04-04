@@ -1,0 +1,12 @@
+[book]
+title = "Wicket Documentation"
+authors = ["GEverding"]
+language = "en"
+src = "docs/src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/GEverding/wicket"
+default-theme = "light"
