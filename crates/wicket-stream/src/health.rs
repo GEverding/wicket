@@ -19,6 +19,9 @@ pub struct BackendHealth {
 }
 
 impl BackendHealth {
+    /// Create a new health tracker for the given backend address.
+    ///
+    /// Starts in a healthy state with zero consecutive failures.
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -28,10 +31,12 @@ impl BackendHealth {
         }
     }
 
+    /// Return the backend socket address being tracked.
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
+    /// Return whether the backend is currently considered healthy.
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
     }
@@ -82,6 +87,7 @@ impl BackendHealth {
         }
     }
 
+    /// Return the number of consecutive connection failures since last success.
     pub fn consecutive_failures(&self) -> u64 {
         self.consecutive_failures.load(Ordering::Relaxed)
     }

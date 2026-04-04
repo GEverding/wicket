@@ -1,4 +1,8 @@
-//! TCP stream proxy implementation.
+//! L4 TCP/TLS stream proxy implementation.
+//!
+//! Provides high-performance TCP proxying with SNI-based routing, source IP pooling,
+//! PROXY protocol support, and optional eBPF sockmap acceleration. Supports hot-reload
+//! of routing and upstream configuration without dropping active connections.
 
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
