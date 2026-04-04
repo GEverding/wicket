@@ -53,6 +53,10 @@ struct Args {
     #[arg(long)]
     dump_config: bool,
 
+    /// Print the JSON Schema for the configuration and exit
+    #[arg(long)]
+    dump_schema: bool,
+
     /// Prometheus metrics server address
     #[arg(long, default_value = "0.0.0.0:9090")]
     metrics_addr: String,
@@ -68,6 +72,13 @@ fn main() {
 
 fn bootstrap() -> BootstrapResult<()> {
     let args = Args::parse();
+
+    // Handle --dump-schema (does not require a config file)
+    if args.dump_schema {
+        let schema = schemars::schema_for!(wicket_config::Config);
+        println!("{}", serde_json::to_string_pretty(&schema).unwrap());
+        return Ok(());
+    }
 
     // Load configuration first to get log settings
     let config = Config::load(&args.config)

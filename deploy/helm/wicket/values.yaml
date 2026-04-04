@@ -1,14 +1,40 @@
-# Default values for Wicket Gateway API Controller
+# Default values for Wicket - Kubernetes Gateway API Controller & Proxy
 
-# Controller deployment
+# -- Global settings
+global:
+  # -- Image pull secrets for all deployments
+  imagePullSecrets: []
+
+# -- Namespace configuration
+namespace:
+  # -- Override namespace name (defaults to release namespace)
+  name: ""
+
+# -- Override chart name
+nameOverride: ""
+# -- Override fully qualified app name
+fullnameOverride: ""
+
+# ==============================================================================
+# Gateway API Controller
+# ==============================================================================
+
 controller:
+  # -- Enable controller deployment
+  enabled: true
+
   image:
+    # -- Controller container image repository
     repository: ghcr.io/geverding/wicket-controller
-    tag: ""  # Defaults to Chart appVersion
+    # -- Image tag (defaults to Chart appVersion)
+    tag: ""
+    # -- Image pull policy
     pullPolicy: IfNotPresent
 
-  replicas: 1
+  # -- Number of controller replicas (only one is active via leader election)
+  replicaCount: 1
 
+  # -- Controller resource requests and limits
   resources:
     limits:
       memory: 1024Mi
@@ -16,80 +42,245 @@ controller:
       cpu: 100m
       memory: 256Mi
 
+  # -- Pod-level security context
   securityContext:
-    allowPrivilegeEscalation: false
     runAsNonRoot: true
     runAsUser: 65532
     runAsGroup: 65532
     seccompProfile:
       type: RuntimeDefault
 
-  pod:
+  # -- Container-level security context
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+
+  # -- Controller CLI arguments
+  args:
+    # -- Log level (trace, debug, info, warn, error)
+    logLevel: info
+    # -- Enable JSON-formatted log output
+    jsonLogs: true
+    # -- Watch resources in all namespaces (false = watch release namespace only)
+    watchAllNamespaces: true
+    # -- Enable leader election for HA
+    leaderElection: true
+
+  # -- Metrics endpoint configuration
+  metrics:
+    # -- Enable metrics endpoint
+    enabled: true
+    # -- Metrics port
+    port: 8081
+    serviceMonitor:
+      # -- Create a ServiceMonitor for controller metrics
+      enabled: false
+      # -- Scrape interval
+      interval: 30s
+      # -- Scrape timeout
+      scrapeTimeout: 10s
+
+  serviceAccount:
+    # -- Create a ServiceAccount for the controller
+    create: true
+    # -- ServiceAccount name (auto-generated if empty)
+    name: ""
+    # -- Annotations for the ServiceAccount (e.g. for IRSA/Workload Identity)
     annotations: {}
-    labels: {}
-    affinity: {}
-    tolerations: []
-    nodeSelector: {}
 
-# Controller config
-config:
-  controllerName: gateway.wicket.dev/gatewayclass-controller
-  logging:
-    level: info
+  podDisruptionBudget:
+    # -- Enable PodDisruptionBudget for controller
+    enabled: false
+    # -- Minimum available pods during disruption
+    minAvailable: 1
 
-# Service for controller (metrics, health)
-service:
-  type: ClusterIP
-  annotations: {}
-  ports:
-    - name: metrics
-      port: 8081
-      targetPort: 8081
+  # -- Node selector for controller pods
+  nodeSelector: {}
+  # -- Affinity rules for controller pods
+  affinity: {}
+  # -- Tolerations for controller pods
+  tolerations: []
 
-# Install Gateway API CRDs
-crds:
-  install: true
+# ==============================================================================
+# Wicket Proxy (Data Plane)
+# ==============================================================================
 
+proxy:
+  # -- Enable proxy deployment
+  enabled: true
+
+  image:
+    # -- Proxy container image repository
+    repository: ghcr.io/geverding/wicket
+    # -- Image tag (defaults to Chart appVersion)
+    tag: ""
+    # -- Image pull policy
+    pullPolicy: IfNotPresent
+
+  # -- Number of proxy replicas (ignored if autoscaling is enabled)
+  replicaCount: 1
+
+  # -- Proxy configuration (generates wicket.toml ConfigMap)
+  config:
+    # -- Listen address inside the container
+    listen: "0.0.0.0:8080"
+    # -- Number of worker threads (null = CPU count)
+    workers: null
+    # -- Enable structured JSON logging
+    jsonLogs: true
+    # -- Log level (trace, debug, info, warn, error)
+    logLevel: info
+    # -- Graceful shutdown timeout in seconds
+    shutdownTimeout: 30
+
+  # -- Proxy resource requests and limits
+  resources:
+    limits:
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # -- Pod-level security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+
+  # -- Container-level security context
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+
+  service:
+    # -- Proxy service type (ClusterIP, LoadBalancer, NodePort)
+    type: ClusterIP
+    # -- Service annotations (e.g. for cloud load balancer config)
+    annotations: {}
+    # -- Service ports
+    ports:
+      - name: http
+        port: 80
+        targetPort: 8080
+        protocol: TCP
+
+  serviceAccount:
+    # -- Create a ServiceAccount for the proxy
+    create: true
+    # -- ServiceAccount name (auto-generated if empty)
+    name: ""
+    # -- Annotations for the ServiceAccount
+    annotations: {}
+
+  autoscaling:
+    # -- Enable HorizontalPodAutoscaler
+    enabled: false
+    # -- Minimum replicas
+    minReplicas: 1
+    # -- Maximum replicas
+    maxReplicas: 10
+    # -- Target CPU utilization percentage
+    targetCPUUtilizationPercentage: 80
+    # -- Target memory utilization percentage (null = disabled)
+    targetMemoryUtilizationPercentage: null
+
+  podDisruptionBudget:
+    # -- Enable PodDisruptionBudget for proxy
+    enabled: false
+    # -- Minimum available pods during disruption
+    minAvailable: 1
+
+  # -- Additional pod labels
+  podLabels: {}
+  # -- Additional pod annotations
+  podAnnotations: {}
+  # -- Node selector for proxy pods
+  nodeSelector: {}
+  # -- Affinity rules for proxy pods
+  affinity: {}
+  # -- Tolerations for proxy pods
+  tolerations: []
+  # -- Topology spread constraints for proxy pods
+  topologySpreadConstraints: []
+  # -- Priority class name for proxy pods
+  priorityClassName: ""
+  # -- Termination grace period in seconds
+  terminationGracePeriodSeconds: 60
+  # -- Pre-stop hook sleep in seconds (allows load balancer deregistration)
+  preStopSleepSeconds: 5
+
+# ==============================================================================
+# Gateway API
+# ==============================================================================
+
+gatewayClass:
+  # -- Create a GatewayClass resource
+  create: true
+  # -- GatewayClass name
+  name: wicket
+  # -- GatewayClass description
+  description: "Wicket Gateway Controller"
+
+# ==============================================================================
 # RBAC
+# ==============================================================================
+
 rbac:
+  # -- Create RBAC resources (ClusterRole, ClusterRoleBinding)
   create: true
 
-# Monitoring: PrometheusRules, ServiceMonitors, Grafana dashboards
+# ==============================================================================
+# CRDs
+# ==============================================================================
+
+crds:
+  # -- Install Gateway API CRDs
+  install: true
+
+# ==============================================================================
+# Monitoring
+# ==============================================================================
+
 monitoring:
-  # Prometheus alerting rules
+  # -- Prometheus alerting rules
   prometheusRules:
+    # -- Enable PrometheusRule resources
     enabled: false
-    # Additional labels for PrometheusRule resources (e.g. to match Prometheus selector)
+    # -- Additional labels for PrometheusRule resources (e.g. to match Prometheus selector)
     labels: {}
-    # Proxy alert thresholds
+    # -- Proxy alert thresholds
     proxy:
-      # Error rate threshold (fraction, e.g. 0.01 = 1%)
+      # -- HTTP error rate threshold (fraction, e.g. 0.01 = 1%)
       errorRateThreshold: 0.01
-      # p99 latency threshold in seconds
+      # -- p99 latency threshold in seconds
       latencyP99Threshold: 1.0
-      # Certificate expiry warning threshold in seconds (default: 7 days)
+      # -- Certificate expiry warning threshold in seconds (default: 7 days)
       certExpiryWarningSeconds: 604800
-    # Controller alert thresholds
+    # -- Controller alert thresholds
     controller:
-      # Reconciliation error rate threshold (fraction)
+      # -- Reconciliation error rate threshold (fraction)
       reconcileErrorRateThreshold: 0.05
-      # Config sync lag threshold in seconds (default: 5 minutes)
+      # -- Config sync lag threshold in seconds (default: 5 minutes)
       configSyncLagThreshold: 300
 
-  # Grafana dashboards (deployed as ConfigMaps with grafana_dashboard label)
+  # -- Grafana dashboards (deployed as ConfigMaps with grafana_dashboard label)
   grafanaDashboards:
+    # -- Enable Grafana dashboard ConfigMaps
     enabled: false
-    # Additional labels for dashboard ConfigMaps
+    # -- Additional labels for dashboard ConfigMaps
     labels: {}
-    # Grafana sidecar folder
+    # -- Grafana sidecar folder name
     folder: "Wicket"
-    # Prometheus datasource name used in dashboard queries
+    # -- Prometheus datasource name used in dashboard queries
     datasource: "Prometheus"
 
-  # Proxy ServiceMonitor (controller already has one above)
+  # -- Proxy ServiceMonitor
   proxyServiceMonitor:
+    # -- Enable ServiceMonitor for proxy metrics
     enabled: false
+    # -- Scrape interval
     interval: 30s
+    # -- Scrape timeout
     scrapeTimeout: 10s
-
-createNamespace: false

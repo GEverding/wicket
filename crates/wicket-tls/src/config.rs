@@ -5,13 +5,14 @@
 //! - `file`: Static certificates loaded from disk with optional file watching
 //! - `mixed`: Both ACME and file-based certificates
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::warn;
 
 /// Top-level TLS configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct TlsConfig {
     /// Mode: "acme", "file", or "mixed"
     pub mode: TlsMode,
@@ -24,7 +25,7 @@ pub struct TlsConfig {
 }
 
 /// TLS mode selection.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TlsMode {
     /// ACME-only (auto-obtain via DNS-01)
@@ -37,7 +38,7 @@ pub enum TlsMode {
 }
 
 /// ACME configuration for automatic certificate provisioning.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct AcmeConfig {
     /// Contact email for Let's Encrypt account
     pub email: String,
@@ -136,7 +137,7 @@ impl AcmeConfig {
 }
 
 /// Individual ACME certificate configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct AcmeCertConfig {
     /// Domains for this certificate (first is primary, rest are SANs)
     pub domains: Vec<String>,
@@ -145,7 +146,7 @@ pub struct AcmeCertConfig {
 }
 
 /// DNS provider configuration for ACME DNS-01 validation.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct DnsProviderConfig {
     /// Provider name: "cloudflare"
     pub provider: String,
@@ -196,7 +197,7 @@ impl DnsProviderConfig {
 }
 
 /// File-based certificate configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct FileConfig {
     /// Watch for file changes and reload automatically
     #[serde(default = "default_true")]
@@ -210,7 +211,7 @@ pub struct FileConfig {
 }
 
 /// Individual file-based certificate configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct FileCertConfig {
     /// Unique name for this certificate
     pub name: String,
