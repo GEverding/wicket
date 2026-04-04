@@ -1,5 +1,8 @@
 # Wicket
 
+> **Warning**
+> This project is **pre-production, alpha, experimental software**. APIs, configuration formats, and behaviors may change without notice between releases. Do not use in production environments without understanding the risks. See the [Feature Contract Matrix](docs/FEATURE_CONTRACT_MATRIX.md) for per-capability stability status.
+
 A Kubernetes Gateway API implementation and general-purpose reverse proxy built on [Cloudflare's Pingora](https://github.com/cloudflare/pingora) framework.
 
 ## Features
@@ -174,6 +177,17 @@ The authoritative feature contract is documented in [`docs/FEATURE_CONTRACT_MATR
 - **Beta** capabilities are partially implemented; behavior may still evolve.
 
 Current focus areas: data-plane parity, TLS unification, and controller hardening.
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Usage Guide](docs/USAGE.md) | Getting started, CLI options, running modes, and examples |
+| [Configuration Reference](docs/CONFIGURATION.md) | Complete reference for `wicket.toml` and all config sections |
+| [Deployment Guide](docs/DEPLOYMENT.md) | Docker, Kubernetes, Helm chart, and production deployment |
+| [Feature Contract Matrix](docs/FEATURE_CONTRACT_MATRIX.md) | Per-capability stability status (GA / Beta / Unsupported) |
+| [TLS Guide](crates/wicket-tls/README.md) | ACME DNS-01, file-watch, mixed mode TLS configuration |
+| [Security Audit](docs/SECURITY_AUDIT.md) | Security considerations and threat model |
 
 ## License
 

@@ -161,6 +161,11 @@ fn init_acme(
     Ok(())
 }
 
+/// Initialize and run the Wicket proxy server.
+///
+/// Sets up TLS (file-watch, ACME, or mixed), creates the Pingora HTTP proxy service,
+/// optionally starts the L4 stream proxy, installs signal handlers for graceful
+/// shutdown, and starts a config-file watcher for hot reloads.
 fn run_server(config: Config, args: &Args) -> Result<()> {
     info!(
         config_path = %args.config.display(),
