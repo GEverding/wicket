@@ -167,37 +167,59 @@ pub async fn apply_config_plan(
                 "data": data,
             });
 
-            api.patch(
-                input.configmap_name,
-                &PatchParams::apply("wicket-controller"),
-                &Patch::Merge(&patch),
-            )
-            .await
-            .map_err(|e| ApplyError::KubeApi(e.to_string()))?;
+            let patch_result = api
+                .patch(
+                    input.configmap_name,
+                    &PatchParams::apply("wicket-controller"),
+                    &Patch::Merge(&patch),
+                )
+                .await;
 
-            // ── 3. Update in-memory config ────────────────────────────────────
-            {
-                let mut current = input.in_memory_config.write().await;
-                *current = new_config;
+            match patch_result {
+                Ok(_) => {
+                    // ── 3. Update in-memory config ────────────────────────────
+                    {
+                        let mut current = input.in_memory_config.write().await;
+                        *current = new_config;
+                    }
+
+                    // ── 4. Update metrics ─────────────────────────────────────
+                    crate::metrics::CONFIG_UPDATES_TOTAL
+                        .with_label_values(&["success"])
+                        .inc();
+                    crate::metrics::CONFIG_LAST_UPDATE_TIMESTAMP
+                        .set(chrono::Utc::now().timestamp());
+                    crate::metrics::CONFIG_GENERATION.inc();
+
+                    tracing::info!(
+                        configmap = %input.configmap_name,
+                        namespace = %input.configmap_namespace,
+                        config_hash = %config_hash,
+                        "Configuration applied to ConfigMap"
+                    );
+
+                    Ok(ConfigApplyResult::Updated {
+                        config_hash: config_hash.clone(),
+                    })
+                }
+                Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                    // Central ConfigMap doesn't exist — likely running in
+                    // managed-runtime-only mode where per-Gateway ConfigMaps
+                    // are used instead.  Sync in-memory config so generation
+                    // metrics still work, but skip the patch silently.
+                    {
+                        let mut current = input.in_memory_config.write().await;
+                        *current = new_config;
+                    }
+                    tracing::debug!(
+                        configmap = %input.configmap_name,
+                        namespace = %input.configmap_namespace,
+                        "Central ConfigMap not found; skipping (managed-runtime-only mode?)"
+                    );
+                    Ok(ConfigApplyResult::NoOp)
+                }
+                Err(e) => Err(ApplyError::KubeApi(e.to_string())),
             }
-
-            // ── 4. Update metrics ─────────────────────────────────────────────
-            crate::metrics::CONFIG_UPDATES_TOTAL
-                .with_label_values(&["success"])
-                .inc();
-            crate::metrics::CONFIG_LAST_UPDATE_TIMESTAMP.set(chrono::Utc::now().timestamp());
-            crate::metrics::CONFIG_GENERATION.inc();
-
-            tracing::info!(
-                configmap = %input.configmap_name,
-                namespace = %input.configmap_namespace,
-                config_hash = %config_hash,
-                "Configuration applied to ConfigMap"
-            );
-
-            Ok(ConfigApplyResult::Updated {
-                config_hash: config_hash.clone(),
-            })
         }
     }
 }

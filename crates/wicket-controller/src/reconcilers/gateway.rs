@@ -733,9 +733,9 @@ fn build_legacy_listener_statuses(gateway: &Gateway) -> Vec<ListenerStatus> {
                 supported_kinds,
                 attached_routes: 0,
                 conditions: vec![
-                    Condition::accepted(),
-                    Condition::programmed(),
-                    Condition::resolved_refs(),
+                    Condition::accepted().with_observed_generation(gateway.metadata.generation),
+                    Condition::programmed().with_observed_generation(gateway.metadata.generation),
+                    Condition::resolved_refs().with_observed_generation(gateway.metadata.generation),
                 ],
             }
         })
@@ -1039,21 +1039,21 @@ fn build_managed_runtime_status(
                     vec![
                         Condition::accepted().with_observed_generation(outcome.observed_generation),
                         not_prog,
-                        Condition::resolved_refs(),
+                        Condition::resolved_refs().with_observed_generation(outcome.observed_generation),
                     ]
                 } else {
                     vec![
                         Condition::not_accepted()
                             .with_observed_generation(outcome.observed_generation),
                         not_prog,
-                        Condition::resolved_refs(),
+                        Condition::resolved_refs().with_observed_generation(outcome.observed_generation),
                     ]
                 }
             } else if programmed && intent.accepted {
                 vec![
                     Condition::accepted().with_observed_generation(outcome.observed_generation),
                     Condition::programmed().with_observed_generation(outcome.observed_generation),
-                    Condition::resolved_refs(),
+                    Condition::resolved_refs().with_observed_generation(outcome.observed_generation),
                 ]
             } else if intent.accepted {
                 let not_prog = if only_store_not_ready {
@@ -1065,7 +1065,7 @@ fn build_managed_runtime_status(
                 vec![
                     Condition::accepted().with_observed_generation(outcome.observed_generation),
                     not_prog,
-                    Condition::resolved_refs(),
+                    Condition::resolved_refs().with_observed_generation(outcome.observed_generation),
                 ]
             } else {
                 let not_prog = if only_store_not_ready {
@@ -1075,9 +1075,9 @@ fn build_managed_runtime_status(
                 }
                 .with_observed_generation(outcome.observed_generation);
                 vec![
-                    Condition::not_accepted(),
+                    Condition::not_accepted().with_observed_generation(outcome.observed_generation),
                     not_prog,
-                    Condition::resolved_refs(),
+                    Condition::resolved_refs().with_observed_generation(outcome.observed_generation),
                 ]
             };
 
