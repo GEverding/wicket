@@ -403,11 +403,29 @@ async fn write_tls_file(
     extension: &str,
     data: &[u8],
 ) -> Result<PathBuf, SecretError> {
-    // Ensure directory exists with secure permissions
+    // Ensure directory exists with secure permissions.
+    // If the directory cannot be created (read-only filesystem, permissions),
+    // skip the disk write silently — this indicates managed-runtime mode
+    // where TLS certs flow via mounted Secrets, not controller-written files.
     let dir = PathBuf::from(tls_cert_dir);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| SecretError::WriteFile(format!("Failed to create dir: {}", e)))?;
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        // Read-only filesystem or permission denied → skip disk write.
+        // This is expected in managed-runtime mode where the controller
+        // container has no writable volume for TLS certs.
+        if e.kind() == std::io::ErrorKind::PermissionDenied
+            || e.raw_os_error() == Some(30) // EROFS (Read-only file system)
+        {
+            tracing::debug!(
+                path = %dir.display(),
+                error = %e,
+                "TLS cert directory not writable, skipping disk write"
+            );
+            let safe_ns = sanitize_filename_component(namespace);
+            let safe_name = sanitize_filename_component(name);
+            return Ok(dir.join(format!("{}-{}.{}", safe_ns, safe_name, extension)));
+        }
+        return Err(SecretError::WriteFile(format!("Failed to create dir: {e}")));
+    }
 
     // Set directory permissions to 0700 (owner only)
     #[cfg(unix)]
