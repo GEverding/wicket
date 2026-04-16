@@ -47,16 +47,40 @@ impl ProxyProtocolEncoder {
     ///
     /// Format: `PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n`
     fn encode_v1(client_addr: SocketAddr, proxy_addr: SocketAddr) -> Vec<u8> {
-        let protocol = if client_addr.is_ipv4() {
-            "TCP4"
+        // Normalize both addresses to the same family.
+        // PROXY protocol v1 requires both IPs to match the declared protocol.
+        let (protocol, src_ip, dst_ip) = if client_addr.is_ipv4() {
+            let src = match client_addr {
+                SocketAddr::V4(a) => *a.ip(),
+                SocketAddr::V6(a) => a
+                    .ip()
+                    .to_ipv4_mapped()
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            };
+            let dst = match proxy_addr {
+                SocketAddr::V4(a) => *a.ip(),
+                SocketAddr::V6(a) => a
+                    .ip()
+                    .to_ipv4_mapped()
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            };
+            ("TCP4", src.to_string(), dst.to_string())
         } else {
-            "TCP6"
+            let src = match client_addr {
+                SocketAddr::V6(a) => *a.ip(),
+                SocketAddr::V4(a) => a.ip().to_ipv6_mapped(),
+            };
+            let dst = match proxy_addr {
+                SocketAddr::V6(a) => *a.ip(),
+                SocketAddr::V4(a) => a.ip().to_ipv6_mapped(),
+            };
+            ("TCP6", src.to_string(), dst.to_string())
         };
         let header = format!(
             "PROXY {} {} {} {} {}\r\n",
             protocol,
-            client_addr.ip(),
-            proxy_addr.ip(),
+            src_ip,
+            dst_ip,
             client_addr.port(),
             proxy_addr.port()
         );
@@ -75,54 +99,58 @@ impl ProxyProtocolEncoder {
         // Version and command (1 byte): 0x21 = version 2, PROXY command
         buf.push(0x21);
 
-        // Family and protocol (1 byte)
-        let family = if client_addr.is_ipv4() {
-            0x11 // AF_INET (IPv4) + STREAM
-        } else {
-            0x21 // AF_INET6 (IPv6) + STREAM
-        };
-        buf.push(family);
-
-        // Length and addresses
+        // Family and protocol (1 byte), determined by client address
         if client_addr.is_ipv4() {
-            // Length: 12 bytes (4+4+2+2) in big-endian
+            buf.push(0x11); // AF_INET + STREAM
+
+            // Length: 12 bytes (4+4+2+2)
             buf.extend_from_slice(&[0x00, 0x0C]);
 
             // Source address (4 bytes)
-            if let SocketAddr::V4(addr) = client_addr {
-                buf.extend_from_slice(&addr.ip().octets());
-            }
+            let src = match client_addr {
+                SocketAddr::V4(a) => *a.ip(),
+                SocketAddr::V6(a) => a
+                    .ip()
+                    .to_ipv4_mapped()
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            };
+            buf.extend_from_slice(&src.octets());
 
             // Destination address (4 bytes)
-            if let SocketAddr::V4(addr) = proxy_addr {
-                buf.extend_from_slice(&addr.ip().octets());
-            }
-
-            // Source port (2 bytes, big-endian)
-            buf.extend_from_slice(&client_addr.port().to_be_bytes());
-
-            // Destination port (2 bytes, big-endian)
-            buf.extend_from_slice(&proxy_addr.port().to_be_bytes());
+            let dst = match proxy_addr {
+                SocketAddr::V4(a) => *a.ip(),
+                SocketAddr::V6(a) => a
+                    .ip()
+                    .to_ipv4_mapped()
+                    .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
+            };
+            buf.extend_from_slice(&dst.octets());
         } else {
-            // Length: 36 bytes (16+16+2+2) in big-endian
+            buf.push(0x21); // AF_INET6 + STREAM
+
+            // Length: 36 bytes (16+16+2+2)
             buf.extend_from_slice(&[0x00, 0x24]);
 
             // Source address (16 bytes)
-            if let SocketAddr::V6(addr) = client_addr {
-                buf.extend_from_slice(&addr.ip().octets());
-            }
+            let src = match client_addr {
+                SocketAddr::V6(a) => *a.ip(),
+                SocketAddr::V4(a) => a.ip().to_ipv6_mapped(),
+            };
+            buf.extend_from_slice(&src.octets());
 
             // Destination address (16 bytes)
-            if let SocketAddr::V6(addr) = proxy_addr {
-                buf.extend_from_slice(&addr.ip().octets());
-            }
-
-            // Source port (2 bytes, big-endian)
-            buf.extend_from_slice(&client_addr.port().to_be_bytes());
-
-            // Destination port (2 bytes, big-endian)
-            buf.extend_from_slice(&proxy_addr.port().to_be_bytes());
+            let dst = match proxy_addr {
+                SocketAddr::V6(a) => *a.ip(),
+                SocketAddr::V4(a) => a.ip().to_ipv6_mapped(),
+            };
+            buf.extend_from_slice(&dst.octets());
         }
+
+        // Source port (2 bytes, big-endian)
+        buf.extend_from_slice(&client_addr.port().to_be_bytes());
+
+        // Destination port (2 bytes, big-endian)
+        buf.extend_from_slice(&proxy_addr.port().to_be_bytes());
 
         buf
     }

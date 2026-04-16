@@ -734,30 +734,25 @@ async fn start_slow_backend(hold_duration: Duration) -> (SocketAddr, tokio::task
         .expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let handle = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((mut stream, _)) => {
-                    let dur = hold_duration;
-                    tokio::spawn(async move {
-                        // Hold the connection open, echoing data slowly.
-                        let mut buf = [0u8; 1024];
-                        loop {
-                            tokio::select! {
-                                result = stream.read(&mut buf) => {
-                                    match result {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(n) => {
-                                            tokio::time::sleep(dur).await;
-                                            let _ = stream.write_all(&buf[..n]).await;
-                                        }
-                                    }
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let dur = hold_duration;
+            tokio::spawn(async move {
+                // Hold the connection open, echoing data slowly.
+                let mut buf = [0u8; 1024];
+                loop {
+                    tokio::select! {
+                        result = stream.read(&mut buf) => {
+                            match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    tokio::time::sleep(dur).await;
+                                    let _ = stream.write_all(&buf[..n]).await;
                                 }
                             }
                         }
-                    });
+                    }
                 }
-                Err(_) => break,
-            }
+            });
         }
     });
     (addr, handle)
