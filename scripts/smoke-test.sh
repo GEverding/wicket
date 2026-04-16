@@ -152,7 +152,7 @@ fi
 section "Package"
 info "Building controller image wicket-controller:smoke"
 docker build -t wicket-controller:smoke -f - "${ROOT_DIR}" <<'EOF'
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates \
   && rm -rf /var/lib/apt/lists/*
@@ -165,7 +165,7 @@ EOF
 
 info "Building proxy image wicket:smoke"
 docker build -t wicket:smoke -f - "${ROOT_DIR}" <<'EOF'
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates libssl3 \
   && rm -rf /var/lib/apt/lists/*
@@ -174,6 +174,7 @@ COPY target/release/wicket /usr/local/bin/wicket
 RUN chmod +x /usr/local/bin/wicket
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/wicket"]
+CMD ["-c", "/etc/wicket/wicket.toml"]
 EOF
 log "Docker images built"
 
@@ -198,6 +199,7 @@ log "Gateway API CRDs applied"
 
 section "Helm Install"
 helm upgrade --install "${RELEASE_NAME}" "${ROOT_DIR}/deploy/helm/wicket" \
+  --skip-crds \
   -n "${SYSTEM_NAMESPACE}" \
   --create-namespace \
   --set controller.image.repository=wicket-controller \

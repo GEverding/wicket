@@ -48,7 +48,6 @@ spec:
             {{- else }}
             - --leader-election=false
             {{- end }}
-            - --config-output=/etc/wicket/wicket.toml
           env:
             - name: POD_NAMESPACE
               valueFrom:

@@ -42,7 +42,7 @@ struct Args {
     namespace: String,
 
     /// Watch all namespaces (if false, only watches controller namespace)
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
     watch_all_namespaces: bool,
 
     /// Name of the ConfigMap to update with proxy configuration
@@ -62,7 +62,7 @@ struct Args {
     json_logs: bool,
 
     /// Enable leader election (for HA deployments)
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
     leader_election: bool,
 
     /// Leader election lease name
@@ -89,6 +89,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install rustls crypto provider before kube client initialization
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let args = Args::parse();
 
     // Initialize logging

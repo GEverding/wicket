@@ -58,5 +58,8 @@ hostname = "0.4"
 # X.509 certificate parsing
 x509-parser = "0.16"
 
+# TLS crypto provider
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
