@@ -288,7 +288,11 @@ go_test_cmd=(
   --gateway-class=wicket
   --supported-features=Gateway,HTTPRoute
   --cleanup-base-resources=true
-  --show-debug=true
+  --debug
+  --organization=geverding
+  --project=wicket
+  --url=https://github.com/GEverding/wicket
+  --version=0.1.0
 )
 
 if [[ -n "${RUN_TEST}" ]]; then
