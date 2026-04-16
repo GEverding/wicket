@@ -57,19 +57,68 @@ pub async fn reconcile_gateway_class(
         return Ok(Action::await_change());
     }
 
-    // Update the GatewayClass status
-    let api: Api<GatewayClass> = Api::all(ctx.client.clone());
+    let generation = gc.metadata.generation;
+
+    // Build desired conditions.
+    let desired_conditions = [
+        ("Accepted", true, "Accepted", "Resource has been accepted"),
+        ("SupportedVersion", true, "SupportedVersion", "Gateway API v1 is supported"),
+    ];
+
+    // Check if status already matches — avoid patching when nothing changed
+    // to prevent an infinite reconciliation loop.
+    let existing_conditions = gc
+        .status
+        .as_ref()
+        .map(|s| &s.conditions)
+        .cloned()
+        .unwrap_or_default();
+
+    let status_matches = desired_conditions.iter().all(|(type_, status, reason, _msg)| {
+        let status_str = if *status { "True" } else { "False" };
+        existing_conditions.iter().any(|c| {
+            c.type_ == *type_
+                && c.status == status_str
+                && c.reason == *reason
+                && c.observed_generation == generation
+        })
+    });
+
+    if status_matches {
+        // Status is already correct — no patch needed.
+        tracing::debug!(name = %name, "GatewayClass status already up to date, skipping patch");
+        metrics.record_success();
+
+        // Still upsert into store (might be missing after restart).
+        ctx.store
+            .upsert_gateway_class(name.clone(), (*gc).clone())
+            .await;
+
+        return Ok(Action::requeue(Duration::from_secs(300)));
+    }
+
+    // Build new status, preserving lastTransitionTime for conditions whose
+    // status hasn't changed.
+    let conditions: Vec<Condition> = desired_conditions
+        .iter()
+        .map(|(type_, status, reason, message)| {
+            let mut cond = Condition::new(type_, *status, reason, message)
+                .with_observed_generation(generation);
+
+            // Preserve lastTransitionTime if the condition status hasn't changed.
+            let status_str = if *status { "True" } else { "False" };
+            if let Some(existing) = existing_conditions.iter().find(|c| c.type_ == *type_) {
+                if existing.status == status_str {
+                    cond.last_transition_time = existing.last_transition_time.clone();
+                }
+            }
+
+            cond
+        })
+        .collect();
 
     let status = GatewayClassStatus {
-        conditions: vec![
-            Condition::accepted(),
-            Condition::new(
-                "SupportedVersion",
-                true,
-                "SupportedVersion",
-                "Gateway API v1 is supported",
-            ),
-        ],
+        conditions,
         supported_features: vec![
             "HTTPRoute".to_string(),
             "TCPRoute".to_string(),
@@ -77,6 +126,9 @@ pub async fn reconcile_gateway_class(
             "ReferenceGrant".to_string(),
         ],
     };
+
+    // Update the GatewayClass status
+    let api: Api<GatewayClass> = Api::all(ctx.client.clone());
 
     let patch = serde_json::json!({
         "status": status
