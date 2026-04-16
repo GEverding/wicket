@@ -235,10 +235,7 @@ path_prefix = "/"
     let req = backend.last_request().await.expect("should have request");
 
     // The proxy should inject an x-request-id header
-    let has_request_id = req
-        .headers
-        .iter()
-        .any(|(k, _)| k == "x-request-id");
+    let has_request_id = req.headers.iter().any(|(k, _)| k == "x-request-id");
     assert!(
         has_request_id,
         "backend should receive x-request-id header, got headers: {:?}",

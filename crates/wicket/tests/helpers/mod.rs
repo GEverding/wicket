@@ -83,7 +83,6 @@ impl TestProxy {
 
 /// Get a free port by binding to 127.0.0.1:0.
 pub fn free_port() -> u16 {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("bind for free port");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind for free port");
     listener.local_addr().expect("local addr").port()
 }

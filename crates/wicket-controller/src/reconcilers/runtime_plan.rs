@@ -2872,10 +2872,7 @@ mod tests {
             plan.spec_changed,
             "stale spec hash must trigger spec_changed"
         );
-        assert!(
-            !plan.is_noop(),
-            "plan with both changes must not be a noop"
-        );
+        assert!(!plan.is_noop(), "plan with both changes must not be a noop");
     }
 
     // ── FSM state transition completeness ────────────────────────────────────
@@ -3198,8 +3195,12 @@ mod tests {
         );
 
         let baseline_snap = make_snapshot(gw.clone());
-        let baseline_input =
-            make_input("prod", "my-gw", baseline_snap, ObservedRuntimeState::default());
+        let baseline_input = make_input(
+            "prod",
+            "my-gw",
+            baseline_snap,
+            ObservedRuntimeState::default(),
+        );
         let baseline_plan = GatewayRuntimePlanner.plan(&baseline_input).unwrap();
         let baseline_hash = baseline_plan.spec_hash.clone();
 

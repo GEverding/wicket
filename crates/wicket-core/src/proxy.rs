@@ -15,10 +15,10 @@ use async_trait::async_trait;
 use pingora_core::prelude::*;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_core::Result as PingoraResult;
+use pingora_http::RequestHeader;
 use pingora_load_balancing::selection::consistent::KetamaHashing;
 use pingora_load_balancing::selection::RoundRobin;
 use pingora_load_balancing::{health_check::TcpHealthCheck, LoadBalancer};
-use pingora_http::RequestHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use rand::Rng;
 use std::collections::HashMap;
@@ -302,12 +302,8 @@ impl UpstreamCluster {
     /// Select a peer from this upstream cluster.
     fn select_peer(&self, key: &[u8]) -> Option<HttpPeer> {
         let backend = match self.strategy {
-            LoadBalanceStrategy::RoundRobin => {
-                self.lb_round_robin.as_ref()?.select(key, 256)?
-            }
-            LoadBalanceStrategy::ConsistentHash => {
-                self.lb_ketama.as_ref()?.select(key, 256)?
-            }
+            LoadBalanceStrategy::RoundRobin => self.lb_round_robin.as_ref()?.select(key, 256)?,
+            LoadBalanceStrategy::ConsistentHash => self.lb_ketama.as_ref()?.select(key, 256)?,
         };
         Some(HttpPeer::new(backend.addr, false, String::new()))
     }
@@ -363,7 +359,10 @@ impl ProxyHttp for WicketProxy {
         }
 
         // Extract request properties
-        let host = req_header.headers.get(HEADER_HOST).and_then(|v| v.to_str().ok());
+        let host = req_header
+            .headers
+            .get(HEADER_HOST)
+            .and_then(|v| v.to_str().ok());
 
         let path = req_header.uri.path();
         let method = req_header.method.as_str();
@@ -496,11 +495,12 @@ impl ProxyHttp for WicketProxy {
         if let Some(inet_addr) = session.client_addr().and_then(|a| a.as_inet()) {
             let client_ip = inet_addr.ip().to_string();
 
-            let xff_value = if let Some(existing) = upstream_request.headers.get(HEADER_X_FORWARDED_FOR) {
-                format!("{}, {}", existing.to_str().unwrap_or(""), client_ip)
-            } else {
-                client_ip
-            };
+            let xff_value =
+                if let Some(existing) = upstream_request.headers.get(HEADER_X_FORWARDED_FOR) {
+                    format!("{}, {}", existing.to_str().unwrap_or(""), client_ip)
+                } else {
+                    client_ip
+                };
 
             upstream_request
                 .insert_header(HEADER_X_FORWARDED_FOR, &xff_value)
@@ -636,7 +636,12 @@ impl ProxyHttp for WicketProxy {
         // Record errors (4xx, 5xx)
         if status >= 400 {
             HTTP_ERRORS_TOTAL
-                .with_label_values(&[method, route_label, &status_str, classify_http_error(status)])
+                .with_label_values(&[
+                    method,
+                    route_label,
+                    &status_str,
+                    classify_http_error(status),
+                ])
                 .inc();
         }
 

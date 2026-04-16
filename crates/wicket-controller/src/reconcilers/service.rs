@@ -85,10 +85,10 @@ pub async fn reconcile_endpoint_slice(
     // Aggregate all slices for this service to get the full picture.
     let slice_api: Api<EndpointSlice> = Api::namespaced(ctx.client.clone(), &namespace);
     let slices = slice_api
-        .list(&kube::api::ListParams::default().labels(&format!(
-            "kubernetes.io/service-name={}",
-            service_name
-        )))
+        .list(
+            &kube::api::ListParams::default()
+                .labels(&format!("kubernetes.io/service-name={}", service_name)),
+        )
         .await?;
 
     let mut healthy_count: i64 = 0;
@@ -104,11 +104,7 @@ pub async fn reconcile_endpoint_slice(
             .unwrap_or_default();
 
         for ep in &s.endpoints {
-            let ready = ep
-                .conditions
-                .as_ref()
-                .and_then(|c| c.ready)
-                .unwrap_or(true);
+            let ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
 
             if ready {
                 for addr in &ep.addresses {
@@ -353,11 +349,7 @@ pub async fn load_all_service_endpoints(client: &Client, state: &mut GatewayStat
                     .unwrap_or_default();
 
                 for ep in &slice.endpoints {
-                    let ready = ep
-                        .conditions
-                        .as_ref()
-                        .and_then(|c| c.ready)
-                        .unwrap_or(true);
+                    let ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
 
                     if ready {
                         for addr in &ep.addresses {

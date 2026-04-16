@@ -568,7 +568,7 @@ mod tests {
         client_hello.extend_from_slice(&[0x00, 0x3c]); // One cipher suite
         client_hello.push(0x01); // Compression methods length = 1
         client_hello.push(0x00); // Null compression
-        // No extensions follow — this is where the handshake body ends.
+                                 // No extensions follow — this is where the handshake body ends.
 
         let hs_body_len = client_hello.len() - hs_body_start;
         let record_body_len = client_hello.len() - handshake_start;
@@ -589,8 +589,7 @@ mod tests {
         );
 
         // Verify our constant is self-consistent: record length must match actual buffer
-        let declared_record_len =
-            u16::from_be_bytes([client_hello[3], client_hello[4]]) as usize;
+        let declared_record_len = u16::from_be_bytes([client_hello[3], client_hello[4]]) as usize;
         let actual_record_body = client_hello.len() - 5; // subtract 5-byte header
         assert_eq!(
             declared_record_len, actual_record_body,

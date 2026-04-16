@@ -82,7 +82,11 @@ pub async fn reconcile_gateway(
     // Prefer the shared store over a live API call to avoid redundant reads
     // and races with the cache.  Fall back to the API only when the store
     // has not yet been populated (bootstrap / recovery).
-    let gc = match ctx.store.get_gateway_class(&gateway.spec.gateway_class_name).await {
+    let gc = match ctx
+        .store
+        .get_gateway_class(&gateway.spec.gateway_class_name)
+        .await
+    {
         Some(gc) => gc,
         None => {
             // Store not ready or class absent — fall back to live API.
@@ -91,9 +95,7 @@ pub async fn reconcile_gateway(
                 .get(&gateway.spec.gateway_class_name)
                 .await
                 .map_err(|_| {
-                    GatewayError::GatewayClassNotFound(
-                        gateway.spec.gateway_class_name.clone(),
-                    )
+                    GatewayError::GatewayClassNotFound(gateway.spec.gateway_class_name.clone())
                 })?
         }
     };
@@ -161,11 +163,12 @@ pub async fn reconcile_gateway(
                 Ok((observed, apply_result, snapshot_result)) => {
                     // Check if config actually changed via the managed-runtime
                     // applier.  When NoOp, we can skip the global config trigger.
-                    managed_config_changed = apply_result
-                        .config_result
-                        .as_ref()
-                        .is_some_and(|r| matches!(r, crate::reconcilers::contracts::ConfigApplyResult::Updated { .. }))
-                        || apply_result.service_changed
+                    managed_config_changed = apply_result.config_result.as_ref().is_some_and(|r| {
+                        matches!(
+                            r,
+                            crate::reconcilers::contracts::ConfigApplyResult::Updated { .. }
+                        )
+                    }) || apply_result.service_changed
                         || apply_result.deployment_changed;
                     ManagedRuntimeInput::Applied(observed, apply_result, Box::new(snapshot_result))
                 }
@@ -386,7 +389,14 @@ async fn reconcile_managed_runtime(
     ctx: &Context,
     namespace: &str,
     name: &str,
-) -> Result<(ObservedRuntimeState, RuntimeApplyResult, SnapshotResult<PlannerSnapshot>), ManagedRuntimeError> {
+) -> Result<
+    (
+        ObservedRuntimeState,
+        RuntimeApplyResult,
+        SnapshotResult<PlannerSnapshot>,
+    ),
+    ManagedRuntimeError,
+> {
     // ── 1. Gather ObservedRuntimeState ────────────────────────────────────────
     let observed = observe_runtime_state(gateway, &ctx.client, namespace).await?;
 
@@ -409,7 +419,8 @@ async fn reconcile_managed_runtime(
     // ── 3. Plan ───────────────────────────────────────────────────────────────
     // Clone the snapshot before moving it into the planner input so we can
     // return it to the caller and avoid a second store read in the status path.
-    let snapshot_for_status: SnapshotResult<PlannerSnapshot> = SnapshotResult::Ready(snapshot.clone());
+    let snapshot_for_status: SnapshotResult<PlannerSnapshot> =
+        SnapshotResult::Ready(snapshot.clone());
     let planner = GatewayRuntimePlanner;
     let input = RuntimePlanInput {
         gateway_namespace: namespace.to_string(),
@@ -669,7 +680,11 @@ enum ManagedRuntimeInput {
     /// `ObservedRuntimeState`, the `RuntimeApplyResult`, and the
     /// `PlannerSnapshot` that was used during planning so the status path
     /// can reuse them without a second Kubernetes API or store read.
-    Applied(ObservedRuntimeState, RuntimeApplyResult, Box<SnapshotResult<PlannerSnapshot>>),
+    Applied(
+        ObservedRuntimeState,
+        RuntimeApplyResult,
+        Box<SnapshotResult<PlannerSnapshot>>,
+    ),
 
     /// The planner store was not yet ready.  `reconcile_managed_runtime`
     /// observes runtime state BEFORE checking store readiness, so the
@@ -2171,7 +2186,11 @@ mod tests {
         };
         let result = RuntimeApplyResult::default(); // no-op apply
 
-        let input = super::ManagedRuntimeInput::Applied(obs.clone(), result, Box::new(SnapshotResult::NotReady));
+        let input = super::ManagedRuntimeInput::Applied(
+            obs.clone(),
+            result,
+            Box::new(SnapshotResult::NotReady),
+        );
 
         // The variant must be matchable and carry the original observation.
         match input {
@@ -2541,7 +2560,8 @@ mod tests {
             desired_replicas: Some(1),
         };
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
+        let input =
+            super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
 
         let outcome = super::resolve_managed_status_outcome(input, true, Some(1));
 
@@ -2578,7 +2598,8 @@ mod tests {
             deployment_changed: true,
             ..Default::default()
         };
-        let input = super::ManagedRuntimeInput::Applied(obs, rollout, Box::new(SnapshotResult::NotReady));
+        let input =
+            super::ManagedRuntimeInput::Applied(obs, rollout, Box::new(SnapshotResult::NotReady));
 
         // store_ready=false: even with store not ready, only_store_not_ready
         // must be false because the cause is the in-flight rollout.
@@ -2601,7 +2622,8 @@ mod tests {
     fn resolve_outcome_applied_not_converged_store_not_ready() {
         let obs = ObservedRuntimeState::default(); // all None => not converged
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
+        let input =
+            super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
 
         let outcome = super::resolve_managed_status_outcome(input, false, Some(1));
 
@@ -2619,7 +2641,8 @@ mod tests {
     fn resolve_outcome_applied_not_converged_store_ready() {
         let obs = ObservedRuntimeState::default();
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
+        let input =
+            super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
 
         let outcome = super::resolve_managed_status_outcome(input, true, Some(1));
 
@@ -3365,7 +3388,8 @@ mod tests {
 
         // Verify this propagates through resolve_managed_status_outcome.
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
+        let input =
+            super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
         let outcome = super::resolve_managed_status_outcome(input, true, Some(5));
         assert!(
             !outcome.programmed,
@@ -3393,7 +3417,8 @@ mod tests {
 
         // Through the Applied path with no-op apply.
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
+        let input =
+            super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
         let outcome = super::resolve_managed_status_outcome(input, true, Some(4));
         assert!(
             !outcome.programmed,
@@ -3426,7 +3451,11 @@ mod tests {
             service_account_created: true,
             ..Default::default()
         };
-        let input = super::ManagedRuntimeInput::Applied(converged, result, Box::new(SnapshotResult::NotReady));
+        let input = super::ManagedRuntimeInput::Applied(
+            converged,
+            result,
+            Box::new(SnapshotResult::NotReady),
+        );
         let outcome = super::resolve_managed_status_outcome(input, true, Some(2));
 
         assert!(
@@ -3677,7 +3706,8 @@ mod tests {
             desired_replicas: Some(0),
         };
         let noop = RuntimeApplyResult::default();
-        let input = super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
+        let input =
+            super::ManagedRuntimeInput::Applied(obs, noop, Box::new(SnapshotResult::NotReady));
 
         let outcome = super::resolve_managed_status_outcome(input, true, Some(1));
 
@@ -3814,10 +3844,12 @@ mod tests {
         ];
 
         for case in &cases {
-            let input =
-                super::ManagedRuntimeInput::Applied(case.obs.clone(), case.result.clone(), Box::new(SnapshotResult::NotReady));
-            let outcome =
-                super::resolve_managed_status_outcome(input, case.store_ready, Some(1));
+            let input = super::ManagedRuntimeInput::Applied(
+                case.obs.clone(),
+                case.result.clone(),
+                Box::new(SnapshotResult::NotReady),
+            );
+            let outcome = super::resolve_managed_status_outcome(input, case.store_ready, Some(1));
 
             assert_eq!(
                 outcome.programmed, case.expect_programmed,
@@ -3950,24 +3982,15 @@ mod tests {
 
         // HTTP listener supports HTTPRoute
         let http = statuses.iter().find(|s| s.name == "http").unwrap();
-        assert!(http
-            .supported_kinds
-            .iter()
-            .any(|k| k.kind == "HTTPRoute"));
+        assert!(http.supported_kinds.iter().any(|k| k.kind == "HTTPRoute"));
 
         // TCP listener supports TCPRoute
         let tcp = statuses.iter().find(|s| s.name == "tcp").unwrap();
-        assert!(tcp
-            .supported_kinds
-            .iter()
-            .any(|k| k.kind == "TCPRoute"));
+        assert!(tcp.supported_kinds.iter().any(|k| k.kind == "TCPRoute"));
 
         // TLS listener supports TLSRoute
         let tls = statuses.iter().find(|s| s.name == "tls").unwrap();
-        assert!(tls
-            .supported_kinds
-            .iter()
-            .any(|k| k.kind == "TLSRoute"));
+        assert!(tls.supported_kinds.iter().any(|k| k.kind == "TLSRoute"));
     }
 
     // ── build_gateway_conditions ──────────���──────────────────────────────────

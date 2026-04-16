@@ -649,11 +649,8 @@ impl Config {
             .with_context(|| format!("Invalid stream listen address: {}", stream.listen))?;
 
         // Build upstream name set
-        let upstream_names: HashSet<&str> = stream
-            .upstreams
-            .iter()
-            .map(|u| u.name.as_str())
-            .collect();
+        let upstream_names: HashSet<&str> =
+            stream.upstreams.iter().map(|u| u.name.as_str()).collect();
 
         // Validate default_upstream exists if specified
         if let Some(ref default) = stream.default_upstream {

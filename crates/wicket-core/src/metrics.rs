@@ -274,7 +274,6 @@ pub fn classify_http_error(status: u16) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

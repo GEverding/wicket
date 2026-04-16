@@ -53,7 +53,11 @@ fn sock_key_from_fd(fd: RawFd) -> Result<SockKey, SockMapError> {
     let mut len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
 
     let ret = unsafe {
-        libc::getsockname(fd, &mut local_addr as *mut _ as *mut libc::sockaddr, &mut len)
+        libc::getsockname(
+            fd,
+            &mut local_addr as *mut _ as *mut libc::sockaddr,
+            &mut len,
+        )
     };
     if ret != 0 {
         return Err(SockMapError::Register(format!(
@@ -64,7 +68,11 @@ fn sock_key_from_fd(fd: RawFd) -> Result<SockKey, SockMapError> {
 
     len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     let ret = unsafe {
-        libc::getpeername(fd, &mut remote_addr as *mut _ as *mut libc::sockaddr, &mut len)
+        libc::getpeername(
+            fd,
+            &mut remote_addr as *mut _ as *mut libc::sockaddr,
+            &mut len,
+        )
     };
     if ret != 0 {
         return Err(SockMapError::Register(format!(

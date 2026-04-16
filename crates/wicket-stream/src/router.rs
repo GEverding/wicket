@@ -163,7 +163,7 @@ mod tests {
             router.match_sni(Some("www.example.com")),
             Some("wildcard-backend")
         ); // wildcard
-        // Multi-level subdomains should NOT match per RFC 6125
+           // Multi-level subdomains should NOT match per RFC 6125
         assert_eq!(router.match_sni(Some("sub.api.example.com")), None);
         assert_eq!(router.match_sni(Some("example.com")), None); // no match
     }
