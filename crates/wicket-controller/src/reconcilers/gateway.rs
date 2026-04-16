@@ -55,6 +55,72 @@ pub enum GatewayError {
     RuntimeApplyError(String),
 }
 
+/// Returns true when two condition slices describe the same logical state,
+/// ignoring `last_transition_time`.
+fn conditions_semantically_equal(a: &[Condition], b: &[Condition]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).all(|(x, y)| {
+        x.type_ == y.type_
+            && x.status == y.status
+            && x.reason == y.reason
+            && x.message == y.message
+            && x.observed_generation == y.observed_generation
+    })
+}
+
+/// Copy `last_transition_time` from existing conditions onto new conditions
+/// where the logical status (type + status) hasn't changed.  This makes the
+/// subsequent status patch idempotent: if nothing actually changed, the
+/// serialized status will be byte-for-byte identical and the patch becomes
+/// a no-op at the API server level.
+fn preserve_condition_timestamps(new: &mut [Condition], existing: &[Condition]) {
+    for cond in new.iter_mut() {
+        if let Some(prev) = existing.iter().find(|e| e.type_ == cond.type_) {
+            if prev.status == cond.status {
+                cond.last_transition_time = prev.last_transition_time.clone();
+            }
+        }
+    }
+}
+
+/// Preserve `last_transition_time` on both top-level and per-listener
+/// conditions where status hasn't changed.
+fn preserve_gateway_status_timestamps(new_status: &mut GatewayStatus, existing: &GatewayStatus) {
+    preserve_condition_timestamps(&mut new_status.conditions, &existing.conditions);
+
+    for new_listener in new_status.listeners.iter_mut() {
+        if let Some(prev) = existing
+            .listeners
+            .iter()
+            .find(|l| l.name == new_listener.name)
+        {
+            preserve_condition_timestamps(&mut new_listener.conditions, &prev.conditions);
+        }
+    }
+}
+
+/// Semantic equality check for GatewayStatus that ignores
+/// `last_transition_time`.  Used to skip redundant status patches.
+fn gateway_status_semantically_equal(a: &GatewayStatus, b: &GatewayStatus) -> bool {
+    if a.addresses != b.addresses {
+        return false;
+    }
+    if !conditions_semantically_equal(&a.conditions, &b.conditions) {
+        return false;
+    }
+    if a.listeners.len() != b.listeners.len() {
+        return false;
+    }
+    a.listeners.iter().zip(&b.listeners).all(|(x, y)| {
+        x.name == y.name
+            && x.supported_kinds == y.supported_kinds
+            && x.attached_routes == y.attached_routes
+            && conditions_semantically_equal(&x.conditions, &y.conditions)
+    })
+}
+
 /// Reconcile a Gateway resource.
 pub async fn reconcile_gateway(
     gateway: Arc<Gateway>,
@@ -224,24 +290,43 @@ pub async fn reconcile_gateway(
     );
 
     // Update Gateway status
-    let status = GatewayStatus {
+    let mut status = GatewayStatus {
         addresses,
         conditions: gateway_conditions,
         listeners: listener_statuses.clone(),
     };
 
-    let api: Api<Gateway> = Api::namespaced(ctx.client.clone(), &namespace);
-    let patch = serde_json::json!({
-        "status": status
-    });
+    // Preserve timestamps on unchanged conditions to make the patch idempotent.
+    if let Some(existing) = gateway.status.as_ref() {
+        preserve_gateway_status_timestamps(&mut status, existing);
+    }
 
-    let patched_gateway = api
-        .patch_status(
+    // Skip patching entirely when the status is semantically unchanged.
+    // This breaks the reconcile-loop caused by lastTransitionTime bumps
+    // that would otherwise trigger a watch event and re-queue this object.
+    let needs_patch = gateway
+        .status
+        .as_ref()
+        .map(|existing| !gateway_status_semantically_equal(existing, &status))
+        .unwrap_or(true);
+
+    let api: Api<Gateway> = Api::namespaced(ctx.client.clone(), &namespace);
+    let patched_gateway = if needs_patch {
+        let patch = serde_json::json!({ "status": status });
+        api.patch_status(
             &name,
             &PatchParams::apply("wicket-controller"),
             &Patch::Merge(&patch),
         )
-        .await?;
+        .await?
+    } else {
+        tracing::debug!(
+            namespace = %namespace,
+            name = %name,
+            "Gateway status unchanged, skipping patch"
+        );
+        (*gateway).clone()
+    };
 
     // Return the deferred observation error now that status has been patched.
     // The requeue-with-backoff and error metrics are handled by
