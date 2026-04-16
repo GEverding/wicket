@@ -188,9 +188,14 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         "Starting Wicket proxy"
     );
 
-    // Create a runtime for async TLS operations (ACME)
-    // We need this before Pingora takes over the main thread
-    let tls_runtime = tokio::runtime::Runtime::new().context("Failed to create TLS runtime")?;
+    // Create a tokio runtime for async operations (TLS/ACME, stream proxy,
+    // signal handling, config watcher).  We enter it immediately so that
+    // `tokio::spawn`, `TcpListener::from_std`, and signal handlers used
+    // later in this function have an active reactor context.  Pingora's
+    // `run_forever()` blocks the main thread; spawned tasks execute on
+    // this runtime's worker pool.
+    let tls_runtime = tokio::runtime::Runtime::new().context("Failed to create async runtime")?;
+    let _rt_guard = tls_runtime.enter();
 
     // Initialize TLS if configured
     let cert_manager: Option<Arc<CertManager>> = if let Some(ref tls_config) = config.tls {
