@@ -45,7 +45,7 @@ rules:
       - get
       - patch
       - update
-  # Core resources
+  # Core resources (read-only)
   - apiGroups:
       - ""
     resources:
@@ -68,6 +68,40 @@ rules:
       - create
       - update
       - patch
+  # Managed-runtime resources (Gateway-owned Deployments, Services, ServiceAccounts)
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - services
+    verbs:
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - serviceaccounts
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
   - apiGroups:
       - ""
     resources:
