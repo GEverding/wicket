@@ -62,7 +62,12 @@ pub async fn reconcile_gateway_class(
     // Build desired conditions.
     let desired_conditions = [
         ("Accepted", true, "Accepted", "Resource has been accepted"),
-        ("SupportedVersion", true, "SupportedVersion", "Gateway API v1 is supported"),
+        (
+            "SupportedVersion",
+            true,
+            "SupportedVersion",
+            "Gateway API v1 is supported",
+        ),
     ];
 
     // Check if status already matches — avoid patching when nothing changed
@@ -74,15 +79,17 @@ pub async fn reconcile_gateway_class(
         .cloned()
         .unwrap_or_default();
 
-    let status_matches = desired_conditions.iter().all(|(type_, status, reason, _msg)| {
-        let status_str = if *status { "True" } else { "False" };
-        existing_conditions.iter().any(|c| {
-            c.type_ == *type_
-                && c.status == status_str
-                && c.reason == *reason
-                && c.observed_generation == generation
-        })
-    });
+    let status_matches = desired_conditions
+        .iter()
+        .all(|(type_, status, reason, _msg)| {
+            let status_str = if *status { "True" } else { "False" };
+            existing_conditions.iter().any(|c| {
+                c.type_ == *type_
+                    && c.status == status_str
+                    && c.reason == *reason
+                    && c.observed_generation == generation
+            })
+        });
 
     if status_matches {
         // Status is already correct — no patch needed.

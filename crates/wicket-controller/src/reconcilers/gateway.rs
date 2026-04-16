@@ -32,6 +32,9 @@ use crate::reconcilers::runtime_plan::{
     service_name as owned_service_name, GatewayRuntimePlanner, ObservedRuntimeState,
     RuntimePlanInput,
 };
+use crate::reconcilers::status_helpers::{
+    conditions_semantically_equal, preserve_condition_timestamps,
+};
 use crate::reconcilers::store::{PlannerSnapshot, SnapshotResult};
 
 use super::context::{trigger_config_update, Context};
@@ -53,36 +56,6 @@ pub enum GatewayError {
 
     #[error("Managed-runtime apply error: {0}")]
     RuntimeApplyError(String),
-}
-
-/// Returns true when two condition slices describe the same logical state,
-/// ignoring `last_transition_time`.
-fn conditions_semantically_equal(a: &[Condition], b: &[Condition]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).all(|(x, y)| {
-        x.type_ == y.type_
-            && x.status == y.status
-            && x.reason == y.reason
-            && x.message == y.message
-            && x.observed_generation == y.observed_generation
-    })
-}
-
-/// Copy `last_transition_time` from existing conditions onto new conditions
-/// where the logical status (type + status) hasn't changed.  This makes the
-/// subsequent status patch idempotent: if nothing actually changed, the
-/// serialized status will be byte-for-byte identical and the patch becomes
-/// a no-op at the API server level.
-fn preserve_condition_timestamps(new: &mut [Condition], existing: &[Condition]) {
-    for cond in new.iter_mut() {
-        if let Some(prev) = existing.iter().find(|e| e.type_ == cond.type_) {
-            if prev.status == cond.status {
-                cond.last_transition_time = prev.last_transition_time.clone();
-            }
-        }
-    }
 }
 
 /// Preserve `last_transition_time` on both top-level and per-listener
@@ -820,7 +793,8 @@ fn build_legacy_listener_statuses(gateway: &Gateway) -> Vec<ListenerStatus> {
                 conditions: vec![
                     Condition::accepted().with_observed_generation(gateway.metadata.generation),
                     Condition::programmed().with_observed_generation(gateway.metadata.generation),
-                    Condition::resolved_refs().with_observed_generation(gateway.metadata.generation),
+                    Condition::resolved_refs()
+                        .with_observed_generation(gateway.metadata.generation),
                 ],
             }
         })
@@ -1124,21 +1098,24 @@ fn build_managed_runtime_status(
                     vec![
                         Condition::accepted().with_observed_generation(outcome.observed_generation),
                         not_prog,
-                        Condition::resolved_refs().with_observed_generation(outcome.observed_generation),
+                        Condition::resolved_refs()
+                            .with_observed_generation(outcome.observed_generation),
                     ]
                 } else {
                     vec![
                         Condition::not_accepted()
                             .with_observed_generation(outcome.observed_generation),
                         not_prog,
-                        Condition::resolved_refs().with_observed_generation(outcome.observed_generation),
+                        Condition::resolved_refs()
+                            .with_observed_generation(outcome.observed_generation),
                     ]
                 }
             } else if programmed && intent.accepted {
                 vec![
                     Condition::accepted().with_observed_generation(outcome.observed_generation),
                     Condition::programmed().with_observed_generation(outcome.observed_generation),
-                    Condition::resolved_refs().with_observed_generation(outcome.observed_generation),
+                    Condition::resolved_refs()
+                        .with_observed_generation(outcome.observed_generation),
                 ]
             } else if intent.accepted {
                 let not_prog = if only_store_not_ready {
@@ -1150,7 +1127,8 @@ fn build_managed_runtime_status(
                 vec![
                     Condition::accepted().with_observed_generation(outcome.observed_generation),
                     not_prog,
-                    Condition::resolved_refs().with_observed_generation(outcome.observed_generation),
+                    Condition::resolved_refs()
+                        .with_observed_generation(outcome.observed_generation),
                 ]
             } else {
                 let not_prog = if only_store_not_ready {
@@ -1162,7 +1140,8 @@ fn build_managed_runtime_status(
                 vec![
                     Condition::not_accepted().with_observed_generation(outcome.observed_generation),
                     not_prog,
-                    Condition::resolved_refs().with_observed_generation(outcome.observed_generation),
+                    Condition::resolved_refs()
+                        .with_observed_generation(outcome.observed_generation),
                 ]
             };
 

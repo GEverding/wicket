@@ -25,6 +25,7 @@ use super::attachment_planner::{
 };
 use super::config_generator::GatewayState;
 use super::context::{trigger_config_update, Context};
+use super::status_helpers::{conditions_semantically_equal, preserve_condition_timestamps};
 use super::store::SnapshotResult;
 
 /// Error type for HTTPRoute reconciliation.
@@ -41,6 +42,35 @@ pub enum HTTPRouteError {
 
     #[error("Configuration error: {0}")]
     ConfigError(String),
+}
+
+/// Preserve `last_transition_time` on per-parentRef conditions where status
+/// hasn't changed.  Matching is by ParentReference equality.
+fn preserve_httproute_status_timestamps(
+    new_status: &mut HTTPRouteStatus,
+    existing: &HTTPRouteStatus,
+) {
+    for new_parent in new_status.parents.iter_mut() {
+        if let Some(prev) = existing
+            .parents
+            .iter()
+            .find(|p| p.parent_ref == new_parent.parent_ref)
+        {
+            preserve_condition_timestamps(&mut new_parent.conditions, &prev.conditions);
+        }
+    }
+}
+
+/// Semantic equality for HTTPRouteStatus that ignores `last_transition_time`.
+fn httproute_status_semantically_equal(a: &HTTPRouteStatus, b: &HTTPRouteStatus) -> bool {
+    if a.parents.len() != b.parents.len() {
+        return false;
+    }
+    a.parents.iter().zip(&b.parents).all(|(x, y)| {
+        x.parent_ref == y.parent_ref
+            && x.controller_name == y.controller_name
+            && conditions_semantically_equal(&x.conditions, &y.conditions)
+    })
 }
 
 /// Reconcile an HTTPRoute resource.
@@ -260,21 +290,39 @@ pub async fn reconcile_httproute(
     }
 
     // Update HTTPRoute status
-    let status = HTTPRouteStatus {
+    let mut status = HTTPRouteStatus {
         parents: parent_statuses,
     };
 
-    let api: Api<HTTPRoute> = Api::namespaced(ctx.client.clone(), &namespace);
-    let patch = serde_json::json!({
-        "status": status
-    });
+    // Preserve timestamps on unchanged conditions for patch idempotency.
+    if let Some(existing) = route.status.as_ref() {
+        preserve_httproute_status_timestamps(&mut status, existing);
+    }
 
-    api.patch_status(
-        &name,
-        &PatchParams::apply("wicket-controller"),
-        &Patch::Merge(&patch),
-    )
-    .await?;
+    // Skip patch when status is semantically unchanged — avoids the
+    // reconcile-loop caused by lastTransitionTime bumps.
+    let needs_patch = route
+        .status
+        .as_ref()
+        .map(|existing| !httproute_status_semantically_equal(existing, &status))
+        .unwrap_or(true);
+
+    let api: Api<HTTPRoute> = Api::namespaced(ctx.client.clone(), &namespace);
+    if needs_patch {
+        let patch = serde_json::json!({ "status": status });
+        api.patch_status(
+            &name,
+            &PatchParams::apply("wicket-controller"),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+    } else {
+        tracing::debug!(
+            namespace = %namespace,
+            name = %name,
+            "HTTPRoute status unchanged, skipping patch"
+        );
+    }
 
     // If we have a valid parent, upsert into store and trigger configuration update.
     if has_valid_parent {

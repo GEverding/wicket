@@ -32,6 +32,7 @@ pub mod config_planner;
 pub mod contracts;
 pub mod runtime_applier;
 pub mod runtime_plan;
+pub mod status_helpers;
 
 pub use config_applier::apply_config_plan;
 pub use config_generator::*;
