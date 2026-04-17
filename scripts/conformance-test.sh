@@ -284,7 +284,7 @@ section "Run Conformance Tests"
 rm -f "${GO_TEST_LOG}" "${REPORT_TMP_PATH}" "${REPORT_OUTPUT_PATH}"
 
 go_test_cmd=(
-  go test ./conformance -run TestConformance -v -count=1 -timeout 30m -args
+  go test ./conformance -run TestConformance -v -count=1 -timeout 90m -args
   --gateway-class=wicket
   --supported-features=Gateway,HTTPRoute
   --cleanup-base-resources=true

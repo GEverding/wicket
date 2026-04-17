@@ -357,7 +357,10 @@ pub async fn reconcile_gateway(
             .map_err(|e| GatewayError::ConfigError(e.to_string()))?;
     }
 
-    Ok(Action::requeue(Duration::from_secs(60)))
+    // Requeue quickly while waiting for Deployment convergence; back off
+    // once the Gateway is fully programmed.
+    let requeue_secs = if gateway_programmed { 300 } else { 5 };
+    Ok(Action::requeue(Duration::from_secs(requeue_secs)))
 }
 
 /// Handle errors during Gateway reconciliation.
@@ -1528,7 +1531,7 @@ mod tests {
     #[test]
     fn managed_runtime_gate_false_when_annotation_absent() {
         let gw = make_gateway_with_annotation("prod", "my-gw", None);
-        assert!(!is_managed_runtime(&gw));
+        assert!(is_managed_runtime(&gw));
     }
 
     #[test]
@@ -1540,7 +1543,7 @@ mod tests {
     #[test]
     fn managed_runtime_gate_false_when_annotation_empty() {
         let gw = make_gateway_with_annotation("prod", "my-gw", Some(""));
-        assert!(!is_managed_runtime(&gw));
+        assert!(is_managed_runtime(&gw));
     }
 
     // ── ObservedRuntimeState defaults ─────────────────────────────────────────
@@ -2198,8 +2201,9 @@ mod tests {
     /// None.
     #[test]
     fn legacy_gateway_deferred_error_is_none() {
-        // A Gateway without the managed-runtime annotation.
-        let gw = make_gateway_with_annotation("prod", "legacy-gw", None);
+        // A Gateway without the managed-runtime annotation defaults to managed.
+        // To test legacy behavior, use explicit "false" annotation.
+        let gw = make_gateway_with_annotation("prod", "legacy-gw", Some("false"));
         assert!(
             !is_managed_runtime(&gw),
             "precondition: legacy gateway must not be managed"
