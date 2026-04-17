@@ -549,7 +549,8 @@ pub fn spec_hash_of(
 // Managed-runtime annotation check
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns `true` if the Gateway carries `wicket.io/managed-runtime: "true"`.
+/// Returns `true` unless the Gateway explicitly sets `wicket.io/managed-runtime: "false"`.
+/// All Gateways default to managed-runtime (infrastructure provisioning).
 #[must_use]
 pub fn is_managed_runtime(gateway: &Gateway) -> bool {
     gateway
@@ -557,8 +558,8 @@ pub fn is_managed_runtime(gateway: &Gateway) -> bool {
         .annotations
         .as_ref()
         .and_then(|a| a.get(MANAGED_RUNTIME_ANNOTATION))
-        .map(|v| v == "true")
-        .unwrap_or(false)
+         .map(|v| v != "false")
+         .unwrap_or(true)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1329,7 +1330,7 @@ mod tests {
             },
             status: None,
         };
-        assert!(!is_managed_runtime(&gw));
+        assert!(is_managed_runtime(&gw));
     }
 
     #[test]
