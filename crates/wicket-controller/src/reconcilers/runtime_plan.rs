@@ -606,8 +606,8 @@ impl std::fmt::Display for ServicePortError {
 /// - `DuplicateListenerName` if any two listeners (including UDP) share the
 ///   same name.  Name uniqueness is a spec-level invariant that applies to all
 ///   listeners regardless of protocol.
-/// - `DuplicatePortProtocol` if two *supported* (non-UDP) listeners map to the
-///   same (port, protocol) pair.
+/// - Duplicate supported listeners that share the same (port, protocol) are
+///   deduped; only the first entry is kept.
 pub fn service_ports_from_listeners(
     gateway: &Gateway,
 ) -> Result<Vec<ServicePortSpec>, ServicePortError> {
@@ -640,12 +640,12 @@ pub fn service_ports_from_listeners(
         // All non-UDP protocols run over TCP at the transport layer.
         let protocol: &str = "TCP";
 
-        // Duplicate (port, protocol) check among supported listeners.
+        // Multiple listeners can share the same external port (e.g. two
+        // HTTPS listeners on 443 with different hostnames). The Service only
+        // needs one port entry — hostname routing happens inside the proxy via
+        // SNI/Host header, not at the Service level.
         if !seen_port_proto.insert((l.port, protocol)) {
-            return Err(ServicePortError::DuplicatePortProtocol {
-                port: l.port,
-                protocol: protocol.to_string(),
-            });
+            continue;
         }
 
         ports.push(ServicePortSpec {
@@ -1474,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn service_ports_duplicate_port_protocol_returns_error() {
+    fn service_ports_duplicate_port_protocol_is_deduped() {
         let gw = make_gateway(
             "prod",
             "my-gw",
@@ -1484,14 +1484,10 @@ mod tests {
                 make_listener("http-b", 80, ProtocolType::HTTP), // same port
             ],
         );
-        let err = service_ports_from_listeners(&gw).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ServicePortError::DuplicatePortProtocol { port: 80, .. }
-            ),
-            "duplicate port/protocol must return DuplicatePortProtocol error"
-        );
+        let ports = service_ports_from_listeners(&gw).unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].name, "http-a");
+        assert_eq!(ports[0].port, 80);
     }
 
     // ── Listener status intents ───────────────────────────────────────────────
@@ -1895,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_error_when_duplicate_port_protocol() {
+    fn planner_dedupes_duplicate_port_protocol() {
         let gw = make_gateway(
             "prod",
             "my-gw",
@@ -1907,8 +1903,11 @@ mod tests {
         );
         let snapshot = make_snapshot(gw);
         let input = make_input("prod", "my-gw", snapshot, ObservedRuntimeState::default());
-        let err = GatewayRuntimePlanner.plan(&input).unwrap_err();
-        assert!(matches!(err, PlanError::InvalidInput { .. }));
+        let plan = GatewayRuntimePlanner.plan(&input).unwrap();
+        // Two listeners on port 80, but only one Service port entry
+        assert_eq!(plan.service_ports.len(), 1);
+        assert_eq!(plan.service_ports[0].port, 80);
+        assert_eq!(plan.service_ports[0].name, "http-a"); // first listener wins
     }
 
     #[test]
