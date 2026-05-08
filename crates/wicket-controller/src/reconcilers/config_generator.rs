@@ -36,6 +36,22 @@ pub struct WicketConfig {
 pub struct ServerConfig {
     pub listen: String,
 
+    /// Optional explicit HTTPS listen address.
+    ///
+    /// Emitted when at least one Gateway listener uses the HTTPS protocol.
+    /// The proxy reads this into `wicket-config::ServerConfig.https_listen`
+    /// and binds HTTPS there, instead of using the legacy port mapping
+    /// (HTTP port + 363).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_listen: Option<String>,
+
+    /// When true, the proxy must NOT bind HTTP on `listen`.
+    ///
+    /// Set when the Gateway has only HTTPS listeners on the same port as
+    /// `listen`, so HTTP and HTTPS would otherwise collide.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disable_http: bool,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workers: Option<usize>,
 
@@ -53,10 +69,16 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:8080".to_string(),
+            https_listen: None,
+            disable_http: false,
             workers: None,
             json_logs: true,
             log_level: default_log_level(),
@@ -331,15 +353,27 @@ impl GatewayState {
         let mut gw_entries: Vec<(&String, &Gateway)> = self.gateways.iter().collect();
         gw_entries.sort_by_key(|(k, _)| k.as_str());
 
-        // Determine listeners from gateways (sorted).
+        // Bucket listeners by protocol family so HTTPS gets its own bind.
+        //
+        // `http_listeners`     — plain HTTP only.
+        // `https_listeners`    — HTTPS (TLS-terminating).
+        // `tcp_listeners`      — raw TCP / TLS passthrough (handled by stream config).
+        //
+        // We keep the combined `http_or_https` order solely so that route
+        // matching downstream can still iterate over every L7 listener with
+        // its associated Gateway key when needed.
         let mut http_listeners: Vec<(String, &Listener)> = Vec::new();
+        let mut https_listeners: Vec<(String, &Listener)> = Vec::new();
         let mut tcp_listeners: Vec<(String, &Listener)> = Vec::new();
 
         for (gw_key, gateway) in &gw_entries {
             for listener in &gateway.spec.listeners {
                 match listener.protocol {
-                    ProtocolType::HTTP | ProtocolType::HTTPS => {
+                    ProtocolType::HTTP => {
                         http_listeners.push(((*gw_key).clone(), listener));
+                    }
+                    ProtocolType::HTTPS => {
+                        https_listeners.push(((*gw_key).clone(), listener));
                     }
                     ProtocolType::TCP | ProtocolType::TLS => {
                         tcp_listeners.push(((*gw_key).clone(), listener));
@@ -349,9 +383,43 @@ impl GatewayState {
             }
         }
 
-        // Set server listen address from first HTTP listener.
-        if let Some((_, listener)) = http_listeners.first() {
-            config.server.listen = format!("0.0.0.0:{}", listener.port);
+        // Determine listen addresses.
+        //
+        // Priority for `server.listen` (which the field requires non-empty):
+        //   1. First HTTP listener's port  → `0.0.0.0:<http-port>`.
+        //   2. First HTTPS listener's port → `0.0.0.0:<https-port>` so the
+        //      field is well-formed, but `disable_http=true` so the proxy
+        //      doesn't actually bind HTTP on it.
+        //
+        // `server.https_listen` is set whenever any HTTPS listener exists;
+        // its port comes from the first HTTPS listener.
+        //
+        // `server.disable_http` is set when we have HTTPS listeners but no
+        // plain HTTP listeners — without this flag the proxy would still
+        // bind HTTP on the same port and TLS handshakes would fail.
+        match (http_listeners.first(), https_listeners.first()) {
+            (Some((_, http_l)), Some((_, https_l))) => {
+                config.server.listen = format!("0.0.0.0:{}", http_l.port);
+                config.server.https_listen = Some(format!("0.0.0.0:{}", https_l.port));
+                config.server.disable_http = false;
+            }
+            (Some((_, http_l)), None) => {
+                config.server.listen = format!("0.0.0.0:{}", http_l.port);
+                // No HTTPS listener; leave https_listen and disable_http at
+                // their defaults.
+            }
+            (None, Some((_, https_l))) => {
+                // HTTPS-only proxy: bind HTTPS on the listener port and skip
+                // HTTP entirely.  `listen` still holds the same port purely
+                // to satisfy the proxy's required field.
+                let addr = format!("0.0.0.0:{}", https_l.port);
+                config.server.listen = addr.clone();
+                config.server.https_listen = Some(addr);
+                config.server.disable_http = true;
+            }
+            (None, None) => {
+                // No L7 listeners; leave server.listen at its default.
+            }
         }
 
         // Process HTTPRoutes in sorted key order.
@@ -735,15 +803,27 @@ impl GatewayState {
         let mut tls_certs = Vec::new();
         let mut stream_config: Option<StreamConfig> = None;
 
-        // Determine listeners from gateways
+        // Bucket listeners by protocol family so HTTPS gets its own bind.
+        //
+        // `http_listeners`     — plain HTTP only.
+        // `https_listeners`    — HTTPS (TLS-terminating).
+        // `tcp_listeners`      — raw TCP / TLS passthrough (handled by stream config).
+        //
+        // We keep the combined `http_or_https` order solely so that route
+        // matching downstream can still iterate over every L7 listener with
+        // its associated Gateway key when needed.
         let mut http_listeners: Vec<(String, &Listener)> = Vec::new();
+        let mut https_listeners: Vec<(String, &Listener)> = Vec::new();
         let mut tcp_listeners: Vec<(String, &Listener)> = Vec::new();
 
         for (gw_key, gateway) in &self.gateways {
             for listener in &gateway.spec.listeners {
                 match listener.protocol {
-                    ProtocolType::HTTP | ProtocolType::HTTPS => {
+                    ProtocolType::HTTP => {
                         http_listeners.push((gw_key.clone(), listener));
+                    }
+                    ProtocolType::HTTPS => {
+                        https_listeners.push((gw_key.clone(), listener));
                     }
                     ProtocolType::TCP | ProtocolType::TLS => {
                         tcp_listeners.push((gw_key.clone(), listener));
@@ -753,9 +833,43 @@ impl GatewayState {
             }
         }
 
-        // Set server listen address from first HTTP listener
-        if let Some((_, listener)) = http_listeners.first() {
-            config.server.listen = format!("0.0.0.0:{}", listener.port);
+        // Determine listen addresses.
+        //
+        // Priority for `server.listen` (which the field requires non-empty):
+        //   1. First HTTP listener's port  → `0.0.0.0:<http-port>`.
+        //   2. First HTTPS listener's port → `0.0.0.0:<https-port>` so the
+        //      field is well-formed, but `disable_http=true` so the proxy
+        //      doesn't actually bind HTTP on it.
+        //
+        // `server.https_listen` is set whenever any HTTPS listener exists;
+        // its port comes from the first HTTPS listener.
+        //
+        // `server.disable_http` is set when we have HTTPS listeners but no
+        // plain HTTP listeners — without this flag the proxy would still
+        // bind HTTP on the same port and TLS handshakes would fail.
+        match (http_listeners.first(), https_listeners.first()) {
+            (Some((_, http_l)), Some((_, https_l))) => {
+                config.server.listen = format!("0.0.0.0:{}", http_l.port);
+                config.server.https_listen = Some(format!("0.0.0.0:{}", https_l.port));
+                config.server.disable_http = false;
+            }
+            (Some((_, http_l)), None) => {
+                config.server.listen = format!("0.0.0.0:{}", http_l.port);
+                // No HTTPS listener; leave https_listen and disable_http at
+                // their defaults.
+            }
+            (None, Some((_, https_l))) => {
+                // HTTPS-only proxy: bind HTTPS on the listener port and skip
+                // HTTP entirely.  `listen` still holds the same port purely
+                // to satisfy the proxy's required field.
+                let addr = format!("0.0.0.0:{}", https_l.port);
+                config.server.listen = addr.clone();
+                config.server.https_listen = Some(addr);
+                config.server.disable_http = true;
+            }
+            (None, None) => {
+                // No L7 listeners; leave server.listen at its default.
+            }
         }
 
         // Process HTTPRoutes

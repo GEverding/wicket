@@ -49,13 +49,15 @@
 //! Steps 2 and 4 are skipped (no-op) when the plan signals no change.
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::api::core::v1::Service as K8sService;
 use k8s_openapi::api::core::v1::{
     ConfigMapVolumeSource, Container, ContainerPort, EnvVar, PodSpec, PodTemplateSpec,
-    ResourceRequirements, ServiceAccount, ServicePort, ServiceSpec, Volume, VolumeMount,
+    ResourceRequirements, SecretVolumeSource, ServiceAccount, ServicePort, ServiceSpec, Volume,
+    VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -674,7 +676,7 @@ async fn apply_deployment(
         })
         .collect();
 
-    // Volume mount for the ConfigMap.
+    // Volumes and mounts for the ConfigMap and referenced TLS Secrets.
     let volume_mount = VolumeMount {
         name: "config".to_string(),
         mount_path: "/etc/wicket".to_string(),
@@ -682,7 +684,6 @@ async fn apply_deployment(
         ..Default::default()
     };
 
-    // ConfigMap volume.
     let config_volume = Volume {
         name: "config".to_string(),
         config_map: Some(ConfigMapVolumeSource {
@@ -692,6 +693,42 @@ async fn apply_deployment(
         ..Default::default()
     };
 
+    let mut volume_mounts = vec![volume_mount];
+    let mut volumes = vec![config_volume];
+    let mut seen_volume_names: HashSet<String> = HashSet::new();
+    seen_volume_names.insert("config".to_string());
+
+    for mount in &plan.tls_secret_mounts {
+        let raw_name = format!("tls-{}", mount.secret_name);
+        let vol_name = if raw_name.len() > 63 {
+            raw_name[..63].to_string()
+        } else {
+            raw_name
+        };
+
+        if !seen_volume_names.insert(vol_name.clone()) {
+            continue;
+        }
+
+        volume_mounts.push(VolumeMount {
+            name: vol_name.clone(),
+            mount_path: mount.mount_path.clone(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+
+        volumes.push(Volume {
+            name: vol_name,
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(mount.secret_name.clone()),
+                default_mode: Some(0o400),
+                optional: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
     // Env var exposing the config revision so the proxy can log it.
     // NOTE: this env var is derived from the spec-covered fields only; it does
     // NOT carry config_hash so that config-only changes do not mutate the
@@ -700,7 +737,7 @@ async fn apply_deployment(
         name: "wicket-proxy".to_string(),
         image: Some(plan.runtime_metadata.image.clone()),
         ports: Some(container_ports),
-        volume_mounts: Some(vec![volume_mount]),
+        volume_mounts: Some(volume_mounts),
         env: Some(vec![EnvVar {
             name: "WICKET_SPEC_REVISION".to_string(),
             value: Some(plan.spec_hash.clone()),
@@ -725,7 +762,7 @@ async fn apply_deployment(
         spec: Some(PodSpec {
             service_account_name: Some(plan.service_account_name.clone()),
             containers: vec![container],
-            volumes: Some(vec![config_volume]),
+            volumes: Some(volumes),
             node_selector: if plan.runtime_metadata.node_selector.is_empty() {
                 None
             } else {
@@ -891,6 +928,7 @@ mod tests {
             },
             service_type,
             service_ports: ports,
+            tls_secret_mounts: vec![],
             listener_statuses: vec![],
             config_changed,
             spec_changed,

@@ -41,6 +41,27 @@ pub struct ServerConfig {
     /// Address to listen on (e.g., "0.0.0.0:8080")
     pub listen: SocketAddr,
 
+    /// Optional explicit HTTPS listen address.
+    ///
+    /// When set and `[tls]` is configured, the proxy binds HTTPS here
+    /// directly.  When unset, the proxy falls back to the legacy mapping
+    /// (`compute_https_addr(listen)`: 80 → 443, otherwise port + 363).
+    ///
+    /// Use this when the Gateway-declared port for HTTPS does not follow
+    /// the dev-mode `:80/:443` convention (e.g. HTTPS on `:443` while
+    /// `listen` is also `:443`, or HTTPS on `:8443` while `listen` is
+    /// `:8080`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_listen: Option<SocketAddr>,
+
+    /// When true, the proxy does not bind HTTP on `listen`.
+    ///
+    /// Useful when every routing intent on this proxy is HTTPS-only;
+    /// without this flag, HTTP and HTTPS would both attempt to bind the
+    /// same port.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disable_http: bool,
+
     /// Number of worker threads (defaults to CPU count)
     #[serde(default)]
     pub workers: Option<usize>,
@@ -190,6 +211,10 @@ pub struct RedirectFilter {
 
 fn default_redirect_status() -> u16 {
     302
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Path modification for redirects and rewrites.

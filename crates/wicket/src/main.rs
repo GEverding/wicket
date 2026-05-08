@@ -311,17 +311,31 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     // Create HTTP proxy service
     let mut proxy_service = http_proxy_service(&server.configuration, wicket_proxy);
 
-    // Configure the listener
-    proxy_service.add_tcp(&config.server.listen.to_string());
-
-    info!(
-        address = %config.server.listen,
-        "HTTP proxy listening"
-    );
+    // Configure the HTTP listener unless explicitly disabled.
+    //
+    // `disable_http` is set by the controller for HTTPS-only Gateways so
+    // that HTTP and HTTPS do not contend for the same port.
+    if !config.server.disable_http {
+        proxy_service.add_tcp(&config.server.listen.to_string());
+        info!(
+            address = %config.server.listen,
+            "HTTP proxy listening"
+        );
+    } else {
+        info!("HTTP listener disabled (server.disable_http = true)");
+    }
 
     // Add HTTPS listener if TLS is configured
     if let Some(ref tls_config) = config.tls {
-        let https_addr = compute_https_addr(config.server.listen);
+        // Prefer the explicit `server.https_listen` when provided; fall
+        // back to the legacy port-mapping derivation.  The explicit form
+        // is required for Gateway API managed runtimes where the HTTPS
+        // listener port is declared by the Gateway and may equal the HTTP
+        // `listen` port (in which case `disable_http` is also set).
+        let https_addr = match config.server.https_listen {
+            Some(addr) => addr.to_string(),
+            None => compute_https_addr(config.server.listen),
+        };
 
         match select_tls_cert(tls_config, &config) {
             Some((cert_path, key_path, source)) => {

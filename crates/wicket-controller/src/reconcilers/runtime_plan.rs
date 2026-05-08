@@ -315,6 +315,39 @@ pub struct RuntimePlanInput {
 // GatewayRuntimePlan (IR)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Pod-side mount path for a TLS Secret in the managed proxy.
+///
+/// Convention: each referenced Secret is mounted as a directory at
+/// `/etc/wicket/tls/<secret-name>/`. Inside this directory the standard
+/// `kubernetes.io/tls` Secret keys (`tls.crt`, `tls.key`) are projected as
+/// individual files.
+///
+/// Both the runtime applier (which builds the Deployment volumes) and the
+/// config generator (which emits TLS cert paths into wicket.toml) MUST use
+/// this helper so they stay in sync.
+#[must_use]
+pub fn tls_mount_dir(secret_name: &str) -> String {
+    format!("/etc/wicket/tls/{}", secret_name)
+}
+
+/// A TLS Secret that must be mounted into the managed proxy pod so the
+/// proxy can read cert/key files referenced from the generated config.
+///
+/// Derived by the planner from `Gateway.spec.listeners[*].tls.certificateRefs`,
+/// deduplicated by `(secret_namespace, secret_name)` so each Secret is
+/// mounted at most once per managed proxy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSecretMount {
+    /// Name of the Kubernetes Secret to mount.
+    pub secret_name: String,
+    /// Namespace of the Kubernetes Secret. Same as the Gateway's namespace
+    /// when `certificateRef.namespace` is unset.
+    pub secret_namespace: String,
+    /// Pod-side directory where the Secret will be projected.
+    /// Always `tls_mount_dir(secret_name)`.
+    pub mount_path: String,
+}
+
 /// Pure internal IR representing the desired runtime state for one managed Gateway.
 ///
 /// This is the contract between the planner and the applier.  It is never
@@ -404,6 +437,9 @@ pub struct GatewayRuntimePlan {
     pub service_type: ServiceType,
     /// Port specs for the owned Service, derived from Gateway listeners.
     pub service_ports: Vec<ServicePortSpec>,
+    /// TLS Secrets that must be mounted into the managed proxy pod.
+    /// Empty when no listener has `tls.certificateRefs`.
+    pub tls_secret_mounts: Vec<TlsSecretMount>,
 
     // ── Status intents ────────────────────────────────────────────────────────
     /// Per-listener status intents consumed by the status observer.
@@ -511,6 +547,7 @@ pub fn spec_hash_of(
     metadata: &RuntimeMetadata,
     service_type: &ServiceType,
     service_ports: &[ServicePortSpec],
+    tls_secret_mounts: &[TlsSecretMount],
 ) -> Result<String, PlanError> {
     let svc_type_str = match service_type {
         ServiceType::ClusterIP => "ClusterIP",
@@ -539,6 +576,29 @@ pub fn spec_hash_of(
         "service_ports": ports_repr,
         "service_type": svc_type_str,
     });
+    let repr = if tls_secret_mounts.is_empty() {
+        repr
+    } else {
+        let mounts_repr: Vec<serde_json::Value> = tls_secret_mounts
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "mount_path": m.mount_path,
+                    "secret_name": m.secret_name,
+                    "secret_namespace": m.secret_namespace,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "image": metadata.image,
+            "node_selector": metadata.node_selector,
+            "replicas": metadata.replicas,
+            "resources": metadata.resources,
+            "service_ports": ports_repr,
+            "service_type": svc_type_str,
+            "tls_secret_mounts": mounts_repr,
+        })
+    };
     let json = serde_json::to_string(&repr).map_err(|e| PlanError::InvalidInput {
         reason: format!("failed to serialize apply shape for hashing: {}", e),
     })?;
@@ -558,8 +618,8 @@ pub fn is_managed_runtime(gateway: &Gateway) -> bool {
         .annotations
         .as_ref()
         .and_then(|a| a.get(MANAGED_RUNTIME_ANNOTATION))
-         .map(|v| v != "false")
-         .unwrap_or(true)
+        .map(|v| v != "false")
+        .unwrap_or(true)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -817,7 +877,39 @@ pub fn config_toml_from_snapshot(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         service_endpoints: snapshot.service_endpoints.clone(),
-        tls_secrets: snapshot.tls_secrets.clone(),
+        tls_secrets: {
+            // Override controller-local cert paths with pod-mount paths.
+            //
+            // The managed proxy pod has each referenced Secret mounted at
+            // `/etc/wicket/tls/<secret-name>/` (see `tls_mount_dir`), with
+            // the standard kubernetes.io/tls keys projected as `tls.crt`
+            // and `tls.key` files.  The config generator must reference
+            // those paths, NOT the controller-local paths the Secret
+            // reconciler writes for its own bookkeeping.
+            let mut overrides: std::collections::HashMap<String, (String, String)> =
+                std::collections::HashMap::new();
+            if let Some(gw) = snapshot.gateways.get(&gw_key) {
+                let gw_ns = gw
+                    .metadata
+                    .namespace
+                    .as_deref()
+                    .unwrap_or(gateway_namespace);
+                for listener in &gw.spec.listeners {
+                    if let Some(tls) = &listener.tls {
+                        for cert_ref in &tls.certificate_refs {
+                            let secret_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
+                            let secret_name = &cert_ref.name;
+                            let cert_key = format!("{}/{}", secret_ns, secret_name);
+                            let mount_dir = tls_mount_dir(secret_name);
+                            let cert_path = format!("{}/tls.crt", mount_dir);
+                            let key_path = format!("{}/tls.key", mount_dir);
+                            overrides.insert(cert_key, (cert_path, key_path));
+                        }
+                    }
+                }
+            }
+            overrides
+        },
     };
 
     // Use the deterministic variant so that HashMap iteration order does not
@@ -999,7 +1091,49 @@ impl Planner for GatewayRuntimePlanner {
             })?;
 
         // ── 6. Compute spec_hash over the full desired apply shape ─────────────
-        let spec_hash = spec_hash_of(&runtime_metadata, &service_type, &service_ports)?;
+        // ── 11. Derive TLS Secret mounts from listener certificateRefs ────────
+        //
+        // Each `Gateway.spec.listeners[*].tls.certificateRefs` entry becomes a
+        // Secret volume/mount in the managed proxy Deployment.  Dedup by
+        // (namespace, name) so a Secret referenced by multiple listeners is
+        // mounted only once.  Sort for determinism so the resulting
+        // `spec_hash` is stable across reconciles.
+        let mut tls_secret_mounts: Vec<TlsSecretMount> = {
+            use std::collections::BTreeSet;
+            let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+            let mut mounts = Vec::new();
+            for listener in &gateway.spec.listeners {
+                if let Some(tls) = &listener.tls {
+                    for cert_ref in &tls.certificate_refs {
+                        let secret_namespace = cert_ref
+                            .namespace
+                            .clone()
+                            .unwrap_or_else(|| input.gateway_namespace.clone());
+                        let secret_name = cert_ref.name.clone();
+                        if seen.insert((secret_namespace.clone(), secret_name.clone())) {
+                            let mount_path = tls_mount_dir(&secret_name);
+                            mounts.push(TlsSecretMount {
+                                secret_name,
+                                secret_namespace,
+                                mount_path,
+                            });
+                        }
+                    }
+                }
+            }
+            mounts
+        };
+        tls_secret_mounts.sort_by(|a, b| {
+            a.secret_namespace
+                .cmp(&b.secret_namespace)
+                .then_with(|| a.secret_name.cmp(&b.secret_name))
+        });
+        let spec_hash = spec_hash_of(
+            &runtime_metadata,
+            &service_type,
+            &service_ports,
+            &tls_secret_mounts,
+        )?;
 
         // ── 7. Generate config TOML from snapshot ─────────────────────────────
         let config_toml =
@@ -1058,6 +1192,7 @@ impl Planner for GatewayRuntimePlanner {
             runtime_metadata,
             service_type,
             service_ports,
+            tls_secret_mounts,
             listener_statuses,
             config_changed,
             spec_changed,
@@ -1232,8 +1367,8 @@ mod tests {
     fn spec_hash_deterministic_for_same_inputs() {
         let m = RuntimeMetadata::default();
         let ports = vec![];
-        let h1 = spec_hash_of(&m, &ServiceType::ClusterIP, &ports).unwrap();
-        let h2 = spec_hash_of(&m, &ServiceType::ClusterIP, &ports).unwrap();
+        let h1 = spec_hash_of(&m, &ServiceType::ClusterIP, &ports, &[]).unwrap();
+        let h2 = spec_hash_of(&m, &ServiceType::ClusterIP, &ports, &[]).unwrap();
         assert_eq!(h1, h2);
     }
 
@@ -1249,8 +1384,8 @@ mod tests {
         };
         let ports = vec![];
         assert_ne!(
-            spec_hash_of(&m1, &ServiceType::ClusterIP, &ports).unwrap(),
-            spec_hash_of(&m2, &ServiceType::ClusterIP, &ports).unwrap()
+            spec_hash_of(&m1, &ServiceType::ClusterIP, &ports, &[]).unwrap(),
+            spec_hash_of(&m2, &ServiceType::ClusterIP, &ports, &[]).unwrap()
         );
     }
 
@@ -1266,8 +1401,8 @@ mod tests {
         };
         let ports = vec![];
         assert_ne!(
-            spec_hash_of(&m1, &ServiceType::ClusterIP, &ports).unwrap(),
-            spec_hash_of(&m2, &ServiceType::ClusterIP, &ports).unwrap()
+            spec_hash_of(&m1, &ServiceType::ClusterIP, &ports, &[]).unwrap(),
+            spec_hash_of(&m2, &ServiceType::ClusterIP, &ports, &[]).unwrap()
         );
     }
 
@@ -1275,8 +1410,8 @@ mod tests {
     fn spec_hash_changes_when_service_type_changes() {
         let m = RuntimeMetadata::default();
         let ports = vec![];
-        let h_clusterip = spec_hash_of(&m, &ServiceType::ClusterIP, &ports).unwrap();
-        let h_lb = spec_hash_of(&m, &ServiceType::LoadBalancer, &ports).unwrap();
+        let h_clusterip = spec_hash_of(&m, &ServiceType::ClusterIP, &ports, &[]).unwrap();
+        let h_lb = spec_hash_of(&m, &ServiceType::LoadBalancer, &ports, &[]).unwrap();
         assert_ne!(
             h_clusterip, h_lb,
             "service_type change must change spec_hash"
@@ -1299,8 +1434,8 @@ mod tests {
             protocol: "TCP".to_string(),
         }];
         assert_ne!(
-            spec_hash_of(&m, &ServiceType::ClusterIP, &ports_a).unwrap(),
-            spec_hash_of(&m, &ServiceType::ClusterIP, &ports_b).unwrap(),
+            spec_hash_of(&m, &ServiceType::ClusterIP, &ports_a, &[]).unwrap(),
+            spec_hash_of(&m, &ServiceType::ClusterIP, &ports_b, &[]).unwrap(),
             "service_ports change must change spec_hash"
         );
     }

@@ -150,6 +150,23 @@ pub async fn reconcile_gateway(
         return Ok(Action::await_change());
     }
 
+    // Upsert the current Gateway into the shared store BEFORE the
+    // managed-runtime planner builds its snapshot, so a freshly observed
+    // Gateway is visible to PlannerSnapshot::gateway() on the first
+    // reconcile.  Without this, planning fails with
+    // `missing required field: gateway (not found in snapshot)` until a
+    // later reconcile happens to upsert it for an unrelated reason.
+    //
+    // The post-patch upsert near the end of this function is still
+    // required so the store reflects the freshly patched status; do not
+    // remove it.
+    {
+        let pre_plan_key = super::config_generator::GatewayState::key(&namespace, &name);
+        ctx.store
+            .upsert_gateway(pre_plan_key, (*gateway).clone())
+            .await;
+    }
+
     // ── Managed-runtime orchestration ─────────────────────────────────────────
     // Gate on the `wicket.io/managed-runtime: "true"` annotation.  Only after
     // GatewayClass ownership has been confirmed above.
