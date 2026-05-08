@@ -412,8 +412,8 @@ async fn write_tls_file(
         // Read-only filesystem or permission denied → skip disk write.
         // This is expected in managed-runtime mode where the controller
         // container has no writable volume for TLS certs.
-        if e.kind() == std::io::ErrorKind::PermissionDenied
-            || e.raw_os_error() == Some(30) // EROFS (Read-only file system)
+        if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(30)
+        // EROFS (Read-only file system)
         {
             tracing::debug!(
                 path = %dir.display(),
