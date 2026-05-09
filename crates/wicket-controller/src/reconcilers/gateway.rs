@@ -1448,6 +1448,34 @@ pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error
         .with_label_values(&["Gateway"])
         .set(1);
 
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match api.list(&Default::default()).await {
+            Ok(list) => {
+                for gateway in list.items {
+                    let ns = gateway.metadata.namespace.clone().unwrap_or_default();
+                    let name = gateway.metadata.name.clone().unwrap_or_default();
+                    let key = super::config_generator::GatewayState::key(&ns, &name);
+                    ctx.store.upsert_gateway(key, gateway).await;
+                }
+                ctx.store.mark_gateways_listed().await;
+                tracing::debug!(attempt, "Gateway initial list complete; store flag set");
+                break;
+            }
+            Err(e) => {
+                let backoff = std::cmp::min(attempt * 2, 30);
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    backoff_secs = backoff,
+                    "Initial Gateway list failed; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+        }
+    }
+
     Controller::new(api, Config::default())
         .run(reconcile_gateway, error_policy_gateway, ctx)
         .for_each(|result| async move {
@@ -3159,7 +3187,10 @@ mod tests {
                 ),
             );
 
-        assert!(!before_programmed, "partial rollout must not report programmed");
+        assert!(
+            !before_programmed,
+            "partial rollout must not report programmed"
+        );
         assert!(after_programmed, "converged rollout must report programmed");
         assert!(!before_warming);
         assert!(!after_warming);

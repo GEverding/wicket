@@ -368,20 +368,30 @@ pub struct StoreInner {
     pub populated: PopulatedFlags,
 }
 
-/// Tracks which resource classes have been ingested at least once.
+/// Tracks which resource classes have been listed at least once.
 ///
-/// A planner snapshot is only valid when all flags are set.  This prevents
-/// `ingest_gateway_state` (which does not carry `gateway_classes` or
-/// `reference_grants`) from silently marking the store ready while those
-/// resource classes are still absent.
+/// A planner snapshot is only valid when all flags are set.  Each watch
+/// controller owns one readiness signal and must explicitly mark its initial
+/// list complete, even when that list is empty.
 #[derive(Clone, Debug, Default)]
 pub struct PopulatedFlags {
-    /// True once gateways/routes/endpoints have been ingested via
-    /// [`StoreInner`] or [`SharedStore::ingest_gateway_state`].
-    pub gateway_state: bool,
+    /// True once the initial Gateway list has completed.
+    pub gateways: bool,
     /// True once at least one `upsert_gateway_class` call has been made
     /// *or* the gateway-class list has been explicitly marked complete.
     pub gateway_classes: bool,
+    /// True once the initial HTTPRoute list has completed.
+    pub http_routes: bool,
+    /// True once the initial TCPRoute list has completed.
+    pub tcp_routes: bool,
+    /// True once the initial TLSRoute list has completed.
+    pub tls_routes: bool,
+    /// True once the initial Service list has completed.
+    pub services: bool,
+    /// True once the initial EndpointSlice list has completed.
+    pub endpoints: bool,
+    /// True once the initial Secret list has completed.
+    pub secrets: bool,
     /// True once at least one `upsert_reference_grant` call has been made
     /// *or* the reference-grant list has been explicitly marked complete.
     pub reference_grants: bool,
@@ -392,7 +402,15 @@ impl PopulatedFlags {
     /// present.
     #[must_use]
     pub fn all_complete(&self) -> bool {
-        self.gateway_state && self.gateway_classes && self.reference_grants
+        self.gateway_classes
+            && self.reference_grants
+            && self.gateways
+            && self.http_routes
+            && self.tcp_routes
+            && self.tls_routes
+            && self.services
+            && self.endpoints
+            && self.secrets
     }
 }
 
@@ -551,11 +569,16 @@ impl SharedStore {
 
     /// Returns `true` once all required resource classes have been populated.
     ///
-    /// "Ready" requires that gateway state, gateway classes, *and* reference
-    /// grants have all been ingested at least once.  This prevents planners
-    /// from operating on a store that is missing policy or class data.
+    /// "Ready" requires that every watched resource class has completed its
+    /// initial list at least once.  This prevents planners from operating on a
+    /// partially warmed cache.
     pub async fn is_ready(&self) -> bool {
         self.inner.read().await.is_complete()
+    }
+
+    /// Mark the gateways resource class as having been listed.
+    pub async fn mark_gateways_listed(&self) {
+        self.inner.write().await.populated.gateways = true;
     }
 
     /// Mark the gateway-classes resource class as having been listed.
@@ -574,14 +597,50 @@ impl SharedStore {
         self.inner.write().await.populated.reference_grants = true;
     }
 
+    /// Mark the HTTPRoutes resource class as having been listed.
+    pub async fn mark_http_routes_listed(&self) {
+        self.inner.write().await.populated.http_routes = true;
+    }
+
+    /// Mark the TCPRoutes resource class as having been listed.
+    pub async fn mark_tcp_routes_listed(&self) {
+        self.inner.write().await.populated.tcp_routes = true;
+    }
+
+    /// Mark the TLSRoutes resource class as having been listed.
+    pub async fn mark_tls_routes_listed(&self) {
+        self.inner.write().await.populated.tls_routes = true;
+    }
+
+    /// Mark the Services resource class as having been listed.
+    pub async fn mark_services_listed(&self) {
+        self.inner.write().await.populated.services = true;
+    }
+
+    /// Mark the EndpointSlices resource class as having been listed.
+    pub async fn mark_endpoints_listed(&self) {
+        self.inner.write().await.populated.endpoints = true;
+    }
+
+    /// Mark the Secrets resource class as having been listed.
+    pub async fn mark_secrets_listed(&self) {
+        self.inner.write().await.populated.secrets = true;
+    }
+
     /// Mark the store as fully ready (all resource classes populated).
     ///
     /// Convenience method for tests and initial-population paths that have
     /// already ensured all resource classes are present.
     pub async fn mark_ready(&self) {
         let mut inner = self.inner.write().await;
-        inner.populated.gateway_state = true;
+        inner.populated.gateways = true;
         inner.populated.gateway_classes = true;
+        inner.populated.http_routes = true;
+        inner.populated.tcp_routes = true;
+        inner.populated.tls_routes = true;
+        inner.populated.services = true;
+        inner.populated.endpoints = true;
+        inner.populated.secrets = true;
         inner.populated.reference_grants = true;
     }
 
@@ -589,13 +648,12 @@ impl SharedStore {
 
     /// Return a full [`GatewayState`] snapshot for config generation.
     ///
-    /// Returns `None` when the gateway-state portion of the store has not yet
-    /// been populated (i.e., `populated.gateway_state` is false).  This is a
-    /// lighter check than [`planner_snapshot`] — it does not require
-    /// `gateway_classes` or `reference_grants` to be present.
+    /// Returns `None` when the initial Gateway list has not yet completed.
+    /// This is a lighter check than [`planner_snapshot`] — it does not require
+    /// every resource class to be present.
     pub async fn snapshot(&self) -> Option<GatewayState> {
         let inner = self.inner.read().await;
-        if !inner.populated.gateway_state {
+        if !inner.populated.gateways {
             return None;
         }
         Some(inner.to_gateway_state())
@@ -610,10 +668,9 @@ impl SharedStore {
     /// proceeding with incomplete data.
     ///
     /// Unlike [`snapshot`](Self::snapshot), this snapshot requires **all**
-    /// resource classes — gateways, `gateway_classes`, and `reference_grants`
-    /// — to have been populated.  It returns `NotReady` until that condition
-    /// is met, preventing planners from silently operating without policy/class
-    /// data.
+    /// watched resource classes to have been populated.  It returns `NotReady`
+    /// until that condition is met, preventing planners from silently
+    /// operating on a partially warmed cache.
     pub async fn planner_snapshot(&self) -> SnapshotResult<PlannerSnapshot> {
         let inner = self.inner.read().await;
         if !inner.is_complete() {
@@ -870,8 +927,7 @@ impl SharedStore {
         *self.inner.write().await = new_inner;
     }
 
-    /// Ingest a [`GatewayState`] snapshot into the store atomically and mark
-    /// it ready.
+    /// Ingest a [`GatewayState`] snapshot into the store atomically.
     ///
     /// **Callers must only call this when all core API lists succeeded.**
     /// A partial snapshot would lock in missing resources and prevent future
@@ -896,10 +952,6 @@ impl SharedStore {
         }
 
         inner.rebuild_service_index();
-        // Mark gateway-state as populated.  gateway_classes and
-        // reference_grants are populated by their own reconcilers; the store
-        // is not fully ready until all three flags are set.
-        inner.populated.gateway_state = true;
     }
 }
 
@@ -967,6 +1019,32 @@ mod tests {
             .gateways
             .insert(GatewayState::key(namespace, name), gateway);
         state
+    }
+
+    async fn mark_all_resource_lists_listed(store: &SharedStore) {
+        store.mark_gateways_listed().await;
+        store.mark_gateway_classes_listed().await;
+        store.mark_http_routes_listed().await;
+        store.mark_tcp_routes_listed().await;
+        store.mark_tls_routes_listed().await;
+        store.mark_services_listed().await;
+        store.mark_endpoints_listed().await;
+        store.mark_secrets_listed().await;
+        store.mark_reference_grants_listed().await;
+    }
+
+    fn all_populated_flags() -> PopulatedFlags {
+        PopulatedFlags {
+            gateways: true,
+            gateway_classes: true,
+            http_routes: true,
+            tcp_routes: true,
+            tls_routes: true,
+            services: true,
+            endpoints: true,
+            secrets: true,
+            reference_grants: true,
+        }
     }
 
     fn make_http_route(name: &str, ns: &str, backend_ns: Option<&str>, backend: &str) -> HTTPRoute {
@@ -1180,16 +1258,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_ingest_gateway_state_does_not_mark_fully_ready() {
-        // ingest_gateway_state only sets the gateway_state flag; the store is
-        // NOT fully ready until gateway_classes and reference_grants are also
-        // populated.
+        // ingest_gateway_state updates cached objects only; readiness comes
+        // from the explicit initial-list signals.
         let store = SharedStore::new();
         assert!(!store.is_ready().await);
 
         let state = GatewayState::default();
         store.ingest_gateway_state(state).await;
 
-        // gateway_state is set but the other two flags are not.
         assert!(
             !store.is_ready().await,
             "store must not be ready until all resource classes are populated"
@@ -1200,8 +1276,7 @@ mod tests {
     async fn test_ingest_gateway_state_ready_after_all_classes_populated() {
         let store = SharedStore::new();
         store.ingest_gateway_state(GatewayState::default()).await;
-        store.mark_gateway_classes_listed().await;
-        store.mark_reference_grants_listed().await;
+        mark_all_resource_lists_listed(&store).await;
         assert!(store.is_ready().await);
     }
 
@@ -1214,8 +1289,9 @@ mod tests {
         state.http_routes.insert("default/r".to_string(), route);
 
         store.ingest_gateway_state(state).await;
+        store.mark_gateways_listed().await;
 
-        // snapshot() only requires gateway_state, not full readiness.
+        // snapshot() only requires the Gateway list, not full readiness.
         let snap = store.snapshot().await.expect("store should be ready");
         assert!(snap.http_routes.contains_key("default/r"));
     }
@@ -1229,8 +1305,7 @@ mod tests {
         state.http_routes.insert("default/r".to_string(), route);
 
         store.ingest_gateway_state(state).await;
-        store.mark_gateway_classes_listed().await;
-        store.mark_reference_grants_listed().await;
+        mark_all_resource_lists_listed(&store).await;
 
         assert_eq!(
             store.is_service_referenced("default", "ingested-svc").await,
@@ -1254,6 +1329,7 @@ mod tests {
         // Ingest a GatewayState that does NOT carry the secret.
         let state = GatewayState::default();
         store.ingest_gateway_state(state).await;
+        store.mark_gateways_listed().await;
 
         // The pre-existing secret must still be present.
         let snap = store.snapshot().await.expect("store should be ready");
@@ -1283,6 +1359,7 @@ mod tests {
             ("/stale/cert.crt".to_string(), "/stale/cert.key".to_string()),
         );
         store.ingest_gateway_state(state).await;
+        store.mark_gateways_listed().await;
 
         // The existing (real) path must win.
         let snap = store.snapshot().await.expect("store should be ready");
@@ -1413,9 +1490,7 @@ mod tests {
         assert!(!store.is_ready().await);
 
         let mut inner = StoreInner::default();
-        inner.populated.gateway_state = true;
-        inner.populated.gateway_classes = true;
-        inner.populated.reference_grants = true;
+        inner.populated = all_populated_flags();
         store.replace_all(inner).await;
 
         assert!(store.is_ready().await);
@@ -1426,10 +1501,7 @@ mod tests {
         let store = SharedStore::new();
 
         let mut inner = StoreInner::default();
-        // Mark all resource classes populated so the store is fully ready.
-        inner.populated.gateway_state = true;
-        inner.populated.gateway_classes = true;
-        inner.populated.reference_grants = true;
+        inner.populated = all_populated_flags();
         let route = make_http_route("r", "default", None, "bulk-svc");
         inner.http_routes.insert("default/r".to_string(), route);
         // Intentionally do NOT call rebuild_service_index() here --
@@ -1448,9 +1520,7 @@ mod tests {
         let store = SharedStore::new();
 
         let mut inner = StoreInner::default();
-        inner.populated.gateway_state = true;
-        inner.populated.gateway_classes = true;
-        inner.populated.reference_grants = true;
+        inner.populated = all_populated_flags();
         let route = make_http_route("r", "default", None, "real-svc");
         inner.http_routes.insert("default/r".to_string(), route);
         // Inject a stale index that claims "fake-svc" is referenced.
@@ -1474,11 +1544,18 @@ mod tests {
     // ── mark_gateway_classes_listed / mark_reference_grants_listed ───────────
 
     /// An empty GatewayClass list is a valid observation; the store must become
-    /// ready once all three flags are set even if no items were ever upserted.
+    /// ready once every other readiness flag is also set, even if no items were
+    /// ever upserted.
     #[tokio::test]
     async fn test_mark_gateway_classes_listed_enables_readiness_with_empty_list() {
         let store = SharedStore::new();
-        store.ingest_gateway_state(GatewayState::default()).await;
+        store.mark_gateways_listed().await;
+        store.mark_http_routes_listed().await;
+        store.mark_tcp_routes_listed().await;
+        store.mark_tls_routes_listed().await;
+        store.mark_services_listed().await;
+        store.mark_endpoints_listed().await;
+        store.mark_secrets_listed().await;
         store.mark_reference_grants_listed().await;
         // Not yet ready -- gateway_classes flag is still false.
         assert!(!store.is_ready().await);
@@ -1488,12 +1565,19 @@ mod tests {
     }
 
     /// An empty ReferenceGrant list is a valid observation; the store must
-    /// become ready once all three flags are set even if no grants exist.
+    /// become ready once every other readiness flag is also set, even if no
+    /// grants exist.
     #[tokio::test]
     async fn test_mark_reference_grants_listed_enables_readiness_with_empty_list() {
         let store = SharedStore::new();
-        store.ingest_gateway_state(GatewayState::default()).await;
         store.mark_gateway_classes_listed().await;
+        store.mark_gateways_listed().await;
+        store.mark_http_routes_listed().await;
+        store.mark_tcp_routes_listed().await;
+        store.mark_tls_routes_listed().await;
+        store.mark_services_listed().await;
+        store.mark_endpoints_listed().await;
+        store.mark_secrets_listed().await;
         // Not yet ready -- reference_grants flag is still false.
         assert!(!store.is_ready().await);
 
@@ -1501,14 +1585,12 @@ mod tests {
         assert!(store.is_ready().await);
     }
 
-    /// planner_snapshot must return Ready after all three mark_* calls, even
+    /// planner_snapshot must return Ready after all mark_* calls, even
     /// with no actual resources in the store.
     #[tokio::test]
     async fn test_planner_snapshot_ready_after_all_mark_calls_empty_store() {
         let store = SharedStore::new();
-        store.ingest_gateway_state(GatewayState::default()).await;
-        store.mark_gateway_classes_listed().await;
-        store.mark_reference_grants_listed().await;
+        mark_all_resource_lists_listed(&store).await;
 
         assert!(matches!(
             store.planner_snapshot().await,
@@ -2598,9 +2680,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_planner_snapshot_not_ready_without_gateway_classes() {
-        // gateway_state and reference_grants populated, but NOT gateway_classes.
+        // Every readiness signal except gateway_classes is populated.
         let store = SharedStore::new();
-        store.ingest_gateway_state(GatewayState::default()).await;
+        store.mark_gateways_listed().await;
+        store.mark_http_routes_listed().await;
+        store.mark_tcp_routes_listed().await;
+        store.mark_tls_routes_listed().await;
+        store.mark_services_listed().await;
+        store.mark_endpoints_listed().await;
+        store.mark_secrets_listed().await;
         store.mark_reference_grants_listed().await;
         assert!(
             matches!(store.planner_snapshot().await, SnapshotResult::NotReady),
@@ -2610,10 +2698,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_planner_snapshot_not_ready_without_reference_grants() {
-        // gateway_state and gateway_classes populated, but NOT reference_grants.
+        // Every readiness signal except reference_grants is populated.
         let store = SharedStore::new();
-        store.ingest_gateway_state(GatewayState::default()).await;
+        store.mark_gateways_listed().await;
         store.mark_gateway_classes_listed().await;
+        store.mark_http_routes_listed().await;
+        store.mark_tcp_routes_listed().await;
+        store.mark_tls_routes_listed().await;
+        store.mark_services_listed().await;
+        store.mark_endpoints_listed().await;
+        store.mark_secrets_listed().await;
         assert!(
             matches!(store.planner_snapshot().await, SnapshotResult::NotReady),
             "planner snapshot must be NotReady when reference_grants not populated"
@@ -2623,9 +2717,7 @@ mod tests {
     #[tokio::test]
     async fn test_planner_snapshot_ready_after_all_three_flags() {
         let store = SharedStore::new();
-        store.ingest_gateway_state(GatewayState::default()).await;
-        store.mark_gateway_classes_listed().await;
-        store.mark_reference_grants_listed().await;
+        mark_all_resource_lists_listed(&store).await;
         assert!(
             matches!(store.planner_snapshot().await, SnapshotResult::Ready(_)),
             "planner snapshot must be Ready once all resource classes are populated"
@@ -2640,6 +2732,13 @@ mod tests {
         store
             .ingest_gateway_state(ready_gateway_state("gw", "default"))
             .await;
+        store.mark_gateways_listed().await;
+        store.mark_http_routes_listed().await;
+        store.mark_tcp_routes_listed().await;
+        store.mark_tls_routes_listed().await;
+        store.mark_services_listed().await;
+        store.mark_endpoints_listed().await;
+        store.mark_secrets_listed().await;
         store.mark_gateway_classes_listed().await;
 
         assert!(!store.is_ready().await);
@@ -2657,6 +2756,13 @@ mod tests {
         store
             .ingest_gateway_state(ready_gateway_state("gw", "default"))
             .await;
+        store.mark_gateways_listed().await;
+        store.mark_http_routes_listed().await;
+        store.mark_tcp_routes_listed().await;
+        store.mark_tls_routes_listed().await;
+        store.mark_services_listed().await;
+        store.mark_endpoints_listed().await;
+        store.mark_secrets_listed().await;
         store.mark_gateway_classes_listed().await;
 
         assert!(matches!(
@@ -2683,6 +2789,13 @@ mod tests {
         store
             .ingest_gateway_state(ready_gateway_state("gw", "default"))
             .await;
+        store.mark_gateways_listed().await;
+        store.mark_http_routes_listed().await;
+        store.mark_tcp_routes_listed().await;
+        store.mark_tls_routes_listed().await;
+        store.mark_services_listed().await;
+        store.mark_endpoints_listed().await;
+        store.mark_secrets_listed().await;
         store.mark_gateway_classes_listed().await;
         store.mark_reference_grants_listed().await;
 
@@ -2720,12 +2833,18 @@ mod tests {
     // responsible for only calling mark_*_listed inside the Ok arm.
 
     /// If mark_gateway_classes_listed is NOT called (simulating a list failure),
-    /// the store must remain not-ready even after gateway_state and
-    /// reference_grants are populated.
+    /// the store must remain not-ready even after every other readiness signal
+    /// is populated.
     #[tokio::test]
     async fn test_store_not_ready_when_gateway_classes_flag_not_set() {
         let store = SharedStore::new();
-        store.ingest_gateway_state(GatewayState::default()).await;
+        store.mark_gateways_listed().await;
+        store.mark_http_routes_listed().await;
+        store.mark_tcp_routes_listed().await;
+        store.mark_tls_routes_listed().await;
+        store.mark_services_listed().await;
+        store.mark_endpoints_listed().await;
+        store.mark_secrets_listed().await;
         store.mark_reference_grants_listed().await;
         // Deliberately do NOT call mark_gateway_classes_listed().
         assert!(
@@ -2739,13 +2858,19 @@ mod tests {
     }
 
     /// If mark_reference_grants_listed is NOT called (simulating a list failure),
-    /// the store must remain not-ready even after gateway_state and
-    /// gateway_classes are populated.
+    /// the store must remain not-ready even after every other readiness signal
+    /// is populated.
     #[tokio::test]
     async fn test_store_not_ready_when_reference_grants_flag_not_set() {
         let store = SharedStore::new();
-        store.ingest_gateway_state(GatewayState::default()).await;
+        store.mark_gateways_listed().await;
         store.mark_gateway_classes_listed().await;
+        store.mark_http_routes_listed().await;
+        store.mark_tcp_routes_listed().await;
+        store.mark_tls_routes_listed().await;
+        store.mark_services_listed().await;
+        store.mark_endpoints_listed().await;
+        store.mark_secrets_listed().await;
         // Deliberately do NOT call mark_reference_grants_listed().
         assert!(
             !store.is_ready().await,

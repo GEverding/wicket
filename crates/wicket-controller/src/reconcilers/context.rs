@@ -267,8 +267,8 @@ fn map_apply_error(e: crate::reconcilers::contracts::ApplyError) -> ConfigUpdate
 ///
 /// ## Store readiness
 ///
-/// The store is only marked ready (via `ingest_gateway_state`) when ALL core
-/// list calls succeed.  A partial snapshot is never ingested.
+/// The store is only marked ready after every watch controller has completed
+/// its own initial list. A partial snapshot is never ingested.
 ///
 /// ## Planner/applier split
 ///

@@ -512,6 +512,93 @@ pub async fn run_secret_controller(ctx: Arc<Context>) -> Result<(), kube::Error>
         .with_label_values(&["Secret"])
         .set(1);
 
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match api.list(&Default::default()).await {
+            Ok(list) => {
+                let mut initial_list_error: Option<SecretError> = None;
+                for secret in list.items {
+                    let secret_type = secret.type_.as_deref().unwrap_or("");
+                    let Some(data) = &secret.data else {
+                        continue;
+                    };
+                    if (secret_type != "kubernetes.io/tls" && secret_type != "Opaque")
+                        || !data.contains_key("tls.crt")
+                        || !data.contains_key("tls.key")
+                    {
+                        continue;
+                    }
+
+                    let namespace = secret.metadata.namespace.clone().unwrap_or_default();
+                    let name = secret.metadata.name.clone().unwrap_or_default();
+                    let cert_path = match write_tls_file(
+                        &ctx.tls_cert_dir,
+                        &namespace,
+                        &name,
+                        "crt",
+                        &data["tls.crt"].0,
+                    )
+                    .await
+                    {
+                        Ok(path) => path,
+                        Err(e) => {
+                            initial_list_error = Some(e);
+                            break;
+                        }
+                    };
+                    let key_path = match write_tls_file(
+                        &ctx.tls_cert_dir,
+                        &namespace,
+                        &name,
+                        "key",
+                        &data["tls.key"].0,
+                    )
+                    .await
+                    {
+                        Ok(path) => path,
+                        Err(e) => {
+                            initial_list_error = Some(e);
+                            break;
+                        }
+                    };
+                    let secret_key = GatewayState::key(&namespace, &name);
+                    ctx.store
+                        .upsert_tls_secret(
+                            secret_key,
+                            cert_path.to_string_lossy().to_string(),
+                            key_path.to_string_lossy().to_string(),
+                        )
+                        .await;
+                }
+                if let Some(e) = initial_list_error {
+                    let backoff = std::cmp::min(attempt * 2, 30);
+                    tracing::warn!(
+                        error = %e,
+                        attempt,
+                        backoff_secs = backoff,
+                        "Initial Secret list processing failed; will retry"
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+                    continue;
+                }
+                ctx.store.mark_secrets_listed().await;
+                tracing::debug!(attempt, "Secret initial list complete; store flag set");
+                break;
+            }
+            Err(e) => {
+                let backoff = std::cmp::min(attempt * 2, 30);
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    backoff_secs = backoff,
+                    "Initial Secret list failed; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+        }
+    }
+
     Controller::new(api, config)
         .run(reconcile_secret, error_policy_secret, ctx)
         .for_each(|result| async move {

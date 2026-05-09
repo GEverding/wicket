@@ -346,7 +346,7 @@ impl GatewayState {
         let mut config = WicketConfig::default();
         let mut upstreams: BTreeMap<String, UpstreamConfig> = BTreeMap::new();
         let mut routes = Vec::new();
-        let mut tls_certs = Vec::new();
+        let mut tls_certs: Vec<CertConfig> = Vec::new();
         let mut stream_config: Option<StreamConfig> = None;
 
         // Collect and sort gateway entries.
@@ -573,7 +573,11 @@ impl GatewayState {
             }
         }
 
-        // Process TLS configuration from Gateway listeners (sorted).
+        // Dedupe TLS certs by Secret (namespace/name).  Multiple listeners
+        // may reference the same Secret with different hostnames; we emit
+        // one CertConfig per unique Secret and union the domains.
+        let mut cert_map: BTreeMap<String, CertConfig> = BTreeMap::new();
+
         for (gw_key, gateway) in &gw_entries {
             let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
             let _ = gw_key; // key used only for sort order
@@ -585,17 +589,25 @@ impl GatewayState {
                         let cert_key = Self::key(cert_ns, &cert_ref.name);
 
                         if let Some((cert_path, key_path)) = self.tls_secrets.get(&cert_key) {
-                            tls_certs.push(CertConfig {
+                            let entry = cert_map.entry(cert_key).or_insert_with(|| CertConfig {
                                 name: cert_ref.name.clone(),
                                 cert: cert_path.clone(),
                                 key: key_path.clone(),
-                                domains: listener.hostname.iter().cloned().collect(),
+                                domains: vec![],
                             });
+
+                            if let Some(ref hostname) = listener.hostname {
+                                if !entry.domains.contains(hostname) {
+                                    entry.domains.push(hostname.clone());
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+
+        tls_certs.extend(cert_map.into_values());
 
         // Process TCPRoutes and TLSRoutes for stream config (sorted).
         if !self.tcp_routes.is_empty() || !self.tls_routes.is_empty() {
@@ -800,7 +812,7 @@ impl GatewayState {
         let mut config = WicketConfig::default();
         let mut upstreams: BTreeMap<String, UpstreamConfig> = BTreeMap::new();
         let mut routes = Vec::new();
-        let mut tls_certs = Vec::new();
+        let mut tls_certs: Vec<CertConfig> = Vec::new();
         let mut stream_config: Option<StreamConfig> = None;
 
         // Bucket listeners by protocol family so HTTPS gets its own bind.
@@ -1025,7 +1037,11 @@ impl GatewayState {
             }
         }
 
-        // Process TLS configuration from Gateway listeners
+        // Dedupe TLS certs by Secret (namespace/name).  Multiple listeners
+        // may reference the same Secret with different hostnames; we emit
+        // one CertConfig per unique Secret and union the domains.
+        let mut cert_map: BTreeMap<String, CertConfig> = BTreeMap::new();
+
         for gateway in self.gateways.values() {
             let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
 
@@ -1036,17 +1052,25 @@ impl GatewayState {
                         let cert_key = Self::key(cert_ns, &cert_ref.name);
 
                         if let Some((cert_path, key_path)) = self.tls_secrets.get(&cert_key) {
-                            tls_certs.push(CertConfig {
+                            let entry = cert_map.entry(cert_key).or_insert_with(|| CertConfig {
                                 name: cert_ref.name.clone(),
                                 cert: cert_path.clone(),
                                 key: key_path.clone(),
-                                domains: listener.hostname.iter().cloned().collect(),
+                                domains: vec![],
                             });
+
+                            if let Some(ref hostname) = listener.hostname {
+                                if !entry.domains.contains(hostname) {
+                                    entry.domains.push(hostname.clone());
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+
+        tls_certs.extend(cert_map.into_values());
 
         // Process TCPRoutes and TLSRoutes for stream config
         if !self.tcp_routes.is_empty() || !self.tls_routes.is_empty() {
@@ -1201,10 +1225,10 @@ impl GatewayState {
 mod tests {
     use super::*;
     use crate::crds::{
-        BackendRef, Condition, GatewaySpec, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec,
-        HTTPRouteStatus, Listener, ParentReference, ProtocolType, RouteParentStatus, TCPRoute,
-        TCPRouteSpec, TCPRouteStatus, TLSRoute, TLSRouteRule, TLSRouteSpec, TLSRouteStatus,
-        WICKET_CONTROLLER_NAME,
+        BackendRef, Condition, GatewaySpec, GatewayTLSConfig, HTTPBackendRef, HTTPRouteRule,
+        HTTPRouteSpec, HTTPRouteStatus, Listener, ParentReference, ProtocolType, RouteParentStatus,
+        SecretObjectReference, TCPRoute, TCPRouteSpec, TCPRouteStatus, TLSModeType, TLSRoute,
+        TLSRouteRule, TLSRouteSpec, TLSRouteStatus, WICKET_CONTROLLER_NAME,
     };
     use kube::core::ObjectMeta;
 
@@ -1393,6 +1417,77 @@ mod tests {
         assert_eq!(config.server.listen, "0.0.0.0:8080");
         assert_eq!(config.server.https_listen.as_deref(), Some("0.0.0.0:8443"));
         assert!(!config.server.disable_http);
+    }
+
+    #[test]
+    fn test_https_gateway_same_cert_two_listeners_dedupes_to_one_cert_config() {
+        let mut state = GatewayState::default();
+
+        state.tls_secrets.insert(
+            GatewayState::key("default", "shared-cert"),
+            (
+                "/etc/wicket/tls/shared-cert.crt".to_string(),
+                "/etc/wicket/tls/shared-cert.key".to_string(),
+            ),
+        );
+
+        let tls_config = GatewayTLSConfig {
+            mode: TLSModeType::Terminate,
+            certificate_refs: vec![SecretObjectReference {
+                group: "".to_string(),
+                kind: "Secret".to_string(),
+                name: "shared-cert".to_string(),
+                namespace: Some("default".to_string()),
+            }],
+            options: None,
+            frontend_validation: None,
+        };
+
+        state.gateways.insert(
+            GatewayState::key("default", "test-gateway"),
+            Gateway {
+                metadata: ObjectMeta {
+                    name: Some("test-gateway".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                spec: GatewaySpec {
+                    gateway_class_name: "wicket".to_string(),
+                    listeners: vec![
+                        Listener {
+                            name: "https-a".to_string(),
+                            hostname: Some("a.example.com".to_string()),
+                            port: 443,
+                            protocol: ProtocolType::HTTPS,
+                            tls: Some(tls_config.clone()),
+                            allowed_routes: None,
+                        },
+                        Listener {
+                            name: "https-b".to_string(),
+                            hostname: Some("b.example.com".to_string()),
+                            port: 443,
+                            protocol: ProtocolType::HTTPS,
+                            tls: Some(tls_config),
+                            allowed_routes: None,
+                        },
+                    ],
+                    addresses: vec![],
+                    infrastructure: None,
+                },
+                status: None,
+            },
+        );
+
+        let config = state.generate_config_deterministic();
+        let tls = config.tls.expect("tls config");
+        let file = tls.file.expect("file tls config");
+
+        assert_eq!(file.certs.len(), 1);
+        let cert = &file.certs[0];
+        assert_eq!(cert.cert, "/etc/wicket/tls/shared-cert.crt");
+        assert_eq!(cert.key, "/etc/wicket/tls/shared-cert.key");
+        assert!(cert.domains.contains(&"a.example.com".to_string()));
+        assert!(cert.domains.contains(&"b.example.com".to_string()));
     }
 
     #[test]

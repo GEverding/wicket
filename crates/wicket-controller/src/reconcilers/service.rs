@@ -396,6 +396,31 @@ pub async fn run_endpoints_controller(ctx: Arc<Context>) -> Result<(), kube::Err
         .with_label_values(&["EndpointSlice"])
         .set(1);
 
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match api.list(&Default::default()).await {
+            Ok(_) => {
+                ctx.store.mark_endpoints_listed().await;
+                tracing::debug!(
+                    attempt,
+                    "EndpointSlice initial list complete; store flag set"
+                );
+                break;
+            }
+            Err(e) => {
+                let backoff = std::cmp::min(attempt * 2, 30);
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    backoff_secs = backoff,
+                    "Initial EndpointSlice list failed; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+        }
+    }
+
     Controller::new(api, Config::default())
         .run(reconcile_endpoint_slice, error_policy_endpoint_slice, ctx)
         .for_each(|result| async move {
@@ -524,6 +549,28 @@ pub async fn run_service_controller(ctx: Arc<Context>) -> Result<(), kube::Error
     WATCH_CONNECTIONS_ACTIVE
         .with_label_values(&["Service"])
         .set(1);
+
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match api.list(&Default::default()).await {
+            Ok(_) => {
+                ctx.store.mark_services_listed().await;
+                tracing::debug!(attempt, "Service initial list complete; store flag set");
+                break;
+            }
+            Err(e) => {
+                let backoff = std::cmp::min(attempt * 2, 30);
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    backoff_secs = backoff,
+                    "Initial Service list failed; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+        }
+    }
 
     Controller::new(api, Config::default())
         .run(reconcile_service, error_policy_service, ctx)

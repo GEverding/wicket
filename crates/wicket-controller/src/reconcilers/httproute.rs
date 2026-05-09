@@ -753,6 +753,34 @@ pub async fn run_httproute_controller(ctx: Arc<Context>) -> Result<(), kube::Err
         .with_label_values(&["HTTPRoute"])
         .set(1);
 
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match api.list(&Default::default()).await {
+            Ok(list) => {
+                for route in list.items {
+                    let ns = route.metadata.namespace.clone().unwrap_or_default();
+                    let name = route.metadata.name.clone().unwrap_or_default();
+                    let key = GatewayState::key(&ns, &name);
+                    ctx.store.upsert_http_route(key, route).await;
+                }
+                ctx.store.mark_http_routes_listed().await;
+                tracing::debug!(attempt, "HTTPRoute initial list complete; store flag set");
+                break;
+            }
+            Err(e) => {
+                let backoff = std::cmp::min(attempt * 2, 30);
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    backoff_secs = backoff,
+                    "Initial HTTPRoute list failed; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+        }
+    }
+
     Controller::new(api, Config::default())
         .run(reconcile_httproute, error_policy_httproute, ctx)
         .for_each(|result| async move {
