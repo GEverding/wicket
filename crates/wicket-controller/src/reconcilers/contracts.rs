@@ -252,6 +252,10 @@ pub struct ListenerStatusIntent {
     pub accepted: bool,
     /// Reason for rejection, if `accepted` is false.
     pub rejection_reason: Option<String>,
+    /// Whether all listener references resolved successfully.
+    pub resolved_refs: bool,
+    /// Reason for `ResolvedRefs=False`, if applicable.
+    pub resolved_refs_reason: Option<String>,
 }
 
 /// A (group, kind) pair identifying a route type.

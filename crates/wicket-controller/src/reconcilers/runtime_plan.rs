@@ -47,7 +47,7 @@ use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
 
-use crate::crds::{Gateway, ProtocolType};
+use crate::crds::{Gateway, ProtocolType, RouteGroupKind as CrdRouteGroupKind};
 use crate::reconcilers::attachment_planner::AttachmentPlan;
 use crate::reconcilers::config_generator::{GatewayState, WicketConfig};
 use crate::reconcilers::contracts::{
@@ -64,6 +64,8 @@ const OBJECT_NAME_PREFIX: &str = "wicket-gw-";
 /// Kubernetes names are limited to 63 chars, so 63 - 7 = 56.  We use 52 to
 /// leave a comfortable margin for the 6-char hash suffix.
 const MAX_BASE_NAME_LEN: usize = 52;
+
+const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Controller configuration
@@ -701,59 +703,100 @@ pub fn service_ports_from_listeners(
 /// UDP listeners are explicitly marked as not accepted with a rejection reason,
 /// since the controller does not support UDP.
 ///
-/// `supported_kinds` is derived from the listener protocol:
-/// - HTTP/HTTPS -> HTTPRoute
-/// - TCP/TLS   -> TCPRoute / TLSRoute
-/// - UDP       -> empty (not accepted)
+/// `supported_kinds` is derived from the listener protocol and filtered by
+/// `allowedRoutes.kinds` when present.
 #[must_use]
 pub fn listener_status_intents(gateway: &Gateway) -> Vec<ListenerStatusIntent> {
     gateway
         .spec
         .listeners
         .iter()
-        .map(|l| match l.protocol {
-            ProtocolType::HTTP | ProtocolType::HTTPS => ListenerStatusIntent {
-                name: l.name.clone(),
-                attached_routes: 0,
-                supported_kinds: vec![RouteGroupKind {
-                    group: "gateway.networking.k8s.io".to_string(),
-                    kind: "HTTPRoute".to_string(),
-                }],
-                accepted: true,
-                rejection_reason: None,
-            },
-            ProtocolType::TCP => ListenerStatusIntent {
-                name: l.name.clone(),
-                attached_routes: 0,
-                supported_kinds: vec![RouteGroupKind {
-                    group: "gateway.networking.k8s.io".to_string(),
-                    kind: "TCPRoute".to_string(),
-                }],
-                accepted: true,
-                rejection_reason: None,
-            },
-            ProtocolType::TLS => ListenerStatusIntent {
-                name: l.name.clone(),
-                attached_routes: 0,
-                supported_kinds: vec![RouteGroupKind {
-                    group: "gateway.networking.k8s.io".to_string(),
-                    kind: "TLSRoute".to_string(),
-                }],
-                accepted: true,
-                rejection_reason: None,
-            },
-            ProtocolType::UDP => ListenerStatusIntent {
-                name: l.name.clone(),
-                attached_routes: 0,
-                supported_kinds: vec![],
-                accepted: false,
-                rejection_reason: Some(
-                    "UnsupportedProtocol: UDP listeners are not supported by this controller"
-                        .to_string(),
-                ),
-            },
-        })
+        .map(listener_status_intent)
         .collect()
+}
+
+fn listener_status_intent(listener: &crate::crds::Listener) -> ListenerStatusIntent {
+    let controller_supported_kinds = protocol_supported_kinds(&listener.protocol);
+
+    if listener.protocol == ProtocolType::UDP {
+        return ListenerStatusIntent {
+            name: listener.name.clone(),
+            attached_routes: 0,
+            supported_kinds: vec![],
+            accepted: false,
+            rejection_reason: Some(
+                "UnsupportedProtocol: UDP listeners are not supported by this controller"
+                    .to_string(),
+            ),
+            resolved_refs: true,
+            resolved_refs_reason: None,
+        };
+    }
+
+    let requested_kinds = listener
+        .allowed_routes
+        .as_ref()
+        .map(|allowed_routes| allowed_routes.kinds.as_slice())
+        .unwrap_or(&[]);
+
+    let mut supported_kinds = if requested_kinds.is_empty() {
+        controller_supported_kinds.clone()
+    } else {
+        controller_supported_kinds
+            .iter()
+            .filter(|supported| {
+                requested_kinds
+                    .iter()
+                    .any(|requested| route_group_kind_matches(requested, supported))
+            })
+            .cloned()
+            .collect()
+    };
+
+    let invalid_route_kinds = !requested_kinds.is_empty()
+        && requested_kinds.iter().any(|requested| {
+            !controller_supported_kinds
+                .iter()
+                .any(|supported| route_group_kind_matches(requested, supported))
+        });
+
+    if requested_kinds.is_empty() {
+        supported_kinds = controller_supported_kinds;
+    }
+
+    ListenerStatusIntent {
+        name: listener.name.clone(),
+        attached_routes: 0,
+        supported_kinds,
+        accepted: true,
+        rejection_reason: None,
+        resolved_refs: !invalid_route_kinds,
+        resolved_refs_reason: invalid_route_kinds.then(|| "InvalidRouteKinds".to_string()),
+    }
+}
+
+fn protocol_supported_kinds(protocol: &ProtocolType) -> Vec<RouteGroupKind> {
+    match protocol {
+        ProtocolType::HTTP | ProtocolType::HTTPS => vec![RouteGroupKind {
+            group: GATEWAY_API_GROUP.to_string(),
+            kind: "HTTPRoute".to_string(),
+        }],
+        ProtocolType::TCP => vec![RouteGroupKind {
+            group: GATEWAY_API_GROUP.to_string(),
+            kind: "TCPRoute".to_string(),
+        }],
+        ProtocolType::TLS => vec![RouteGroupKind {
+            group: GATEWAY_API_GROUP.to_string(),
+            kind: "TLSRoute".to_string(),
+        }],
+        ProtocolType::UDP => vec![],
+    }
+}
+
+fn route_group_kind_matches(requested: &CrdRouteGroupKind, supported: &RouteGroupKind) -> bool {
+    (requested.group.is_empty() || requested.group == GATEWAY_API_GROUP)
+        && requested.kind == supported.kind
+        && supported.group == GATEWAY_API_GROUP
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -980,7 +1023,7 @@ pub fn listener_status_intents_with_attachment(
             // Non-accepted listeners must always report zero attached routes.
             // A listener that is not accepted cannot have routes meaningfully
             // attached to it, so reporting a non-zero count would be misleading.
-            if intent.accepted {
+            if intent.accepted && intent.resolved_refs {
                 if let Some(summary) = ap.listener_summary(&intent.name) {
                     intent.attached_routes = summary.attached_routes;
                 }

@@ -972,8 +972,6 @@ fn build_managed_runtime_status(
     name: &str,
     input: ManagedRuntimeInput,
 ) -> (Vec<ListenerStatus>, bool, bool, Option<String>) {
-    use crate::reconcilers::runtime_plan::listener_status_intents_with_attachment;
-
     let gateway_generation = gateway.metadata.generation;
 
     // ── 1. Extract the planner snapshot from the input ───────────────────────
@@ -1030,11 +1028,23 @@ fn build_managed_runtime_status(
         None
     };
 
-    let intents = listener_status_intents_with_attachment(gateway, attachment_plan_opt.as_ref());
+    let tls_snapshot = match &snapshot_result {
+        SnapshotResult::Ready(snapshot) => Some(snapshot),
+        SnapshotResult::NotReady => None,
+    };
+
+    let intents = listener_status_intents_with_attachment_with_tls_validation(
+        gateway,
+        attachment_plan_opt.as_ref(),
+        tls_snapshot,
+    );
 
     let listener_statuses = intents
         .into_iter()
         .map(|intent| {
+            let name = intent.name;
+            let resolved_refs = intent.resolved_refs;
+            let resolved_refs_reason = intent.resolved_refs_reason;
             let supported_kinds = intent
                 .supported_kinds
                 .into_iter()
@@ -1043,6 +1053,9 @@ fn build_managed_runtime_status(
                     kind: k.kind,
                 })
                 .collect();
+            let resolved_refs_condition =
+                listener_resolved_refs_condition(resolved_refs, resolved_refs_reason.as_deref())
+                    .with_observed_generation(outcome.observed_generation);
 
             // Per-listener Programmed condition mirrors the Gateway-level one.
             // Use the accurate reason so operators can distinguish deployment
@@ -1056,24 +1069,21 @@ fn build_managed_runtime_status(
                     vec![
                         Condition::accepted().with_observed_generation(outcome.observed_generation),
                         not_prog,
-                        Condition::resolved_refs()
-                            .with_observed_generation(outcome.observed_generation),
+                        resolved_refs_condition,
                     ]
                 } else {
                     vec![
                         Condition::not_accepted()
                             .with_observed_generation(outcome.observed_generation),
                         not_prog,
-                        Condition::resolved_refs()
-                            .with_observed_generation(outcome.observed_generation),
+                        resolved_refs_condition,
                     ]
                 }
             } else if programmed && intent.accepted {
                 vec![
                     Condition::accepted().with_observed_generation(outcome.observed_generation),
                     Condition::programmed().with_observed_generation(outcome.observed_generation),
-                    Condition::resolved_refs()
-                        .with_observed_generation(outcome.observed_generation),
+                    resolved_refs_condition,
                 ]
             } else if intent.accepted {
                 let not_prog = if only_store_not_ready {
@@ -1085,8 +1095,7 @@ fn build_managed_runtime_status(
                 vec![
                     Condition::accepted().with_observed_generation(outcome.observed_generation),
                     not_prog,
-                    Condition::resolved_refs()
-                        .with_observed_generation(outcome.observed_generation),
+                    resolved_refs_condition,
                 ]
             } else {
                 let not_prog = if only_store_not_ready {
@@ -1098,13 +1107,12 @@ fn build_managed_runtime_status(
                 vec![
                     Condition::not_accepted().with_observed_generation(outcome.observed_generation),
                     not_prog,
-                    Condition::resolved_refs()
-                        .with_observed_generation(outcome.observed_generation),
+                    resolved_refs_condition,
                 ]
             };
 
             ListenerStatus {
-                name: intent.name,
+                name,
                 supported_kinds,
                 // ListenerStatus.attached_routes is i32 (CRD type); cast from u32.
                 // Saturate at i32::MAX to avoid overflow on pathological inputs.
@@ -1120,6 +1128,96 @@ fn build_managed_runtime_status(
         only_store_not_ready,
         outcome.observation_fault,
     )
+}
+
+fn listener_status_intents_with_attachment_with_tls_validation(
+    gateway: &Gateway,
+    attachment_plan: Option<&crate::reconcilers::attachment_planner::AttachmentPlan>,
+    tls_snapshot: Option<&PlannerSnapshot>,
+) -> Vec<crate::reconcilers::contracts::ListenerStatusIntent> {
+    use crate::reconcilers::runtime_plan::listener_status_intents_with_attachment;
+
+    let intents = listener_status_intents_with_attachment(gateway, attachment_plan);
+    let Some(snapshot) = tls_snapshot else {
+        return intents;
+    };
+
+    gateway
+        .spec
+        .listeners
+        .iter()
+        .zip(intents)
+        .map(|(listener, mut intent)| {
+            if intent.resolved_refs
+                && listener_certificate_refs_invalid(listener, gateway, snapshot)
+            {
+                intent.resolved_refs = false;
+                intent.resolved_refs_reason = Some("InvalidCertificateRef".to_string());
+                intent.attached_routes = 0;
+            }
+            intent
+        })
+        .collect()
+}
+
+fn listener_certificate_refs_invalid(
+    listener: &crate::crds::Listener,
+    gateway: &Gateway,
+    snapshot: &PlannerSnapshot,
+) -> bool {
+    let Some(tls) = &listener.tls else {
+        return false;
+    };
+
+    let gateway_namespace = gateway.namespace().unwrap_or_default();
+
+    tls.certificate_refs.iter().any(|cert_ref| {
+        !cert_ref.group.is_empty()
+            || cert_ref.kind != "Secret"
+            || !is_valid_k8s_dns_subdomain(&cert_ref.name)
+            || snapshot
+                .tls_secret(
+                    cert_ref.namespace.as_deref().unwrap_or(&gateway_namespace),
+                    &cert_ref.name,
+                )
+                .is_none()
+    })
+}
+
+fn is_valid_k8s_dns_subdomain(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+
+    name.split('.').all(|label| {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+
+        let bytes = label.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        let is_alnum = |b: u8| matches!(b, b'a'..=b'z' | b'0'..=b'9');
+
+        is_alnum(first)
+            && is_alnum(last)
+            && bytes
+                .iter()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+    })
+}
+
+fn listener_resolved_refs_condition(resolved_refs: bool, reason: Option<&str>) -> Condition {
+    if resolved_refs {
+        Condition::resolved_refs()
+    } else {
+        Condition::new(
+            "ResolvedRefs",
+            false,
+            reason.unwrap_or("InvalidRouteKinds"),
+            "Listener references are invalid",
+        )
+    }
 }
 
 /// Get addresses for a Gateway from its owned managed-runtime Service.
@@ -1552,14 +1650,19 @@ mod tests {
     use super::*;
 
     use kube::core::ObjectMeta;
+    use std::collections::{HashMap, HashSet};
 
     use crate::crds::{
-        Condition, Gateway, GatewaySpec, GatewayStatus, Listener, ListenerStatus, ProtocolType,
+        AllowedRoutes, Condition, Gateway, GatewaySpec, GatewayStatus, GatewayTLSConfig, Listener,
+        ListenerStatus, ProtocolType, RouteGroupKind as CrdRouteGroupKind, SecretObjectReference,
+        TLSModeType,
     };
+    use crate::reconcilers::runtime_applier::RuntimeApplyResult;
     use crate::reconcilers::runtime_plan::{
         config_map_name, deployment_name, is_rollout_converged, owned_object_base_name,
         ObservedRuntimeState,
     };
+    use crate::reconcilers::store::{PlannerSnapshot, SnapshotResult};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1586,6 +1689,115 @@ mod tests {
                 infrastructure: None,
             },
             status: None,
+        }
+    }
+
+    fn snapshot_with_gateway(
+        gateway: Gateway,
+        tls_secrets: HashMap<String, (String, String)>,
+    ) -> SnapshotResult<PlannerSnapshot> {
+        let key = format!(
+            "{}/{}",
+            gateway.metadata.namespace.as_deref().unwrap_or("default"),
+            gateway.metadata.name.as_deref().unwrap_or("")
+        );
+        let mut gateways = HashMap::new();
+        gateways.insert(key, gateway);
+
+        SnapshotResult::Ready(PlannerSnapshot {
+            gateways,
+            gateway_classes: HashMap::new(),
+            http_routes: HashMap::new(),
+            tcp_routes: HashMap::new(),
+            tls_routes: HashMap::new(),
+            service_endpoints: HashMap::new(),
+            tls_secrets,
+            reference_grants: HashMap::new(),
+            service_ref_index: HashSet::new(),
+            namespace_labels: HashMap::new(),
+        })
+    }
+
+    fn snapshot_with_gateway_and_tls_secret(
+        gateway: Gateway,
+        namespace: &str,
+        name: &str,
+    ) -> SnapshotResult<PlannerSnapshot> {
+        let mut tls_secrets = HashMap::new();
+        tls_secrets.insert(
+            format!("{}/{}", namespace, name),
+            ("/cert.pem".to_string(), "/key.pem".to_string()),
+        );
+        snapshot_with_gateway(gateway, tls_secrets)
+    }
+
+    fn build_converged_listener_statuses(gateway: &Gateway) -> Vec<ListenerStatus> {
+        let namespace = gateway.metadata.namespace.as_deref().unwrap_or("default");
+        let name = gateway.metadata.name.as_deref().unwrap_or("");
+        let (listeners, programmed, only_store_not_ready, fault) = build_managed_runtime_status(
+            gateway,
+            namespace,
+            name,
+            ManagedRuntimeInput::Applied(
+                converged_obs(),
+                RuntimeApplyResult::default(),
+                Box::new(snapshot_with_gateway(gateway.clone(), HashMap::new())),
+            ),
+        );
+
+        assert!(
+            programmed,
+            "converged test input must yield Programmed=True"
+        );
+        assert!(
+            !only_store_not_ready,
+            "converged test input must not report controller warmup"
+        );
+        assert!(fault.is_none(), "converged test input must not fault");
+
+        listeners
+    }
+
+    fn listener_named<'a>(listeners: &'a [ListenerStatus], name: &str) -> &'a ListenerStatus {
+        listeners
+            .iter()
+            .find(|listener| listener.name == name)
+            .unwrap_or_else(|| panic!("missing listener status for {name}"))
+    }
+
+    fn listener_condition<'a>(listener: &'a ListenerStatus, type_: &str) -> &'a Condition {
+        listener
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == type_)
+            .unwrap_or_else(|| panic!("missing {type_} condition for listener {}", listener.name))
+    }
+
+    fn http_route_kind() -> CrdRouteGroupKind {
+        CrdRouteGroupKind {
+            group: "gateway.networking.k8s.io".to_string(),
+            kind: "HTTPRoute".to_string(),
+        }
+    }
+
+    fn tcp_route_kind() -> CrdRouteGroupKind {
+        CrdRouteGroupKind {
+            group: "gateway.networking.k8s.io".to_string(),
+            kind: "TCPRoute".to_string(),
+        }
+    }
+
+    fn secret_ref(
+        group: &str,
+        kind: &str,
+        name: &str,
+        namespace: Option<&str>,
+    ) -> SecretObjectReference {
+        SecretObjectReference {
+            group: group.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            namespace: namespace.map(str::to_string),
         }
     }
 
@@ -2337,9 +2549,6 @@ mod tests {
     //
     // The three parallel Option parameters have been replaced by a single
     // ManagedRuntimeInput enum.  Tests now construct the enum variant directly.
-
-    use crate::reconcilers::runtime_applier::RuntimeApplyResult;
-    use crate::reconcilers::store::SnapshotResult;
 
     /// When reconcile_managed_runtime succeeds, the managed_input is
     /// ManagedRuntimeInput::Applied carrying the observed state and apply result.
@@ -4381,5 +4590,142 @@ mod tests {
             .conditions
             .iter()
             .all(|c| c.observed_generation.is_none())));
+    }
+
+    #[test]
+    fn gateway_listener_invalid_route_kinds_empty_supported_kinds_conformance() {
+        let mut gateway = make_gateway("prod", "my-gw");
+        gateway.spec.listeners[0].allowed_routes = Some(AllowedRoutes {
+            namespaces: None,
+            kinds: vec![tcp_route_kind()],
+        });
+
+        let listeners = build_converged_listener_statuses(&gateway);
+        let listener = listener_named(&listeners, "http");
+        let resolved_refs = listener_condition(listener, "ResolvedRefs");
+
+        assert_eq!(resolved_refs.status, "False");
+        assert_eq!(resolved_refs.reason, "InvalidRouteKinds");
+        assert!(
+            listener.supported_kinds.is_empty(),
+            "expected no supportedKinds when all allowedRoutes.kinds are invalid, got {:?}",
+            listener.supported_kinds
+        );
+        assert_eq!(listener.attached_routes, 0);
+    }
+
+    #[test]
+    fn gateway_listener_invalid_route_kinds_preserves_valid_supported_kind_conformance() {
+        let mut gateway = make_gateway("prod", "my-gw");
+        gateway.spec.listeners[0].allowed_routes = Some(AllowedRoutes {
+            namespaces: None,
+            kinds: vec![http_route_kind(), tcp_route_kind()],
+        });
+
+        let listeners = build_converged_listener_statuses(&gateway);
+        let listener = listener_named(&listeners, "http");
+        let resolved_refs = listener_condition(listener, "ResolvedRefs");
+
+        assert_eq!(resolved_refs.status, "False");
+        assert_eq!(resolved_refs.reason, "InvalidRouteKinds");
+        assert_eq!(listener.supported_kinds, vec![http_route_kind()]);
+        assert_eq!(listener.attached_routes, 0);
+    }
+
+    #[test]
+    fn gateway_listener_invalid_certificate_refs_conformance() {
+        let cases = [
+            (
+                "nonexistent secret ref",
+                secret_ref("", "Secret", "missing-cert", Some("prod")),
+            ),
+            (
+                "malformed secret ref",
+                secret_ref("", "Secret", "Bad_Name", Some("prod")),
+            ),
+            (
+                "unsupported group",
+                secret_ref("apps", "Secret", "tls-cert", Some("prod")),
+            ),
+            (
+                "unsupported kind",
+                secret_ref("", "ConfigMap", "tls-cert", Some("prod")),
+            ),
+        ];
+
+        for (case_name, certificate_ref) in cases {
+            let mut gateway = make_gateway("prod", "my-gw");
+            gateway.spec.listeners[0].name = "https".to_string();
+            gateway.spec.listeners[0].port = 443;
+            gateway.spec.listeners[0].protocol = ProtocolType::HTTPS;
+            gateway.spec.listeners[0].tls = Some(GatewayTLSConfig {
+                mode: TLSModeType::Terminate,
+                certificate_refs: vec![certificate_ref],
+                options: None,
+                frontend_validation: None,
+            });
+
+            let listeners = build_converged_listener_statuses(&gateway);
+            let listener = listener_named(&listeners, "https");
+            let resolved_refs = listener_condition(listener, "ResolvedRefs");
+
+            assert_eq!(
+                resolved_refs.status, "False",
+                "case {case_name} should set ResolvedRefs=False"
+            );
+            assert_eq!(
+                resolved_refs.reason, "InvalidCertificateRef",
+                "case {case_name} should set InvalidCertificateRef"
+            );
+            assert_eq!(
+                listener.supported_kinds,
+                vec![http_route_kind()],
+                "case {case_name} should preserve HTTPRoute supportedKinds"
+            );
+            assert_eq!(
+                listener.attached_routes, 0,
+                "case {case_name} should report zero attached routes"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_listener_valid_certificate_ref_keeps_resolved_refs_true() {
+        let mut gateway = make_gateway("prod", "my-gw");
+        gateway.spec.listeners[0].name = "https".to_string();
+        gateway.spec.listeners[0].port = 443;
+        gateway.spec.listeners[0].protocol = ProtocolType::HTTPS;
+        gateway.spec.listeners[0].tls = Some(GatewayTLSConfig {
+            mode: TLSModeType::Terminate,
+            certificate_refs: vec![secret_ref("", "Secret", "valid-cert", Some("prod"))],
+            options: None,
+            frontend_validation: None,
+        });
+
+        let (listeners, programmed, only_store_not_ready, fault) = build_managed_runtime_status(
+            &gateway,
+            "prod",
+            "my-gw",
+            super::ManagedRuntimeInput::Applied(
+                converged_obs(),
+                RuntimeApplyResult::default(),
+                Box::new(snapshot_with_gateway_and_tls_secret(
+                    gateway.clone(),
+                    "prod",
+                    "valid-cert",
+                )),
+            ),
+        );
+
+        assert!(programmed);
+        assert!(!only_store_not_ready);
+        assert!(fault.is_none());
+
+        let listener = listener_named(&listeners, "https");
+        let resolved_refs = listener_condition(listener, "ResolvedRefs");
+
+        assert_eq!(resolved_refs.status, "True");
+        assert_eq!(listener.supported_kinds, vec![http_route_kind()]);
+        assert_eq!(listener.attached_routes, 0);
     }
 }
