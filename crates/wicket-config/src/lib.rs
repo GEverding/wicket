@@ -572,16 +572,25 @@ impl Config {
             }
         }
 
-        // Validate File config if mode is File or Mixed
+        // Validate File config if mode is File or Mixed.
+        //
+        // Unlike ACME (which requires explicit domains to provision certs),
+        // file-loaded certs may legitimately have an empty `domains` list:
+        // such a cert acts as the proxy's default certificate, served when
+        // an incoming TLS handshake's SNI does not match any other cert's
+        // SAN. We disallow MORE THAN ONE such default to keep selection
+        // unambiguous, but a single empty-domains cert is permitted.
         if matches!(tls.mode, TlsMode::File | TlsMode::Mixed) {
             if let Some(ref file) = tls.file {
                 if file.certs.is_empty() && matches!(tls.mode, TlsMode::File) {
                     anyhow::bail!("TLS file mode requires at least one cert config");
                 }
-                for cert in &file.certs {
-                    if cert.domains.is_empty() {
-                        anyhow::bail!("File cert config requires at least one domain");
-                    }
+                let default_cert_count = file.certs.iter().filter(|c| c.domains.is_empty()).count();
+                if default_cert_count > 1 {
+                    anyhow::bail!(
+                        "TLS file mode allows at most one default (empty-domains) cert; found {}",
+                        default_cert_count
+                    );
                 }
             } else if matches!(tls.mode, TlsMode::File) {
                 anyhow::bail!("TLS mode 'file' requires [tls.file] section");
@@ -1011,7 +1020,7 @@ path_prefix = "/"
     }
 
     #[test]
-    fn test_tls_cert_missing_domains() {
+    fn test_tls_cert_empty_domains_allowed_as_default() {
         let toml = r#"
 [server]
 listen = "0.0.0.0:8080"
@@ -1037,12 +1046,57 @@ upstream = "backend"
 path_prefix = "/"
 "#;
 
+        let cfg = Config::parse(toml).expect("empty domains should parse as default cert");
+        let tls = cfg.tls.expect("tls present");
+        let file = tls.file.expect("file tls present");
+        assert_eq!(file.certs.len(), 1);
+        assert!(
+            file.certs[0].domains.is_empty(),
+            "expected default cert to have no domains"
+        );
+    }
+
+    #[test]
+    fn test_tls_cert_multiple_default_certs_rejected() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[tls]
+mode = "file"
+
+[tls.file]
+watch = true
+
+[[tls.file.certs]]
+name = "first-default"
+cert = "/certs/a.crt"
+key = "/certs/a.key"
+domains = []
+
+[[tls.file.certs]]
+name = "second-default"
+cert = "/certs/b.crt"
+key = "/certs/b.key"
+domains = []
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
         let result = Config::parse(toml);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("requires at least one domain"));
+        assert!(result.is_err(), "two default certs should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("at most one default"),
+            "unexpected error: {}",
+            msg
+        );
     }
 
     #[test]
