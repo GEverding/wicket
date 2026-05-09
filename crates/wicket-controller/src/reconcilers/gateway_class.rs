@@ -15,6 +15,7 @@ use kube::{
 
 use crate::crds::{Condition, GatewayClass, GatewayClassStatus};
 use crate::metrics::{ReconcileMetrics, GATEWAY_CLASSES};
+use crate::reconcilers::store::ResourceClass;
 
 use super::context::Context;
 
@@ -402,24 +403,22 @@ pub async fn run_gateway_class_controller(ctx: Arc<Context>) -> Result<(), kube:
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match api.list(&Default::default()).await {
-            Ok(list) => {
+        match tokio::time::timeout(Duration::from_secs(30), api.list(&Default::default())).await {
+            Ok(Ok(list)) => {
                 for gc in list.items {
                     if gc.is_wicket_managed() {
                         let name = gc.metadata.name.clone().unwrap_or_default();
                         ctx.store.upsert_gateway_class(name, gc).await;
                     }
                 }
-                // Mark the resource class as listed only after a successful list.
-                // An empty list is a valid observation; a failed list is not.
-                ctx.store.mark_gateway_classes_listed().await;
+                ctx.store.mark_listed(ResourceClass::GatewayClasses).await;
                 tracing::debug!(
                     attempt,
                     "GatewayClass initial list complete; store flag set"
                 );
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let backoff = std::cmp::min(attempt * 2, 30);
                 tracing::warn!(
                     error = %e,
@@ -428,6 +427,13 @@ pub async fn run_gateway_class_controller(ctx: Arc<Context>) -> Result<(), kube:
                     "Initial GatewayClass list failed; will retry"
                 );
                 tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    attempt,
+                    "Initial GatewayClass list timed out after 30s; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }

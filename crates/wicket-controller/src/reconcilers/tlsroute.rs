@@ -25,7 +25,7 @@ use super::attachment_planner::{
 };
 use super::config_generator::GatewayState;
 use super::context::{trigger_config_update, Context};
-use super::store::SnapshotResult;
+use super::store::{ResourceClass, SnapshotResult};
 
 /// Error type for TLSRoute reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -683,19 +683,19 @@ pub async fn run_tlsroute_controller(ctx: Arc<Context>) -> Result<(), kube::Erro
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match api.list(&Default::default()).await {
-            Ok(list) => {
+        match tokio::time::timeout(Duration::from_secs(30), api.list(&Default::default())).await {
+            Ok(Ok(list)) => {
                 for route in list.items {
                     let ns = route.metadata.namespace.clone().unwrap_or_default();
                     let name = route.metadata.name.clone().unwrap_or_default();
                     let key = GatewayState::key(&ns, &name);
                     ctx.store.upsert_tls_route(key, route).await;
                 }
-                ctx.store.mark_tls_routes_listed().await;
+                ctx.store.mark_listed(ResourceClass::TlsRoutes).await;
                 tracing::debug!(attempt, "TLSRoute initial list complete; store flag set");
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let backoff = std::cmp::min(attempt * 2, 30);
                 tracing::warn!(
                     error = %e,
@@ -704,6 +704,13 @@ pub async fn run_tlsroute_controller(ctx: Arc<Context>) -> Result<(), kube::Erro
                     "Initial TLSRoute list failed; will retry"
                 );
                 tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    attempt,
+                    "Initial TLSRoute list timed out after 30s; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }

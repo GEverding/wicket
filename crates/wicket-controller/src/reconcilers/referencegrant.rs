@@ -20,6 +20,7 @@ use crate::metrics::{
     ReconcileMetrics, REFERENCE_GRANTS, WATCH_CONNECTIONS_ACTIVE, WATCH_ERRORS_TOTAL,
     WATCH_EVENTS_TOTAL,
 };
+use crate::reconcilers::store::ResourceClass;
 
 use super::context::{trigger_config_update, Context};
 
@@ -142,24 +143,22 @@ pub async fn run_referencegrant_controller(ctx: Arc<Context>) -> Result<(), kube
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match api.list(&Default::default()).await {
-            Ok(list) => {
+        match tokio::time::timeout(Duration::from_secs(30), api.list(&Default::default())).await {
+            Ok(Ok(list)) => {
                 for grant in list.items {
                     let ns = grant.metadata.namespace.clone().unwrap_or_default();
                     let name = grant.metadata.name.clone().unwrap_or_default();
                     let key = format!("{}/{}", ns, name);
                     ctx.store.upsert_reference_grant(key, grant).await;
                 }
-                // Mark the resource class as listed only after a successful list.
-                // An empty list is a valid observation; a failed list is not.
-                ctx.store.mark_reference_grants_listed().await;
+                ctx.store.mark_listed(ResourceClass::ReferenceGrants).await;
                 tracing::debug!(
                     attempt,
                     "ReferenceGrant initial list complete; store flag set"
                 );
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let backoff = std::cmp::min(attempt * 2, 30);
                 tracing::warn!(
                     error = %e,
@@ -168,6 +167,13 @@ pub async fn run_referencegrant_controller(ctx: Arc<Context>) -> Result<(), kube
                     "Initial ReferenceGrant list failed; will retry"
                 );
                 tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    attempt,
+                    "Initial ReferenceGrant list timed out after 30s; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }

@@ -35,7 +35,7 @@ use crate::reconcilers::runtime_plan::{
 use crate::reconcilers::status_helpers::{
     conditions_semantically_equal, preserve_condition_timestamps,
 };
-use crate::reconcilers::store::{PlannerSnapshot, SnapshotResult};
+use crate::reconcilers::store::{PlannerSnapshot, ResourceClass, SnapshotResult};
 
 use super::context::{trigger_config_update, Context};
 
@@ -1451,19 +1451,19 @@ pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match api.list(&Default::default()).await {
-            Ok(list) => {
+        match tokio::time::timeout(Duration::from_secs(30), api.list(&Default::default())).await {
+            Ok(Ok(list)) => {
                 for gateway in list.items {
                     let ns = gateway.metadata.namespace.clone().unwrap_or_default();
                     let name = gateway.metadata.name.clone().unwrap_or_default();
                     let key = super::config_generator::GatewayState::key(&ns, &name);
                     ctx.store.upsert_gateway(key, gateway).await;
                 }
-                ctx.store.mark_gateways_listed().await;
+                ctx.store.mark_listed(ResourceClass::Gateways).await;
                 tracing::debug!(attempt, "Gateway initial list complete; store flag set");
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let backoff = std::cmp::min(attempt * 2, 30);
                 tracing::warn!(
                     error = %e,
@@ -1472,6 +1472,13 @@ pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error
                     "Initial Gateway list failed; will retry"
                 );
                 tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    attempt,
+                    "Initial Gateway list timed out after 30s; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }

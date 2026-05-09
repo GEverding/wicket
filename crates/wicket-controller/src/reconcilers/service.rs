@@ -22,6 +22,7 @@ use crate::metrics::{
 
 use super::config_generator::{GatewayState, ServiceEndpoints};
 use super::context::{trigger_config_update, Context};
+use super::store::ResourceClass;
 
 /// Error type for Service/Endpoints reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -399,16 +400,16 @@ pub async fn run_endpoints_controller(ctx: Arc<Context>) -> Result<(), kube::Err
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match api.list(&Default::default()).await {
-            Ok(_) => {
-                ctx.store.mark_endpoints_listed().await;
+        match tokio::time::timeout(Duration::from_secs(30), api.list(&Default::default())).await {
+            Ok(Ok(_)) => {
+                ctx.store.mark_listed(ResourceClass::Endpoints).await;
                 tracing::debug!(
                     attempt,
                     "EndpointSlice initial list complete; store flag set"
                 );
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let backoff = std::cmp::min(attempt * 2, 30);
                 tracing::warn!(
                     error = %e,
@@ -417,6 +418,13 @@ pub async fn run_endpoints_controller(ctx: Arc<Context>) -> Result<(), kube::Err
                     "Initial EndpointSlice list failed; will retry"
                 );
                 tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    attempt,
+                    "Initial EndpointSlice list timed out after 30s; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }
@@ -553,13 +561,13 @@ pub async fn run_service_controller(ctx: Arc<Context>) -> Result<(), kube::Error
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match api.list(&Default::default()).await {
-            Ok(_) => {
-                ctx.store.mark_services_listed().await;
+        match tokio::time::timeout(Duration::from_secs(30), api.list(&Default::default())).await {
+            Ok(Ok(_)) => {
+                ctx.store.mark_listed(ResourceClass::Services).await;
                 tracing::debug!(attempt, "Service initial list complete; store flag set");
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let backoff = std::cmp::min(attempt * 2, 30);
                 tracing::warn!(
                     error = %e,
@@ -568,6 +576,13 @@ pub async fn run_service_controller(ctx: Arc<Context>) -> Result<(), kube::Error
                     "Initial Service list failed; will retry"
                 );
                 tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    attempt,
+                    "Initial Service list timed out after 30s; will retry"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }
