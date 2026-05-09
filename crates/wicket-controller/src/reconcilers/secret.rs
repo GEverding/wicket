@@ -25,7 +25,7 @@ use crate::metrics::{
 };
 
 use super::config_generator::GatewayState;
-use super::context::{trigger_config_update, Context};
+use super::context::Context;
 use super::store::ResourceClass;
 
 /// Error type for Secret reconciliation.
@@ -88,9 +88,6 @@ pub async fn reconcile_secret(
         }
 
         tracing::info!(namespace = %namespace, name = %name, "Secret deleted, removed from store");
-        trigger_config_update(&ctx, "Secret deleted")
-            .await
-            .map_err(|e| SecretError::ConfigError(e.to_string()))?;
         return Ok(Action::await_change());
     }
 
@@ -216,11 +213,6 @@ pub async fn reconcile_secret(
             key_path.to_string_lossy().to_string(),
         )
         .await;
-
-    // Trigger configuration regeneration via the shared path.
-    trigger_config_update(&ctx, "Secret reconciled")
-        .await
-        .map_err(|e| SecretError::ConfigError(e.to_string()))?;
 
     metrics.record_success();
     Ok(Action::requeue(Duration::from_secs(300))) // Recheck every 5 minutes
@@ -646,11 +638,7 @@ mod tests {
     use super::*;
     use crate::reconcilers::store::SharedStore;
 
-    /// Verify that the secret module no longer defines its own trigger_config_update.
-    ///
-    /// Compile-time assertion: if a local function with the old 5-argument signature
-    /// existed it would shadow the import and the two-argument call site above would
-    /// fail to compile.  This test confirms the store upsert path works in isolation.
+    /// Confirms the store upsert path works in isolation.
     #[tokio::test]
     async fn test_tls_secret_upsert_into_store() {
         let store = SharedStore::new();

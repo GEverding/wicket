@@ -21,7 +21,7 @@ use crate::metrics::{
 };
 
 use super::config_generator::{GatewayState, ServiceEndpoints};
-use super::context::{trigger_config_update, Context};
+use super::context::Context;
 use super::store::ResourceClass;
 
 /// Error type for Service/Endpoints reconciliation.
@@ -167,10 +167,6 @@ pub async fn reconcile_endpoint_slice(
     }
 
     // Trigger configuration regeneration.
-    trigger_config_update(&ctx, "EndpointSlice reconciled")
-        .await
-        .map_err(|e| ServiceError::ConfigError(e.to_string()))?;
-
     metrics.record_success();
     Ok(Action::requeue(Duration::from_secs(30)))
 }
@@ -513,10 +509,6 @@ pub async fn reconcile_service(
     }
 
     // Trigger configuration regeneration via the shared path.
-    trigger_config_update(&ctx, "Service reconciled")
-        .await
-        .map_err(|e| ServiceError::ConfigError(e.to_string()))?;
-
     metrics.record_success();
     Ok(Action::requeue(Duration::from_secs(300))) // Recheck every 5 minutes
 }
@@ -626,11 +618,6 @@ mod tests {
     use super::*;
     use crate::reconcilers::store::SharedStore;
 
-    /// Verify that the service module no longer defines its own trigger_config_update.
-    ///
-    /// This is a compile-time assertion: if a local `trigger_config_update` existed
-    /// with the old single-argument signature it would shadow the import and this
-    /// module would fail to compile with the two-argument call sites above.
     /// The test itself just confirms the store upsert path works in isolation.
     #[tokio::test]
     async fn test_endpoints_upsert_into_store() {

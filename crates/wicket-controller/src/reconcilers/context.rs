@@ -1,8 +1,4 @@
 //! Shared context for reconcilers.
-//!
-//! `trigger_config_update` is now a compatibility stub. The per-Gateway
-//! managed-runtime path owns proxy ConfigMap writes; this context no longer
-//! performs any central ConfigMap planning or apply work.
 
 use std::sync::Arc;
 
@@ -106,27 +102,4 @@ impl Context {
     pub async fn get_config(&self) -> WicketConfig {
         self.config.read().await.clone()
     }
-}
-
-/// Errors that can occur during configuration updates.
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigUpdateError {
-    /// A planning-phase error (pure logic; no I/O involved).
-    #[error("Config planning error: {0}")]
-    Planning(String),
-
-    /// TOML serialization or deserialization failed.
-    #[error("Failed to serialize configuration: {0}")]
-    Serialization(String),
-
-    /// A Kubernetes API call failed during the apply phase.
-    #[error("Kubernetes API error: {0}")]
-    KubeApi(String),
-}
-
-/// Trigger a configuration update from the shared store snapshot.
-pub async fn trigger_config_update(ctx: &Context, reason: &str) -> Result<(), ConfigUpdateError> {
-    let _ = ctx;
-    tracing::debug!(reason = %reason, "Central config update path removed; skipping");
-    Ok(())
 }

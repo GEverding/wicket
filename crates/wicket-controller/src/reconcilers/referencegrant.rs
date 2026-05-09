@@ -22,7 +22,7 @@ use crate::metrics::{
 };
 use crate::reconcilers::store::ResourceClass;
 
-use super::context::{trigger_config_update, Context};
+use super::context::Context;
 
 /// Error type for ReferenceGrant reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -50,9 +50,6 @@ pub async fn reconcile_referencegrant(
         let key = format!("{}/{}", namespace, name);
         ctx.store.remove_reference_grant(&key).await;
         tracing::info!(namespace = %namespace, name = %name, "ReferenceGrant deleted, removed from store");
-        trigger_config_update(&ctx, "ReferenceGrant deleted")
-            .await
-            .map_err(|e| ReferenceGrantError::ConfigError(e.to_string()))?;
         metrics.record_success();
         return Ok(Action::await_change());
     }
@@ -62,12 +59,6 @@ pub async fn reconcile_referencegrant(
     ctx.store
         .upsert_reference_grant(key, (*grant).clone())
         .await;
-
-    // Trigger a config/planner recompute so policy changes take effect
-    // immediately rather than waiting for an unrelated event.
-    trigger_config_update(&ctx, "ReferenceGrant upserted")
-        .await
-        .map_err(|e| ReferenceGrantError::ConfigError(e.to_string()))?;
 
     // Update the total count of ReferenceGrants
     update_referencegrant_metrics(&ctx.client).await;

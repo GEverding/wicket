@@ -5,19 +5,21 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::{
     api::{Api, Patch, PatchParams},
     runtime::{
         controller::{Action, Controller},
+        reflector::ObjectRef,
         watcher::Config,
     },
     Client, ResourceExt,
 };
 
 use crate::crds::{
-    AddressType, Condition, Gateway, GatewayClass, GatewayStatus, GatewayStatusAddress,
-    ListenerStatus, RouteGroupKind,
+    AddressType, Condition, Gateway, GatewayClass, GatewayStatus, GatewayStatusAddress, HTTPRoute,
+    ListenerStatus, ParentReference, ReferenceGrant, RouteGroupKind, TCPRoute, TLSRoute,
 };
 use crate::metrics::{
     ReconcileMetrics, GATEWAYS, GATEWAY_LISTENER_ATTACHED_ROUTES, GATEWAY_PROGRAMMED,
@@ -36,7 +38,7 @@ use crate::reconcilers::status_helpers::{
 };
 use crate::reconcilers::store::{PlannerSnapshot, ResourceClass, SnapshotResult};
 
-use super::context::{trigger_config_update, Context};
+use super::context::Context;
 
 /// Error type for Gateway reconciliation.
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +95,48 @@ fn gateway_status_semantically_equal(a: &GatewayStatus, b: &GatewayStatus) -> bo
     })
 }
 
+fn gateway_refs_from_parent_refs(
+    route_namespace: &str,
+    parent_refs: &[ParentReference],
+) -> Vec<ObjectRef<Gateway>> {
+    let mut refs = std::collections::HashSet::new();
+
+    for parent_ref in parent_refs {
+        let group_matches =
+            parent_ref.group.is_empty() || parent_ref.group == "gateway.networking.k8s.io";
+        if !group_matches || parent_ref.kind != "Gateway" {
+            continue;
+        }
+
+        let gateway_namespace = parent_ref.namespace.as_deref().unwrap_or(route_namespace);
+        refs.insert((gateway_namespace.to_string(), parent_ref.name.clone()));
+    }
+
+    let mut refs: Vec<ObjectRef<Gateway>> = refs
+        .into_iter()
+        .map(|(namespace, name)| ObjectRef::new(&name).within(&namespace))
+        .collect();
+    refs.sort_by(|a, b| {
+        a.namespace
+            .cmp(&b.namespace)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    refs
+}
+
+fn gateway_refs_from_keys(keys: Vec<(String, String)>) -> Vec<ObjectRef<Gateway>> {
+    let mut refs: Vec<ObjectRef<Gateway>> = keys
+        .into_iter()
+        .map(|(namespace, name)| ObjectRef::new(&name).within(&namespace))
+        .collect();
+    refs.sort_by(|a, b| {
+        a.namespace
+            .cmp(&b.namespace)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    refs
+}
+
 /// Reconcile a Gateway resource.
 pub async fn reconcile_gateway(
     gateway: Arc<Gateway>,
@@ -109,9 +153,6 @@ pub async fn reconcile_gateway(
         let key = super::config_generator::GatewayState::key(&namespace, &name);
         ctx.store.remove_gateway(&key).await;
         tracing::info!(namespace = %namespace, name = %name, "Gateway deleted, removed from store");
-        trigger_config_update(&ctx, "Gateway deleted")
-            .await
-            .map_err(|e| GatewayError::ConfigError(e.to_string()))?;
         return Ok(Action::await_change());
     }
 
@@ -185,25 +226,11 @@ pub async fn reconcile_gateway(
     // passed as a single typed value so build_managed_runtime_status can match
     // on it exhaustively rather than inspecting three parallel Options.
 
-    // Track whether the managed-runtime path produced a config-affecting change.
-    // When `false`, we skip `trigger_config_update` at the end since the planner
-    // already determined that the generated config is identical to the current one.
-    let mut managed_config_changed = false;
-
     // Resolve the managed-runtime input: observe, plan, apply.
     // Each arm produces a ManagedRuntimeInput variant that is passed
     // directly to build_managed_runtime_status (no Option wrapper).
     let managed_input = match reconcile_managed_runtime(&gateway, &ctx, &namespace, &name).await {
         Ok((observed, apply_result, snapshot_result)) => {
-            // Check if config actually changed via the managed-runtime
-            // applier.  When NoOp, we can skip the global config trigger.
-            managed_config_changed = apply_result.config_result.as_ref().is_some_and(|r| {
-                matches!(
-                    r,
-                    crate::reconcilers::contracts::ConfigApplyResult::Updated { .. }
-                )
-            }) || apply_result.service_changed
-                || apply_result.deployment_changed;
             ManagedRuntimeInput::Applied(observed, apply_result, Box::new(snapshot_result))
         }
         // StoreNotReady is a safe defer: the store is still warming up.
@@ -331,16 +358,6 @@ pub async fn reconcile_gateway(
 
     // Update metrics
     update_gateway_metrics(&ctx.client).await;
-
-    // Trigger configuration regeneration.
-    //
-    // Skip redundant config regeneration when the managed-runtime applier
-    // already determined that config, service, and deployment are unchanged.
-    if managed_config_changed {
-        trigger_config_update(&ctx, "Gateway reconciled")
-            .await
-            .map_err(|e| GatewayError::ConfigError(e.to_string()))?;
-    }
 
     // Requeue quickly while waiting for Deployment convergence; back off
     // once the Gateway is fully programmed.
@@ -1404,7 +1421,106 @@ pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error
         }
     }
 
+    let reverse_index = ctx.store.reverse_index();
+    let http_route_api: Api<HTTPRoute> = if ctx.watch_all_namespaces {
+        Api::all(ctx.client.clone())
+    } else {
+        Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
+    };
+    let tcp_route_api: Api<TCPRoute> = if ctx.watch_all_namespaces {
+        Api::all(ctx.client.clone())
+    } else {
+        Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
+    };
+    let tls_route_api: Api<TLSRoute> = if ctx.watch_all_namespaces {
+        Api::all(ctx.client.clone())
+    } else {
+        Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
+    };
+    let service_api: Api<Service> = if ctx.watch_all_namespaces {
+        Api::all(ctx.client.clone())
+    } else {
+        Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
+    };
+    let endpoint_slice_api: Api<EndpointSlice> = if ctx.watch_all_namespaces {
+        Api::all(ctx.client.clone())
+    } else {
+        Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
+    };
+    let secret_api: Api<Secret> = if ctx.watch_all_namespaces {
+        Api::all(ctx.client.clone())
+    } else {
+        Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
+    };
+    let reference_grant_api: Api<ReferenceGrant> = if ctx.watch_all_namespaces {
+        Api::all(ctx.client.clone())
+    } else {
+        Api::namespaced(ctx.client.clone(), &ctx.controller_namespace)
+    };
+
     Controller::new(api, Config::default())
+        .watches(http_route_api, Config::default(), {
+            move |route: HTTPRoute| -> Vec<ObjectRef<Gateway>> {
+                let namespace = route.namespace().unwrap_or_default();
+                gateway_refs_from_parent_refs(&namespace, &route.spec.parent_refs)
+            }
+        })
+        .watches(tcp_route_api, Config::default(), {
+            move |route: TCPRoute| -> Vec<ObjectRef<Gateway>> {
+                let namespace = route.namespace().unwrap_or_default();
+                gateway_refs_from_parent_refs(&namespace, &route.spec.parent_refs)
+            }
+        })
+        .watches(tls_route_api, Config::default(), {
+            move |route: TLSRoute| -> Vec<ObjectRef<Gateway>> {
+                let namespace = route.namespace().unwrap_or_default();
+                gateway_refs_from_parent_refs(&namespace, &route.spec.parent_refs)
+            }
+        })
+        .watches(service_api, Config::default(), {
+            let reverse_index = reverse_index.clone();
+            move |service: Service| -> Vec<ObjectRef<Gateway>> {
+                let namespace = service.namespace().unwrap_or_default();
+                let name = service.name_any();
+                gateway_refs_from_keys(reverse_index.gateways_for_service(&namespace, &name))
+            }
+        })
+        .watches(endpoint_slice_api, Config::default(), {
+            let reverse_index = reverse_index.clone();
+            move |slice: EndpointSlice| -> Vec<ObjectRef<Gateway>> {
+                let namespace = slice.namespace().unwrap_or_default();
+                let service_name = slice
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("kubernetes.io/service-name"))
+                    .cloned();
+                match service_name {
+                    Some(name) => gateway_refs_from_keys(
+                        reverse_index.gateways_for_service(&namespace, &name),
+                    ),
+                    None => Vec::new(),
+                }
+            }
+        })
+        .watches(secret_api, Config::default(), {
+            let reverse_index = reverse_index.clone();
+            move |secret: Secret| -> Vec<ObjectRef<Gateway>> {
+                let namespace = secret.namespace().unwrap_or_default();
+                let name = secret.name_any();
+                gateway_refs_from_keys(reverse_index.gateways_for_secret(&namespace, &name))
+            }
+        })
+        .watches(reference_grant_api, Config::default(), {
+            let reverse_index = reverse_index.clone();
+            move |grant: ReferenceGrant| -> Vec<ObjectRef<Gateway>> {
+                let namespace = grant.namespace().unwrap_or_default();
+                let name = grant.name_any();
+                gateway_refs_from_keys(
+                    reverse_index.gateways_for_reference_grant(&namespace, &name),
+                )
+            }
+        })
         .run(reconcile_gateway, error_policy_gateway, ctx)
         .for_each(|result| async move {
             match result {

@@ -24,7 +24,7 @@ use super::attachment_planner::{
     AttachmentPlan, AttachmentPlanInput, AttachmentPlanner, AttachmentStatus,
 };
 use super::config_generator::GatewayState;
-use super::context::{trigger_config_update, Context};
+use super::context::Context;
 use super::store::{ResourceClass, SnapshotResult};
 
 /// Error type for TCPRoute reconciliation.
@@ -56,9 +56,6 @@ pub async fn reconcile_tcproute(
         let key = GatewayState::key(&namespace, &name);
         ctx.store.remove_tcp_route(&key).await;
         tracing::info!(namespace = %namespace, name = %name, "TCPRoute deleted, removed from store");
-        trigger_config_update(&ctx, "TCPRoute deleted")
-            .await
-            .map_err(|e| TCPRouteError::ConfigError(e.to_string()))?;
         return Ok(Action::await_change());
     }
 
@@ -281,9 +278,6 @@ pub async fn reconcile_tcproute(
             .upsert_tcp_route(route_key, route_with_status)
             .await;
 
-        trigger_config_update(&ctx, "TCPRoute reconciled")
-            .await
-            .map_err(|e| TCPRouteError::ConfigError(e.to_string()))?;
         tracing::info!(namespace = %namespace, name = %name, "TCPRoute accepted");
 
         // Update route acceptance metrics for each valid parent
@@ -313,10 +307,6 @@ pub async fn reconcile_tcproute(
         );
 
         // Trigger config regeneration so the proxy stops serving the stale route.
-        trigger_config_update(&ctx, "TCPRoute lost all valid parents")
-            .await
-            .map_err(|e| TCPRouteError::ConfigError(e.to_string()))?;
-
         // Track rejection reasons
         for parent_status in &status.parents {
             for condition in &parent_status.conditions {

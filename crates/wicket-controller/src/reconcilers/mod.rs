@@ -33,7 +33,7 @@ pub mod runtime_plan;
 pub mod status_helpers;
 
 pub use config_generator::*;
-pub use context::{trigger_config_update, *};
+pub use context::*;
 pub use gateway::*;
 pub use gateway_class::*;
 pub use httproute::*;

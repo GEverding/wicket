@@ -53,6 +53,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 
 use tokio::sync::RwLock;
 
@@ -335,6 +336,252 @@ fn route_references_gateway(
     })
 }
 
+fn route_parent_gateways(
+    route_namespace: &str,
+    parent_refs: &[crate::crds::ParentReference],
+) -> HashSet<(String, String)> {
+    let mut gateways = HashSet::new();
+
+    for parent_ref in parent_refs {
+        let group_matches =
+            parent_ref.group.is_empty() || parent_ref.group == "gateway.networking.k8s.io";
+        let kind_matches = parent_ref.kind == "Gateway";
+        if !group_matches || !kind_matches {
+            continue;
+        }
+
+        let gateway_ns = parent_ref
+            .namespace
+            .as_deref()
+            .unwrap_or(route_namespace)
+            .to_string();
+        gateways.insert((gateway_ns, parent_ref.name.clone()));
+    }
+
+    gateways
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReverseIndex {
+    inner: Arc<StdRwLock<ReverseIndexInner>>,
+}
+
+#[derive(Default, Debug)]
+struct ReverseIndexInner {
+    http_route_to_gateways: HashMap<(String, String), HashSet<(String, String)>>,
+    tcp_route_to_gateways: HashMap<(String, String), HashSet<(String, String)>>,
+    tls_route_to_gateways: HashMap<(String, String), HashSet<(String, String)>>,
+    service_to_gateways: HashMap<(String, String), HashSet<(String, String)>>,
+    secret_to_gateways: HashMap<(String, String), HashSet<(String, String)>>,
+    reference_grant_to_gateways: HashMap<(String, String), HashSet<(String, String)>>,
+}
+
+impl ReverseIndex {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, ReverseIndexInner> {
+        self.inner.write().expect("reverse_index lock poisoned")
+    }
+
+    fn read_inner(&self) -> std::sync::RwLockReadGuard<'_, ReverseIndexInner> {
+        self.inner.read().expect("reverse_index lock poisoned")
+    }
+
+    pub fn rebuild_from_store(&self, inner: &StoreInner) {
+        let mut index = ReverseIndexInner::default();
+
+        for gateway in inner.gateways.values() {
+            let gateway_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
+            let gateway_name = gateway.metadata.name.as_deref().unwrap_or("");
+            let gateway_key = (gateway_ns.to_string(), gateway_name.to_string());
+
+            for listener in &gateway.spec.listeners {
+                if let Some(tls) = &listener.tls {
+                    for cert_ref in &tls.certificate_refs {
+                        let cert_ns = cert_ref
+                            .namespace
+                            .as_deref()
+                            .unwrap_or(gateway_ns)
+                            .to_string();
+                        let cert_key = (cert_ns.clone(), cert_ref.name.clone());
+                        index
+                            .secret_to_gateways
+                            .entry(cert_key.clone())
+                            .or_default()
+                            .insert(gateway_key.clone());
+                        if cert_ns != gateway_ns {
+                            index
+                                .reference_grant_to_gateways
+                                .entry((cert_ns, cert_ref.name.clone()))
+                                .or_default()
+                                .insert(gateway_key.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        for route in inner.http_routes.values() {
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            let route_name = route.metadata.name.as_deref().unwrap_or("");
+            let route_key = (route_ns.to_string(), route_name.to_string());
+            let gateways = route_parent_gateways(route_ns, &route.spec.parent_refs);
+            index
+                .http_route_to_gateways
+                .insert(route_key, gateways.clone());
+
+            for rule in &route.spec.rules {
+                for backend_ref in &rule.backend_refs {
+                    let br = &backend_ref.backend_ref;
+                    if !is_core_service_ref(&br.group, &br.kind) {
+                        continue;
+                    }
+                    let service_ns = br.namespace.as_deref().unwrap_or(route_ns).to_string();
+                    let service_key = (service_ns.clone(), br.name.clone());
+                    index
+                        .service_to_gateways
+                        .entry(service_key.clone())
+                        .or_default()
+                        .extend(gateways.iter().cloned());
+                    if service_ns != route_ns {
+                        index
+                            .reference_grant_to_gateways
+                            .entry((service_ns, br.name.clone()))
+                            .or_default()
+                            .extend(gateways.iter().cloned());
+                    }
+                }
+            }
+        }
+
+        for route in inner.tcp_routes.values() {
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            let route_name = route.metadata.name.as_deref().unwrap_or("");
+            let route_key = (route_ns.to_string(), route_name.to_string());
+            let gateways = route_parent_gateways(route_ns, &route.spec.parent_refs);
+            index
+                .tcp_route_to_gateways
+                .insert(route_key, gateways.clone());
+
+            for rule in &route.spec.rules {
+                for backend_ref in &rule.backend_refs {
+                    if !is_core_service_ref(&backend_ref.group, &backend_ref.kind) {
+                        continue;
+                    }
+                    let service_ns = backend_ref
+                        .namespace
+                        .as_deref()
+                        .unwrap_or(route_ns)
+                        .to_string();
+                    let service_key = (service_ns.clone(), backend_ref.name.clone());
+                    index
+                        .service_to_gateways
+                        .entry(service_key.clone())
+                        .or_default()
+                        .extend(gateways.iter().cloned());
+                    if service_ns != route_ns {
+                        index
+                            .reference_grant_to_gateways
+                            .entry((service_ns, backend_ref.name.clone()))
+                            .or_default()
+                            .extend(gateways.iter().cloned());
+                    }
+                }
+            }
+        }
+
+        for route in inner.tls_routes.values() {
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            let route_name = route.metadata.name.as_deref().unwrap_or("");
+            let route_key = (route_ns.to_string(), route_name.to_string());
+            let gateways = route_parent_gateways(route_ns, &route.spec.parent_refs);
+            index
+                .tls_route_to_gateways
+                .insert(route_key, gateways.clone());
+
+            for rule in &route.spec.rules {
+                for backend_ref in &rule.backend_refs {
+                    if !is_core_service_ref(&backend_ref.group, &backend_ref.kind) {
+                        continue;
+                    }
+                    let service_ns = backend_ref
+                        .namespace
+                        .as_deref()
+                        .unwrap_or(route_ns)
+                        .to_string();
+                    let service_key = (service_ns.clone(), backend_ref.name.clone());
+                    index
+                        .service_to_gateways
+                        .entry(service_key.clone())
+                        .or_default()
+                        .extend(gateways.iter().cloned());
+                    if service_ns != route_ns {
+                        index
+                            .reference_grant_to_gateways
+                            .entry((service_ns, backend_ref.name.clone()))
+                            .or_default()
+                            .extend(gateways.iter().cloned());
+                    }
+                }
+            }
+        }
+
+        *self.write_inner() = index;
+    }
+
+    fn gateways_for_key(
+        &self,
+        map: impl FnOnce(&ReverseIndexInner) -> &HashMap<(String, String), HashSet<(String, String)>>,
+        namespace: &str,
+        name: &str,
+    ) -> Vec<(String, String)> {
+        let inner = self.read_inner();
+        let mut gateways: Vec<(String, String)> = map(&inner)
+            .get(&(namespace.to_string(), name.to_string()))
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        gateways.sort();
+        gateways
+    }
+
+    #[must_use]
+    pub fn gateways_for_http_route(&self, namespace: &str, name: &str) -> Vec<(String, String)> {
+        self.gateways_for_key(|inner| &inner.http_route_to_gateways, namespace, name)
+    }
+
+    #[must_use]
+    pub fn gateways_for_tcp_route(&self, namespace: &str, name: &str) -> Vec<(String, String)> {
+        self.gateways_for_key(|inner| &inner.tcp_route_to_gateways, namespace, name)
+    }
+
+    #[must_use]
+    pub fn gateways_for_tls_route(&self, namespace: &str, name: &str) -> Vec<(String, String)> {
+        self.gateways_for_key(|inner| &inner.tls_route_to_gateways, namespace, name)
+    }
+
+    #[must_use]
+    pub fn gateways_for_service(&self, namespace: &str, name: &str) -> Vec<(String, String)> {
+        self.gateways_for_key(|inner| &inner.service_to_gateways, namespace, name)
+    }
+
+    #[must_use]
+    pub fn gateways_for_secret(&self, namespace: &str, name: &str) -> Vec<(String, String)> {
+        self.gateways_for_key(|inner| &inner.secret_to_gateways, namespace, name)
+    }
+
+    #[must_use]
+    pub fn gateways_for_reference_grant(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Vec<(String, String)> {
+        self.gateways_for_key(|inner| &inner.reference_grant_to_gateways, namespace, name)
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Inner state
 // ─────────────────────────────────────────────────────────────────────────────
@@ -570,6 +817,7 @@ impl StoreInner {
 #[derive(Clone, Debug)]
 pub struct SharedStore {
     inner: Arc<RwLock<StoreInner>>,
+    reverse_index: ReverseIndex,
 }
 
 impl Default for SharedStore {
@@ -582,7 +830,13 @@ impl SharedStore {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(StoreInner::default())),
+            reverse_index: ReverseIndex::new(),
         }
+    }
+
+    #[must_use]
+    pub fn reverse_index(&self) -> ReverseIndex {
+        self.reverse_index.clone()
     }
 
     // ── Readiness ────────────────────────────────────────────────────────────
@@ -783,12 +1037,16 @@ impl SharedStore {
 
     /// Upsert a Gateway.
     pub async fn upsert_gateway(&self, key: String, gateway: Gateway) {
-        self.inner.write().await.gateways.insert(key, gateway);
+        let mut inner = self.inner.write().await;
+        inner.gateways.insert(key, gateway);
+        self.reverse_index.rebuild_from_store(&inner);
     }
 
     /// Remove a Gateway.
     pub async fn remove_gateway(&self, key: &str) {
-        self.inner.write().await.gateways.remove(key);
+        let mut inner = self.inner.write().await;
+        inner.gateways.remove(key);
+        self.reverse_index.rebuild_from_store(&inner);
     }
 
     /// Upsert a GatewayClass.
@@ -801,6 +1059,7 @@ impl SharedStore {
         let mut inner = self.inner.write().await;
         inner.http_routes.insert(key, route);
         inner.rebuild_service_index();
+        self.reverse_index.rebuild_from_store(&inner);
     }
 
     /// Remove an HTTPRoute and rebuild the service index.
@@ -808,6 +1067,7 @@ impl SharedStore {
         let mut inner = self.inner.write().await;
         inner.http_routes.remove(key);
         inner.rebuild_service_index();
+        self.reverse_index.rebuild_from_store(&inner);
     }
 
     /// Upsert a TCPRoute and rebuild the service index.
@@ -815,6 +1075,7 @@ impl SharedStore {
         let mut inner = self.inner.write().await;
         inner.tcp_routes.insert(key, route);
         inner.rebuild_service_index();
+        self.reverse_index.rebuild_from_store(&inner);
     }
 
     /// Remove a TCPRoute and rebuild the service index.
@@ -822,6 +1083,7 @@ impl SharedStore {
         let mut inner = self.inner.write().await;
         inner.tcp_routes.remove(key);
         inner.rebuild_service_index();
+        self.reverse_index.rebuild_from_store(&inner);
     }
 
     /// Upsert a TLSRoute and rebuild the service index.
@@ -829,6 +1091,7 @@ impl SharedStore {
         let mut inner = self.inner.write().await;
         inner.tls_routes.insert(key, route);
         inner.rebuild_service_index();
+        self.reverse_index.rebuild_from_store(&inner);
     }
 
     /// Remove a TLSRoute and rebuild the service index.
@@ -836,6 +1099,7 @@ impl SharedStore {
         let mut inner = self.inner.write().await;
         inner.tls_routes.remove(key);
         inner.rebuild_service_index();
+        self.reverse_index.rebuild_from_store(&inner);
     }
 
     /// Upsert service endpoints.
@@ -911,6 +1175,8 @@ impl SharedStore {
     pub async fn replace_all(&self, mut new_inner: StoreInner) {
         new_inner.rebuild_service_index();
         *self.inner.write().await = new_inner;
+        let inner = self.inner.read().await;
+        self.reverse_index.rebuild_from_store(&inner);
     }
 
     /// Ingest a [`GatewayState`] snapshot into the store atomically.
@@ -934,6 +1200,7 @@ impl SharedStore {
         }
 
         inner.rebuild_service_index();
+        self.reverse_index.rebuild_from_store(&inner);
     }
 }
 
@@ -945,8 +1212,9 @@ impl SharedStore {
 mod tests {
     use super::*;
     use crate::crds::{
-        BackendRef, Gateway, GatewaySpec, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec, Listener,
-        ParentReference, ProtocolType, TCPRoute, TLSRoute,
+        BackendRef, Gateway, GatewaySpec, GatewayTLSConfig, HTTPBackendRef, HTTPRouteRule,
+        HTTPRouteSpec, Listener, ParentReference, ProtocolType, SecretObjectReference, TCPRoute,
+        TLSModeType, TLSRoute,
     };
     use crate::reconcilers::attachment_planner::{AttachmentPlanInput, AttachmentPlanner};
     use crate::reconcilers::contracts::Planner;
@@ -992,6 +1260,27 @@ mod tests {
             },
             status: None,
         }
+    }
+
+    fn make_gateway_with_secret_ref(
+        name: &str,
+        namespace: &str,
+        secret_namespace: &str,
+        secret_name: &str,
+    ) -> Gateway {
+        let mut gateway = make_gateway(name, namespace);
+        gateway.spec.listeners[0].tls = Some(GatewayTLSConfig {
+            mode: TLSModeType::Terminate,
+            certificate_refs: vec![SecretObjectReference {
+                group: "".to_string(),
+                kind: "Secret".to_string(),
+                name: secret_name.to_string(),
+                namespace: Some(secret_namespace.to_string()),
+            }],
+            options: None,
+            frontend_validation: None,
+        });
+        gateway
     }
 
     fn ready_gateway_state(name: &str, namespace: &str) -> GatewayState {
@@ -1454,6 +1743,119 @@ mod tests {
         assert_eq!(
             cert, "/real/cert.crt",
             "existing TLS path should not be overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reverse_index_route_lookups_and_route_removal() {
+        let store = SharedStore::new();
+
+        store
+            .upsert_gateway("gw-ns/gw-a".to_string(), make_gateway("gw-a", "gw-ns"))
+            .await;
+
+        let mut http_route = make_http_route("http-route", "route-ns", Some("svc-ns"), "svc-a");
+        http_route.spec.parent_refs = vec![make_parent_ref("gw-ns", "gw-a")];
+        store
+            .upsert_http_route("route-ns/http-route".to_string(), http_route)
+            .await;
+
+        store
+            .upsert_tcp_route(
+                "route-ns/tcp-route".to_string(),
+                make_tcp_route_with_parent("tcp-route", "route-ns", "tcp-svc", "gw-ns", "gw-a"),
+            )
+            .await;
+        store
+            .upsert_tls_route(
+                "route-ns/tls-route".to_string(),
+                make_tls_route_with_parent("tls-route", "route-ns", "tls-svc", "gw-ns", "gw-a"),
+            )
+            .await;
+
+        let expected = vec![("gw-ns".to_string(), "gw-a".to_string())];
+        assert_eq!(
+            store
+                .reverse_index()
+                .gateways_for_http_route("route-ns", "http-route"),
+            expected
+        );
+        assert_eq!(
+            store
+                .reverse_index()
+                .gateways_for_tcp_route("route-ns", "tcp-route"),
+            expected
+        );
+        assert_eq!(
+            store
+                .reverse_index()
+                .gateways_for_tls_route("route-ns", "tls-route"),
+            expected
+        );
+        assert_eq!(
+            store
+                .reverse_index()
+                .gateways_for_service("svc-ns", "svc-a"),
+            expected
+        );
+        assert_eq!(
+            store
+                .reverse_index()
+                .gateways_for_reference_grant("svc-ns", "svc-a"),
+            expected
+        );
+
+        store.remove_http_route("route-ns/http-route").await;
+
+        assert!(store
+            .reverse_index()
+            .gateways_for_http_route("route-ns", "http-route")
+            .is_empty());
+        assert!(store
+            .reverse_index()
+            .gateways_for_service("svc-ns", "svc-a")
+            .is_empty());
+        assert!(store
+            .reverse_index()
+            .gateways_for_reference_grant("svc-ns", "svc-a")
+            .is_empty());
+        assert_eq!(
+            store
+                .reverse_index()
+                .gateways_for_tcp_route("route-ns", "tcp-route"),
+            expected
+        );
+        assert_eq!(
+            store
+                .reverse_index()
+                .gateways_for_tls_route("route-ns", "tls-route"),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reverse_index_secret_lookup() {
+        let store = SharedStore::new();
+
+        store
+            .upsert_gateway(
+                "gw-ns/gw-secret".to_string(),
+                make_gateway_with_secret_ref("gw-secret", "gw-ns", "tls-ns", "tls-cert"),
+            )
+            .await;
+
+        let expected = vec![("gw-ns".to_string(), "gw-secret".to_string())];
+        assert_eq!(
+            store
+                .reverse_index()
+                .gateways_for_secret("tls-ns", "tls-cert"),
+            expected
+        );
+        assert_eq!(
+            store
+                .reverse_index()
+                .gateways_for_reference_grant("tls-ns", "tls-cert"),
+            expected
         );
     }
 

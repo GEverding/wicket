@@ -24,7 +24,7 @@ use super::attachment_planner::{
     AttachmentPlan, AttachmentPlanInput, AttachmentPlanner, AttachmentStatus,
 };
 use super::config_generator::GatewayState;
-use super::context::{trigger_config_update, Context};
+use super::context::Context;
 use super::store::{ResourceClass, SnapshotResult};
 
 /// Error type for TLSRoute reconciliation.
@@ -56,9 +56,6 @@ pub async fn reconcile_tlsroute(
         let key = GatewayState::key(&namespace, &name);
         ctx.store.remove_tls_route(&key).await;
         tracing::info!(namespace = %namespace, name = %name, "TLSRoute deleted, removed from store");
-        trigger_config_update(&ctx, "TLSRoute deleted")
-            .await
-            .map_err(|e| TLSRouteError::ConfigError(e.to_string()))?;
         return Ok(Action::await_change());
     }
 
@@ -280,9 +277,6 @@ pub async fn reconcile_tlsroute(
             .upsert_tls_route(route_key, route_with_status)
             .await;
 
-        trigger_config_update(&ctx, "TLSRoute reconciled")
-            .await
-            .map_err(|e| TLSRouteError::ConfigError(e.to_string()))?;
         tracing::info!(
             namespace = %namespace,
             name = %name,
@@ -317,10 +311,6 @@ pub async fn reconcile_tlsroute(
         );
 
         // Trigger config regeneration so the proxy stops serving the stale route.
-        trigger_config_update(&ctx, "TLSRoute lost all valid parents")
-            .await
-            .map_err(|e| TLSRouteError::ConfigError(e.to_string()))?;
-
         // Track rejection reasons.
         for parent_status in &status.parents {
             for condition in &parent_status.conditions {
