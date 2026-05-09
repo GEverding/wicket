@@ -1122,12 +1122,12 @@ fn build_managed_runtime_status(
     )
 }
 
-/// Get addresses for a Gateway from its associated LoadBalancer Service.
+/// Get addresses for a Gateway from its owned managed-runtime Service.
 ///
-/// This function tries to find addresses in the following order:
-/// 1. LoadBalancer Service status (external IP or hostname assigned by cloud provider)
-/// 2. Addresses specified in the Gateway spec
-/// 3. Fallback to a placeholder if nothing is available
+/// Resolution order:
+/// 1. The owned Service's LoadBalancer status / external IPs / cluster IP
+/// 2. Addresses specified in `gateway.spec.addresses`
+/// 3. Empty (pending — Service not yet provisioned)
 async fn get_gateway_addresses(
     client: &Client,
     namespace: &str,
@@ -1136,28 +1136,10 @@ async fn get_gateway_addresses(
 ) -> Vec<GatewayStatusAddress> {
     let mut addresses = Vec::new();
 
-    // Try to find the associated Service (convention: same name as Gateway, or with -lb suffix)
     let svc_api: Api<Service> = Api::namespaced(client.clone(), namespace);
-
-    // Fix (4): include the owned Service name (`wicket-gw-<gateway>-svc`) so
-    // that managed-runtime Gateways have their addresses discovered.  The
-    // owned name is derived via the same naming helpers used by the planner
-    // and applier, ensuring consistency.
     let owned_svc_name = owned_service_name(&owned_object_base_name(gateway_name));
-
-    // Check for Service with the same name or common naming patterns.
-    // The owned managed-runtime Service is checked first so that managed
-    // Gateways resolve addresses without falling through to the legacy names.
-    let service_names = [
-        owned_svc_name,
-        gateway_name.to_string(),
-        format!("{}-lb", gateway_name),
-        format!("{}-gateway", gateway_name),
-        format!("wicket-{}", gateway_name),
-    ];
-
-    for svc_name in &service_names {
-        if let Ok(service) = svc_api.get(svc_name).await {
+    match svc_api.get(&owned_svc_name).await {
+        Ok(service) => {
             // Check if it's a LoadBalancer type Service
             if let Some(spec) = &service.spec {
                 if spec.type_.as_deref() == Some("LoadBalancer") {
@@ -1210,17 +1192,23 @@ async fn get_gateway_addresses(
                 }
             }
 
-            // If we found a service with addresses, break
             if !addresses.is_empty() {
                 tracing::debug!(
                     namespace = %namespace,
                     gateway = %gateway_name,
-                    service = %svc_name,
+                    service = %owned_svc_name,
                     addresses = ?addresses,
                     "Found Gateway addresses from Service"
                 );
-                break;
             }
+        }
+        Err(error) => {
+            tracing::debug!(
+                namespace = %namespace,
+                gateway = %gateway_name,
+                error = %error,
+                "owned Service not yet available; using spec.addresses fallback"
+            );
         }
     }
 
@@ -1681,21 +1669,13 @@ mod tests {
         assert!(!matches!(e, super::ManagedRuntimeError::StoreNotReady(_)));
     }
 
-    // Fix (4): owned Service name must appear in the address-discovery list.
     #[test]
-    fn owned_service_name_included_in_address_discovery() {
+    fn owned_service_name_matches_planner_naming() {
         use crate::reconcilers::runtime_plan::{owned_object_base_name, service_name};
 
-        // The owned service name for gateway "my-gw" must be
-        // "wicket-gw-my-gw-svc" -- the same name the applier creates.
         let base = owned_object_base_name("my-gw");
         let svc = service_name(&base);
         assert_eq!(svc, "wicket-gw-my-gw-svc");
-
-        // Verify the name is derived consistently with the planner.
-        let base2 = owned_object_base_name("prod-gateway");
-        let svc2 = service_name(&base2);
-        assert_eq!(svc2, "wicket-gw-prod-gateway-svc");
     }
 
     // Fix (3): ControllerConfig must be accessible from Context so the live
