@@ -915,10 +915,6 @@ impl SharedStore {
 
     /// Ingest a [`GatewayState`] snapshot into the store atomically.
     ///
-    /// **Callers must only call this when all core API lists succeeded.**
-    /// A partial snapshot would lock in missing resources and prevent future
-    /// fallback retries (see `trigger_config_update` for the guard).
-    ///
     /// Existing TLS secret entries are preserved — the snapshot may not carry
     /// them (they are written by the secret reconciler).
     pub async fn ingest_gateway_state(&self, state: GatewayState) {

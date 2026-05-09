@@ -87,7 +87,7 @@ impl Planner for GlobalConfigPlanner {
     fn plan(&self, input: &GlobalConfigPlanInput) -> Result<ConfigPlan, PlanError> {
         // Generate config deterministically so that HashMap iteration order
         // does not affect the output or the resulting hash.
-        let config: WicketConfig = input.gateway_state.generate_config_deterministic();
+        let config: WicketConfig = input.gateway_state.generate_config();
 
         // Serialize to TOML.  Surface any serialization failure as a planning
         // error rather than silently falling back to a minimal config.

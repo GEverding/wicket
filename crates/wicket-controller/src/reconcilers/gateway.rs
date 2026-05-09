@@ -28,9 +28,8 @@ use crate::reconcilers::runtime_applier::{
     apply_runtime_plan, RuntimeApplierInput, RuntimeApplyResult, SPEC_REVISION_ANNOTATION,
 };
 use crate::reconcilers::runtime_plan::{
-    is_managed_runtime, is_rollout_converged, owned_object_base_name,
-    service_name as owned_service_name, GatewayRuntimePlanner, ObservedRuntimeState,
-    RuntimePlanInput,
+    is_rollout_converged, owned_object_base_name, service_name as owned_service_name,
+    GatewayRuntimePlanner, ObservedRuntimeState, RuntimePlanInput,
 };
 use crate::reconcilers::status_helpers::{
     conditions_semantically_equal, preserve_condition_timestamps,
@@ -168,20 +167,6 @@ pub async fn reconcile_gateway(
     }
 
     // ── Managed-runtime orchestration ─────────────────────────────────────────
-    // Gate on the `wicket.io/managed-runtime: "true"` annotation.  Only after
-    // GatewayClass ownership has been confirmed above.
-    //
-    // `deferred_observation_error` carries an ObservationError that must still
-    // trigger a requeue-with-backoff, but only AFTER patch_status has run so
-    // operators see an accurate Programmed=False / ObservationFault condition
-    // rather than stale success.  Plan and Apply errors still exit immediately
-    // because no useful status can be built from them.
-    //
-    // `managed_input` is a single typed value that encodes which of the three
-    // mutually exclusive sub-reconcile outcomes applies (success, store-not-ready,
-    // or observation fault).  It replaces the three parallel Option parameters
-    // that were previously threaded into build_managed_runtime_status.
-    //
     // `deferred_observation_error` carries an ObservationError that must still
     // trigger a requeue-with-backoff, but only AFTER patch_status has run so
     // operators see an accurate Programmed=False / ObservationFault condition
@@ -199,73 +184,62 @@ pub async fn reconcile_gateway(
     // outcomes applies (Applied, StoreNotReady, or ObservationFault).  It is
     // passed as a single typed value so build_managed_runtime_status can match
     // on it exhaustively rather than inspecting three parallel Options.
-    //
-    // For legacy (non-managed) Gateways the existing behavior is preserved:
-    // attached_routes = 0 and Programmed = True unconditionally.
 
     // Track whether the managed-runtime path produced a config-affecting change.
     // When `false`, we skip `trigger_config_update` at the end since the planner
     // already determined that the generated config is identical to the current one.
     let mut managed_config_changed = false;
 
-    let (listener_statuses, gateway_programmed, only_store_not_ready, gateway_observation_fault) =
-        if is_managed_runtime(&gateway) {
-            // Resolve the managed-runtime input: observe, plan, apply.
-            // Each arm produces a ManagedRuntimeInput variant that is passed
-            // directly to build_managed_runtime_status (no Option wrapper).
-            let managed_input = match reconcile_managed_runtime(&gateway, &ctx, &namespace, &name)
-                .await
-            {
-                Ok((observed, apply_result, snapshot_result)) => {
-                    // Check if config actually changed via the managed-runtime
-                    // applier.  When NoOp, we can skip the global config trigger.
-                    managed_config_changed = apply_result.config_result.as_ref().is_some_and(|r| {
-                        matches!(
-                            r,
-                            crate::reconcilers::contracts::ConfigApplyResult::Updated { .. }
-                        )
-                    }) || apply_result.service_changed
-                        || apply_result.deployment_changed;
-                    ManagedRuntimeInput::Applied(observed, apply_result, Box::new(snapshot_result))
-                }
-                // StoreNotReady is a safe defer: the store is still warming up.
-                // The observed state is carried so the status path can reuse it
-                // without a second Kubernetes API read.
-                // This must NOT increment error metrics.
-                Err(ManagedRuntimeError::StoreNotReady(observed)) => {
-                    tracing::warn!(
-                        namespace = %namespace,
-                        name = %name,
-                        "Managed-runtime planning deferred: store not ready (will retry)"
-                    );
-                    ManagedRuntimeInput::StoreNotReady(observed)
-                }
-                // ObservationError: a non-404 Kubernetes API fault (e.g. RBAC).
-                // We must still patch Gateway status so operators see
-                // Programmed=False / ObservationFault instead of stale success.
-                // Defer the error; it is returned after patch_status below.
-                Err(ManagedRuntimeError::ObservationError(msg)) => {
-                    tracing::warn!(
-                        namespace = %namespace,
-                        name = %name,
-                        error = %msg,
-                        "Managed-runtime observation fault; will patch status then requeue"
-                    );
-                    deferred_observation_error = Some(GatewayError::RuntimeApplyError(msg.clone()));
-                    ManagedRuntimeInput::ObservationFault(msg)
-                }
-                // Planning and apply failures are real errors: propagate so the
-                // outer reconcile cycle requeues with backoff and increments the
-                // error counter.
-                Err(e) => return Err(GatewayError::RuntimeApplyError(e.to_string())),
-            };
+    // Resolve the managed-runtime input: observe, plan, apply.
+    // Each arm produces a ManagedRuntimeInput variant that is passed
+    // directly to build_managed_runtime_status (no Option wrapper).
+    let managed_input = match reconcile_managed_runtime(&gateway, &ctx, &namespace, &name).await {
+        Ok((observed, apply_result, snapshot_result)) => {
+            // Check if config actually changed via the managed-runtime
+            // applier.  When NoOp, we can skip the global config trigger.
+            managed_config_changed = apply_result.config_result.as_ref().is_some_and(|r| {
+                matches!(
+                    r,
+                    crate::reconcilers::contracts::ConfigApplyResult::Updated { .. }
+                )
+            }) || apply_result.service_changed
+                || apply_result.deployment_changed;
+            ManagedRuntimeInput::Applied(observed, apply_result, Box::new(snapshot_result))
+        }
+        // StoreNotReady is a safe defer: the store is still warming up.
+        // The observed state is carried so the status path can reuse it
+        // without a second Kubernetes API read.
+        // This must NOT increment error metrics.
+        Err(ManagedRuntimeError::StoreNotReady(observed)) => {
+            tracing::warn!(
+                namespace = %namespace,
+                name = %name,
+                "Managed-runtime planning deferred: store not ready (will retry)"
+            );
+            ManagedRuntimeInput::StoreNotReady(observed)
+        }
+        // ObservationError: a non-404 Kubernetes API fault (e.g. RBAC).
+        // We must still patch Gateway status so operators see
+        // Programmed=False / ObservationFault instead of stale success.
+        // Defer the error; it is returned after patch_status below.
+        Err(ManagedRuntimeError::ObservationError(msg)) => {
+            tracing::warn!(
+                namespace = %namespace,
+                name = %name,
+                error = %msg,
+                "Managed-runtime observation fault; will patch status then requeue"
+            );
+            deferred_observation_error = Some(GatewayError::RuntimeApplyError(msg.clone()));
+            ManagedRuntimeInput::ObservationFault(msg)
+        }
+        // Planning and apply failures are real errors: propagate so the
+        // outer reconcile cycle requeues with backoff and increments the
+        // error counter.
+        Err(e) => return Err(GatewayError::RuntimeApplyError(e.to_string())),
+    };
 
-            build_managed_runtime_status(&gateway, &namespace, &name, managed_input)
-        } else {
-            // Legacy path: zero attached_routes, always programmed, no fault.
-            let statuses = build_legacy_listener_statuses(&gateway);
-            (statuses, true, false, None)
-        };
+    let (listener_statuses, gateway_programmed, only_store_not_ready, gateway_observation_fault) =
+        build_managed_runtime_status(&gateway, &namespace, &name, managed_input);
 
     // Get addresses from LoadBalancer Service or Gateway spec
     let addresses = get_gateway_addresses(&ctx.client, &namespace, &name, &gateway).await;
@@ -360,15 +334,9 @@ pub async fn reconcile_gateway(
 
     // Trigger configuration regeneration.
     //
-    // For managed-runtime Gateways we skip this when the applier already
-    // determined that config, service, and deployment are unchanged (NoOp).
-    // The global planner would reach the same conclusion via hash comparison,
-    // but skipping avoids the unnecessary work of building GatewayState,
-    // serializing TOML, and hashing.
-    //
-    // For legacy (non-managed) Gateways we always trigger since we have no
-    // plan to check against.
-    if !is_managed_runtime(&gateway) || managed_config_changed {
+    // Skip redundant config regeneration when the managed-runtime applier
+    // already determined that config, service, and deployment are unchanged.
+    if managed_config_changed {
         trigger_config_update(&ctx, "Gateway reconciled")
             .await
             .map_err(|e| GatewayError::ConfigError(e.to_string()))?;
@@ -437,8 +405,7 @@ enum ManagedRuntimeError {
     ObservationError(String),
 }
 
-/// Run the managed-runtime sub-reconcile for a Gateway annotated with
-/// `wicket.io/managed-runtime: "true"`.
+/// Run the managed-runtime sub-reconcile for a Gateway.
 ///
 /// ## Steps
 ///
@@ -773,52 +740,6 @@ enum ManagedRuntimeInput {
     /// The fault message is carried so the status path can build an
     /// `ObservationFault` condition without re-reading the API.
     ObservationFault(String),
-}
-
-/// Build listener statuses for a legacy (non-managed-runtime) Gateway.
-///
-/// Uses zero attached_routes (legacy behavior) and marks all listeners as
-/// accepted and programmed unconditionally.
-fn build_legacy_listener_statuses(gateway: &Gateway) -> Vec<ListenerStatus> {
-    gateway
-        .spec
-        .listeners
-        .iter()
-        .map(|listener| {
-            let supported_kinds = match listener.protocol {
-                crate::crds::ProtocolType::HTTP | crate::crds::ProtocolType::HTTPS => {
-                    vec![RouteGroupKind {
-                        group: "gateway.networking.k8s.io".to_string(),
-                        kind: "HTTPRoute".to_string(),
-                    }]
-                }
-                crate::crds::ProtocolType::TCP => {
-                    vec![RouteGroupKind {
-                        group: "gateway.networking.k8s.io".to_string(),
-                        kind: "TCPRoute".to_string(),
-                    }]
-                }
-                crate::crds::ProtocolType::TLS => {
-                    vec![RouteGroupKind {
-                        group: "gateway.networking.k8s.io".to_string(),
-                        kind: "TLSRoute".to_string(),
-                    }]
-                }
-                _ => vec![],
-            };
-            ListenerStatus {
-                name: listener.name.clone(),
-                supported_kinds,
-                attached_routes: 0,
-                conditions: vec![
-                    Condition::accepted().with_observed_generation(gateway.metadata.generation),
-                    Condition::programmed().with_observed_generation(gateway.metadata.generation),
-                    Condition::resolved_refs()
-                        .with_observed_generation(gateway.metadata.generation),
-                ],
-            }
-        })
-        .collect()
 }
 
 /// Outcome of the managed-runtime status observation.
@@ -1525,7 +1446,6 @@ pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     use kube::core::ObjectMeta;
 
@@ -1533,29 +1453,19 @@ mod tests {
         Condition, Gateway, GatewaySpec, GatewayStatus, Listener, ListenerStatus, ProtocolType,
     };
     use crate::reconcilers::runtime_plan::{
-        config_map_name, deployment_name, is_managed_runtime, is_rollout_converged,
-        owned_object_base_name, ObservedRuntimeState, MANAGED_RUNTIME_ANNOTATION,
+        config_map_name, deployment_name, is_rollout_converged, owned_object_base_name,
+        ObservedRuntimeState,
     };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    fn make_gateway_with_annotation(
-        namespace: &str,
-        name: &str,
-        annotation_value: Option<&str>,
-    ) -> Gateway {
-        let annotations = annotation_value.map(|v| {
-            let mut m = BTreeMap::new();
-            m.insert(MANAGED_RUNTIME_ANNOTATION.to_string(), v.to_string());
-            m
-        });
+    fn make_gateway(namespace: &str, name: &str) -> Gateway {
         Gateway {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
                 namespace: Some(namespace.to_string()),
                 uid: Some("uid-test".to_string()),
                 generation: Some(1),
-                annotations,
                 ..Default::default()
             },
             spec: GatewaySpec {
@@ -1573,32 +1483,6 @@ mod tests {
             },
             status: None,
         }
-    }
-
-    // ── is_managed_runtime gate ───────────────────────────────────────────────
-
-    #[test]
-    fn managed_runtime_gate_true_when_annotated_true() {
-        let gw = make_gateway_with_annotation("prod", "my-gw", Some("true"));
-        assert!(is_managed_runtime(&gw));
-    }
-
-    #[test]
-    fn managed_runtime_gate_false_when_annotation_absent() {
-        let gw = make_gateway_with_annotation("prod", "my-gw", None);
-        assert!(is_managed_runtime(&gw));
-    }
-
-    #[test]
-    fn managed_runtime_gate_false_when_annotation_not_true() {
-        let gw = make_gateway_with_annotation("prod", "my-gw", Some("false"));
-        assert!(!is_managed_runtime(&gw));
-    }
-
-    #[test]
-    fn managed_runtime_gate_false_when_annotation_empty() {
-        let gw = make_gateway_with_annotation("prod", "my-gw", Some(""));
-        assert!(is_managed_runtime(&gw));
     }
 
     // ── ObservedRuntimeState defaults ─────────────────────────────────────────
@@ -1710,31 +1594,6 @@ mod tests {
         let default_cfg = ControllerConfig::default();
         assert_eq!(default_cfg.proxy_image, "ghcr.io/geverding/wicket:latest");
         assert_eq!(default_cfg.default_replicas, 1);
-    }
-
-    // ── build_legacy_listener_statuses ────────────────────────────────────────
-
-    #[test]
-    fn legacy_listener_statuses_zero_attached_routes() {
-        let gw = make_gateway_with_annotation("prod", "my-gw", None);
-        let statuses = super::build_legacy_listener_statuses(&gw);
-        assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].attached_routes, 0);
-        assert_eq!(statuses[0].name, "http");
-    }
-
-    #[test]
-    fn legacy_listener_statuses_programmed_condition_present() {
-        let gw = make_gateway_with_annotation("prod", "my-gw", None);
-        let statuses = super::build_legacy_listener_statuses(&gw);
-        let has_programmed = statuses[0]
-            .conditions
-            .iter()
-            .any(|c| c.type_ == "Programmed" && c.status == "True");
-        assert!(
-            has_programmed,
-            "legacy listener must have Programmed=True condition"
-        );
     }
 
     // ── Condition helpers ─────────────────────────────────────────────────────
@@ -2097,7 +1956,7 @@ mod tests {
         use crate::reconcilers::store::PlannerSnapshot;
         use std::collections::{HashMap, HashSet};
 
-        let gw = make_gateway_with_annotation("prod", "my-gw", Some("true"));
+        let gw = make_gateway("prod", "my-gw");
         let gw_key = "prod/my-gw".to_string();
         let mut gateways = HashMap::new();
         gateways.insert(gw_key, gw.clone());
@@ -2159,7 +2018,7 @@ mod tests {
         use crate::reconcilers::runtime_plan::listener_status_intents_with_attachment;
 
         // Gateway with a UDP listener (not accepted by the controller).
-        let gw = make_gateway_with_annotation("prod", "my-gw", Some("true"));
+        let gw = make_gateway("prod", "my-gw");
         // Rebuild with a UDP listener.
         let gw_udp = crate::crds::Gateway {
             metadata: gw.metadata.clone(),
@@ -2370,36 +2229,6 @@ mod tests {
         assert_ne!(
             fault.reason, deploy.reason,
             "ObservationFault and DeploymentNotReady must be distinct reasons"
-        );
-    }
-
-    /// Legacy (non-managed) Gateways must not be affected by the deferred-error
-    /// path.  The deferred_observation_error slot is only populated inside the
-    /// `if is_managed_runtime(&gateway)` block, so legacy Gateways always see
-    /// None.
-    #[test]
-    fn legacy_gateway_deferred_error_is_none() {
-        // A Gateway without the managed-runtime annotation defaults to managed.
-        // To test legacy behavior, use explicit "false" annotation.
-        let gw = make_gateway_with_annotation("prod", "legacy-gw", Some("false"));
-        assert!(
-            !is_managed_runtime(&gw),
-            "precondition: legacy gateway must not be managed"
-        );
-
-        // Simulate the outer reconcile: the if-block is skipped entirely,
-        // so deferred_observation_error stays None.
-        let mut deferred: Option<super::GatewayError> = None;
-        if is_managed_runtime(&gw) {
-            // This block is never entered for legacy gateways.
-            deferred = Some(super::GatewayError::RuntimeApplyError(
-                "should not happen".to_string(),
-            ));
-        }
-
-        assert!(
-            deferred.is_none(),
-            "legacy gateway must never set deferred_observation_error"
         );
     }
 
@@ -3136,7 +2965,7 @@ mod tests {
         use crate::reconcilers::store::{PlannerSnapshot, SnapshotResult};
         use std::collections::{HashMap, HashSet};
 
-        let gateway = make_gateway_with_annotation("prod", "my-gw", Some("true"));
+        let gateway = make_gateway("prod", "my-gw");
 
         let snapshot = SnapshotResult::Ready(PlannerSnapshot {
             gateways: HashMap::from([("prod/my-gw".to_string(), gateway.clone())]),
@@ -3448,21 +3277,6 @@ mod tests {
 
         assert_eq!(programmed_cond.status, "True");
         assert_eq!(programmed_cond.reason, "Programmed");
-    }
-
-    /// Legacy (non-managed) Gateways always return None for observation_fault,
-    /// so the top-level condition must never be ObservationFault for them.
-    #[test]
-    fn legacy_gateway_top_level_condition_never_observation_fault() {
-        // Legacy path: programmed=true, only_store_not_ready=false, fault=None.
-        let conditions = select_gateway_conditions(true, false, None, Some(1));
-
-        let has_observation_fault = conditions.iter().any(|c| c.reason == "ObservationFault");
-
-        assert!(
-            !has_observation_fault,
-            "legacy gateway must never emit ObservationFault condition"
-        );
     }
 
     /// The Accepted condition must always be present alongside the Programmed
@@ -4243,96 +4057,7 @@ mod tests {
         );
     }
 
-    // ── Legacy vs managed-runtime: FSM mode selection ────────────────────────
-
-    #[test]
-    fn legacy_listener_statuses_always_programmed_and_accepted() {
-        let gw = make_gateway_with_annotation("prod", "my-gw", None);
-        let statuses = super::build_legacy_listener_statuses(&gw);
-
-        for status in &statuses {
-            let has_programmed_true = status
-                .conditions
-                .iter()
-                .any(|c| c.type_ == "Programmed" && c.status == "True");
-            let has_accepted_true = status
-                .conditions
-                .iter()
-                .any(|c| c.type_ == "Accepted" && c.status == "True");
-            assert!(
-                has_programmed_true,
-                "legacy listener '{}' must have Programmed=True",
-                status.name
-            );
-            assert!(
-                has_accepted_true,
-                "legacy listener '{}' must have Accepted=True",
-                status.name
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_listener_statuses_multi_protocol() {
-        use crate::crds::{GatewaySpec, Listener, ProtocolType};
-
-        let gw = Gateway {
-            metadata: ObjectMeta {
-                name: Some("multi-gw".to_string()),
-                namespace: Some("prod".to_string()),
-                ..Default::default()
-            },
-            spec: GatewaySpec {
-                gateway_class_name: "wicket".to_string(),
-                listeners: vec![
-                    Listener {
-                        name: "http".to_string(),
-                        hostname: None,
-                        port: 80,
-                        protocol: ProtocolType::HTTP,
-                        tls: None,
-                        allowed_routes: None,
-                    },
-                    Listener {
-                        name: "tcp".to_string(),
-                        hostname: None,
-                        port: 5432,
-                        protocol: ProtocolType::TCP,
-                        tls: None,
-                        allowed_routes: None,
-                    },
-                    Listener {
-                        name: "tls".to_string(),
-                        hostname: None,
-                        port: 443,
-                        protocol: ProtocolType::TLS,
-                        tls: None,
-                        allowed_routes: None,
-                    },
-                ],
-                addresses: vec![],
-                infrastructure: None,
-            },
-            status: None,
-        };
-
-        let statuses = super::build_legacy_listener_statuses(&gw);
-        assert_eq!(statuses.len(), 3);
-
-        // HTTP listener supports HTTPRoute
-        let http = statuses.iter().find(|s| s.name == "http").unwrap();
-        assert!(http.supported_kinds.iter().any(|k| k.kind == "HTTPRoute"));
-
-        // TCP listener supports TCPRoute
-        let tcp = statuses.iter().find(|s| s.name == "tcp").unwrap();
-        assert!(tcp.supported_kinds.iter().any(|k| k.kind == "TCPRoute"));
-
-        // TLS listener supports TLSRoute
-        let tls = statuses.iter().find(|s| s.name == "tls").unwrap();
-        assert!(tls.supported_kinds.iter().any(|k| k.kind == "TLSRoute"));
-    }
-
-    // ── build_gateway_conditions ──────────���──────────────────────────────────
+    // ── build_gateway_conditions ──────────────────────────────────────────────
 
     #[test]
     fn gateway_conditions_programmed_true() {
@@ -4410,7 +4135,7 @@ mod tests {
 
     #[test]
     fn gateway_status_threads_reconciled_generation_into_conditions_and_listeners() {
-        let mut gw = make_gateway_with_annotation("prod", "my-gw", None);
+        let mut gw = make_gateway("prod", "my-gw");
         gw.metadata.generation = Some(42);
 
         let (listener_statuses, programmed, only_store_not_ready, fault) =
@@ -4446,7 +4171,7 @@ mod tests {
 
     #[test]
     fn gateway_status_keeps_missing_generation_unset() {
-        let mut gw = make_gateway_with_annotation("prod", "my-gw", None);
+        let mut gw = make_gateway("prod", "my-gw");
         gw.metadata.generation = None;
 
         let (listener_statuses, programmed, only_store_not_ready, fault) =

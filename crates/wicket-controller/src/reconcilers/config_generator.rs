@@ -2,14 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use tracing::warn;
 
 use crate::crds::{
     Gateway, HTTPRoute, Listener, ProtocolType, RouteParentStatus, TCPRoute, TLSRoute,
     WICKET_CONTROLLER_NAME,
 };
 
-use wicket_config::{RouteConfig, RouteMatch};
+use wicket_config::RouteConfig;
 
 /// Generated Wicket configuration that matches wicket-config format.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -314,35 +313,10 @@ impl GatewayState {
         parents_accepted_by_wicket(parents)
     }
 
-    /// Generate Wicket configuration with deterministic output.
+    /// Generate Wicket configuration from the current state.
     ///
-    /// Identical to [`generate_config`] but iterates all internal `HashMap`
-    /// fields in sorted key order so that the resulting `WicketConfig` --
-    /// and therefore the serialized TOML -- is identical for the same logical
-    /// state regardless of `HashMap` insertion order.
-    ///
-    /// Use this method whenever the output will be hashed or compared for
-    /// change detection.
-    pub fn generate_config_deterministic(&self) -> WicketConfig {
-        // Build a temporary GatewayState whose maps are backed by sorted
-        // iteration.  We do this by constructing a new GatewayState whose
-        // HashMap fields contain the same entries but were inserted in sorted
-        // key order.  Because HashMap does not guarantee insertion-order
-        // iteration, we instead shadow the fields with BTreeMap-ordered
-        // iterators inside generate_config by building a wrapper that
-        // iterates in sorted order.
-        //
-        // The cleanest approach without duplicating generate_config logic is
-        // to build a new GatewayState with the same entries inserted in
-        // sorted key order.  HashMap iteration order is not stable across
-        // runs, but inserting in a fixed order does not help either.
-        //
-        // Instead we call a private sorted-iteration variant directly.
-        self.generate_config_sorted()
-    }
-
-    /// Internal: generate config by iterating all maps in sorted key order.
-    fn generate_config_sorted(&self) -> WicketConfig {
+    /// Iterates internal maps in sorted key order for deterministic output.
+    pub fn generate_config(&self) -> WicketConfig {
         let mut config = WicketConfig::default();
         let mut upstreams: BTreeMap<String, UpstreamConfig> = BTreeMap::new();
         let mut routes = Vec::new();
@@ -806,419 +780,6 @@ impl GatewayState {
             _ => None,
         }
     }
-
-    /// Generate Wicket configuration from the current state.
-    pub fn generate_config(&self) -> WicketConfig {
-        let mut config = WicketConfig::default();
-        let mut upstreams: BTreeMap<String, UpstreamConfig> = BTreeMap::new();
-        let mut routes = Vec::new();
-        let mut tls_certs: Vec<CertConfig> = Vec::new();
-        let mut stream_config: Option<StreamConfig> = None;
-
-        // Bucket listeners by protocol family so HTTPS gets its own bind.
-        //
-        // `http_listeners`     — plain HTTP only.
-        // `https_listeners`    — HTTPS (TLS-terminating).
-        // `tcp_listeners`      — raw TCP / TLS passthrough (handled by stream config).
-        //
-        // We keep the combined `http_or_https` order solely so that route
-        // matching downstream can still iterate over every L7 listener with
-        // its associated Gateway key when needed.
-        let mut http_listeners: Vec<(String, &Listener)> = Vec::new();
-        let mut https_listeners: Vec<(String, &Listener)> = Vec::new();
-        let mut tcp_listeners: Vec<(String, &Listener)> = Vec::new();
-
-        for (gw_key, gateway) in &self.gateways {
-            for listener in &gateway.spec.listeners {
-                match listener.protocol {
-                    ProtocolType::HTTP => {
-                        http_listeners.push((gw_key.clone(), listener));
-                    }
-                    ProtocolType::HTTPS => {
-                        https_listeners.push((gw_key.clone(), listener));
-                    }
-                    ProtocolType::TCP | ProtocolType::TLS => {
-                        tcp_listeners.push((gw_key.clone(), listener));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Determine listen addresses.
-        //
-        // Priority for `server.listen` (which the field requires non-empty):
-        //   1. First HTTP listener's port  → `0.0.0.0:<http-port>`.
-        //   2. First HTTPS listener's port → `0.0.0.0:<https-port>` so the
-        //      field is well-formed, but `disable_http=true` so the proxy
-        //      doesn't actually bind HTTP on it.
-        //
-        // `server.https_listen` is set whenever any HTTPS listener exists;
-        // its port comes from the first HTTPS listener.
-        //
-        // `server.disable_http` is set when we have HTTPS listeners but no
-        // plain HTTP listeners — without this flag the proxy would still
-        // bind HTTP on the same port and TLS handshakes would fail.
-        match (http_listeners.first(), https_listeners.first()) {
-            (Some((_, http_l)), Some((_, https_l))) => {
-                config.server.listen = format!("0.0.0.0:{}", http_l.port);
-                config.server.https_listen = Some(format!("0.0.0.0:{}", https_l.port));
-                config.server.disable_http = false;
-            }
-            (Some((_, http_l)), None) => {
-                config.server.listen = format!("0.0.0.0:{}", http_l.port);
-                // No HTTPS listener; leave https_listen and disable_http at
-                // their defaults.
-            }
-            (None, Some((_, https_l))) => {
-                // HTTPS-only proxy: bind HTTPS on the listener port and skip
-                // HTTP entirely.  `listen` still holds the same port purely
-                // to satisfy the proxy's required field.
-                let addr = format!("0.0.0.0:{}", https_l.port);
-                config.server.listen = addr.clone();
-                config.server.https_listen = Some(addr);
-                config.server.disable_http = true;
-            }
-            (None, None) => {
-                // No L7 listeners; leave server.listen at its default.
-            }
-        }
-
-        // Process HTTPRoutes
-        for (route_key, route) in &self.http_routes {
-            // ── Parity guard: only render routes accepted by this controller ──
-            if !Self::http_route_is_accepted(route) {
-                tracing::warn!(
-                    route = %route_key,
-                    "HTTPRoute in store has no Accepted=True parent for this controller; \
-                     skipping render (fail-closed)"
-                );
-                continue;
-            }
-
-            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-            let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
-
-            for (rule_idx, rule) in route.spec.rules.iter().enumerate() {
-                // Create upstream from backend refs
-                let upstream_name = format!("{}-{}-rule{}", route_ns, route_name, rule_idx);
-
-                let mut backend_addrs = Vec::new();
-                for backend_ref in &rule.backend_refs {
-                    let backend_ns = backend_ref
-                        .backend_ref
-                        .namespace
-                        .as_deref()
-                        .unwrap_or(route_ns);
-                    let backend_key = Self::key(backend_ns, &backend_ref.backend_ref.name);
-
-                    if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
-                        backend_addrs.extend(endpoints.endpoints.clone());
-                    } else {
-                        // Fallback to DNS name
-                        let port = backend_ref.backend_ref.port.unwrap_or(80);
-                        backend_addrs.push(format!(
-                            "{}.{}.svc.cluster.local:{}",
-                            backend_ref.backend_ref.name, backend_ns, port
-                        ));
-                    }
-                }
-
-                if !backend_addrs.is_empty() {
-                    upstreams.insert(
-                        upstream_name.clone(),
-                        UpstreamConfig {
-                            backends: backend_addrs,
-                            strategy: "round_robin".to_string(),
-                            health_check: None,
-                        },
-                    );
-
-                    // Filters are not yet supported; warn once per rule and skip.
-                    if !rule.filters.is_empty() {
-                        warn!(
-                            route = %format!("{}/{}", route_ns, route_name),
-                            rule_idx = rule_idx,
-                            filter_count = rule.filters.len(),
-                            "HTTPRoute rule has filters which are not yet supported and will be \
-                             skipped; generated route will have no filters applied"
-                        );
-                    }
-
-                    // Parse timeout from rule
-                    let timeout = rule.timeouts.as_ref().and_then(|t| {
-                        t.request
-                            .as_ref()
-                            .and_then(|d| Self::parse_duration_to_secs(d))
-                    });
-
-                    // Create routes from matches
-                    if rule.matches.is_empty() {
-                        // Default match - all traffic
-                        let route_config = RouteConfig {
-                            name: Some(format!("{}-{}-rule{}", route_ns, route_name, rule_idx)),
-                            upstream: upstream_name.clone(),
-                            match_rules: RouteMatch {
-                                host: route.spec.hostnames.first().cloned(),
-                                path: None,
-                                path_prefix: Some("/".to_string()),
-                                methods: vec![],
-                                headers: BTreeMap::new(),
-                            },
-                            tls: None,
-                            filters: None,
-                            timeout,
-                        };
-                        routes.push(route_config);
-                    } else {
-                        for (match_idx, route_match) in rule.matches.iter().enumerate() {
-                            let (path, path_prefix) = if let Some(ref path_match) = route_match.path
-                            {
-                                match path_match.type_ {
-                                    crate::crds::PathMatchType::Exact => {
-                                        (Some(path_match.value.clone()), None)
-                                    }
-                                    crate::crds::PathMatchType::PathPrefix => {
-                                        (None, Some(path_match.value.clone()))
-                                    }
-                                    crate::crds::PathMatchType::RegularExpression => {
-                                        // path_regex is not supported in the canonical RouteMatch.
-                                        // Log a warning and skip this match entirely.
-                                        warn!(
-                                            route = %format!("{}/{}", route_ns, route_name),
-                                            rule_idx = rule_idx,
-                                            match_idx = match_idx,
-                                            pattern = %path_match.value,
-                                            "Skipping route match: RegularExpression path \
-                                             matching is not yet supported in wicket-config \
-                                             RouteMatch (tracked in bd-89m)"
-                                        );
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                (None, Some("/".to_string()))
-                            };
-
-                            let methods: Vec<String> = route_match
-                                .method
-                                .iter()
-                                .map(|m| format!("{:?}", m))
-                                .collect();
-
-                            // BTreeMap preserves sorted key order for deterministic serialization.
-                            let headers: BTreeMap<String, String> = route_match
-                                .headers
-                                .iter()
-                                .map(|h| (h.name.clone(), h.value.clone()))
-                                .collect();
-
-                            let route_config = RouteConfig {
-                                name: Some(format!(
-                                    "{}-{}-rule{}-match{}",
-                                    route_ns, route_name, rule_idx, match_idx
-                                )),
-                                upstream: upstream_name.clone(),
-                                match_rules: RouteMatch {
-                                    host: route.spec.hostnames.first().cloned(),
-                                    path,
-                                    path_prefix,
-                                    methods,
-                                    headers,
-                                },
-                                tls: None,
-                                filters: None,
-                                timeout,
-                            };
-                            routes.push(route_config);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Dedupe TLS certs by Secret (namespace/name).  Multiple listeners
-        // may reference the same Secret with different hostnames; we emit
-        // one CertConfig per unique Secret and union the domains.
-        let mut cert_map: BTreeMap<String, CertConfig> = BTreeMap::new();
-
-        for gateway in self.gateways.values() {
-            let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
-
-            for listener in &gateway.spec.listeners {
-                if let Some(ref tls_config) = listener.tls {
-                    for cert_ref in &tls_config.certificate_refs {
-                        let cert_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
-                        let cert_key = Self::key(cert_ns, &cert_ref.name);
-
-                        if let Some((cert_path, key_path)) = self.tls_secrets.get(&cert_key) {
-                            let entry = cert_map.entry(cert_key).or_insert_with(|| CertConfig {
-                                name: cert_ref.name.clone(),
-                                cert: cert_path.clone(),
-                                key: key_path.clone(),
-                                domains: vec![],
-                            });
-
-                            if let Some(ref hostname) = listener.hostname {
-                                if !entry.domains.contains(hostname) {
-                                    entry.domains.push(hostname.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        tls_certs.extend(cert_map.into_values());
-
-        // Process TCPRoutes and TLSRoutes for stream config
-        if !self.tcp_routes.is_empty() || !self.tls_routes.is_empty() {
-            let mut sni_routes: BTreeMap<String, String> = BTreeMap::new();
-            let mut stream_upstreams = Vec::new();
-            let mut catch_all_upstream: Option<String> = None;
-
-            for (route_key, route) in &self.tls_routes {
-                let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-
-                // ── Parity guard: only render routes accepted by this controller ──
-                if !Self::tls_route_is_accepted(route) {
-                    tracing::warn!(
-                        route = %route_key,
-                        "TLSRoute in store has no Accepted=True parent for this controller; \
-                         skipping render (fail-closed)"
-                    );
-                    continue;
-                }
-
-                for rule in &route.spec.rules {
-                    for backend_ref in &rule.backend_refs {
-                        let upstream_name = format!("{}-{}", route_ns, backend_ref.name);
-                        let backend_ns = backend_ref.namespace.as_deref().unwrap_or(route_ns);
-                        let backend_key = Self::key(backend_ns, &backend_ref.name);
-
-                        let servers =
-                            if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
-                                endpoints.endpoints.clone()
-                            } else {
-                                let port = backend_ref.port.unwrap_or(443);
-                                vec![format!(
-                                    "{}.{}.svc.cluster.local:{}",
-                                    backend_ref.name, backend_ns, port
-                                )]
-                            };
-
-                        stream_upstreams.push(StreamUpstreamConfig {
-                            name: upstream_name.clone(),
-                            servers,
-                        });
-
-                        if route.spec.hostnames.is_empty() {
-                            if catch_all_upstream.is_none() {
-                                catch_all_upstream = Some(upstream_name.clone());
-                            } else {
-                                tracing::warn!(
-                                    route = %route_key,
-                                    upstream = %upstream_name,
-                                    existing = %catch_all_upstream.as_deref().unwrap_or(""),
-                                    "Multiple TLSRoutes with empty hostnames; \
-                                     first-accepted route keeps default_upstream slot"
-                                );
-                            }
-                        } else {
-                            for hostname in &route.spec.hostnames {
-                                if let Some(existing) = sni_routes.get(hostname) {
-                                    tracing::warn!(
-                                        hostname = %hostname,
-                                        existing_upstream = %existing,
-                                        new_upstream = %upstream_name,
-                                        route = %route_key,
-                                        "Duplicate SNI hostname across TLSRoutes; \
-                                         first-accepted route keeps the SNI slot (deterministic)"
-                                    );
-                                    // Do NOT overwrite — first-writer wins.
-                                } else {
-                                    sni_routes.insert(hostname.clone(), upstream_name.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Process TCPRoutes.
-            // TCPRoutes produce plain stream upstreams (no SNI routing).
-            for (route_key, route) in &self.tcp_routes {
-                let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-
-                // ── Parity guard: only render routes accepted by this controller ──
-                if !Self::tcp_route_is_accepted(route) {
-                    tracing::warn!(
-                        route = %route_key,
-                        "TCPRoute in store has no Accepted=True parent for this controller; \
-                         skipping render (fail-closed)"
-                    );
-                    continue;
-                }
-
-                for rule in &route.spec.rules {
-                    for backend_ref in &rule.backend_refs {
-                        let upstream_name = format!("{}-{}", route_ns, backend_ref.name);
-                        let backend_ns = backend_ref.namespace.as_deref().unwrap_or(route_ns);
-                        let backend_key = Self::key(backend_ns, &backend_ref.name);
-
-                        let servers =
-                            if let Some(endpoints) = self.service_endpoints.get(&backend_key) {
-                                endpoints.endpoints.clone()
-                            } else {
-                                let port = backend_ref.port.unwrap_or(9000);
-                                vec![format!(
-                                    "{}.{}.svc.cluster.local:{}",
-                                    backend_ref.name, backend_ns, port
-                                )]
-                            };
-
-                        stream_upstreams.push(StreamUpstreamConfig {
-                            name: upstream_name,
-                            servers,
-                        });
-                    }
-                }
-            }
-
-            // Set stream config if we have TCP listeners
-            if let Some((_, listener)) = tcp_listeners.first() {
-                stream_config = Some(StreamConfig {
-                    listen: format!("0.0.0.0:{}", listener.port),
-                    backlog: 8000,
-                    reuseport: true,
-                    proxy_protocol: None,
-                    sni_routes,
-                    default_upstream: catch_all_upstream,
-                    upstreams: stream_upstreams,
-                });
-            }
-        }
-
-        // Set TLS config if we have certificates
-        if !tls_certs.is_empty() {
-            config.tls = Some(TlsConfig {
-                mode: "file".to_string(),
-                file: Some(FileTlsConfig {
-                    watch: true,
-                    poll_interval_secs: 30,
-                    certs: tls_certs,
-                }),
-                acme: None,
-            });
-        }
-
-        config.upstreams = upstreams;
-        config.routes = routes;
-        config.stream = stream_config;
-
-        config
-    }
 }
 
 #[cfg(test)]
@@ -1366,7 +927,7 @@ mod tests {
             },
         );
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
 
         assert_eq!(config.server.listen, "0.0.0.0:8443");
         assert_eq!(config.server.https_listen.as_deref(), Some("0.0.0.0:8443"));
@@ -1412,7 +973,7 @@ mod tests {
             },
         );
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
 
         assert_eq!(config.server.listen, "0.0.0.0:8080");
         assert_eq!(config.server.https_listen.as_deref(), Some("0.0.0.0:8443"));
@@ -1478,7 +1039,7 @@ mod tests {
             },
         );
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
         let tls = config.tls.expect("tls config");
         let file = tls.file.expect("file tls config");
 
@@ -1519,7 +1080,7 @@ mod tests {
             },
         );
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
         let toml = toml::to_string(&config).expect("serialize https-only config");
         let parsed: WicketConfig = toml::from_str(&toml).expect("parse https-only config");
 
@@ -2135,9 +1696,9 @@ mod tests {
     /// Test: header matches are serialized in deterministic (sorted) key order.
     ///
     /// Inserts headers in reverse-alphabetical order in the CRD match spec and
-    /// verifies that both `generate_config` and `generate_config_deterministic`
-    /// produce identical TOML output regardless of insertion order, and that the
-    /// TOML keys appear in sorted order.
+    /// verifies that repeated calls to `generate_config` produce identical TOML
+    /// output regardless of insertion order, and that the TOML keys appear in
+    /// sorted order.
     #[test]
     fn test_header_match_serialization_is_deterministic() {
         use crate::crds::{HTTPHeaderMatch, HTTPRouteMatch, PathMatchType};
@@ -2240,13 +1801,13 @@ mod tests {
 
         // Both paths must produce the same TOML.
         let cfg_a = state.generate_config();
-        let cfg_b = state.generate_config_deterministic();
+        let cfg_b = state.generate_config();
 
         let toml_a = toml::to_string(&cfg_a).expect("serialize cfg_a");
         let toml_b = toml::to_string(&cfg_b).expect("serialize cfg_b");
         assert_eq!(
             toml_a, toml_b,
-            "generate_config and generate_config_deterministic must produce identical TOML"
+            "generate_config must produce identical TOML"
         );
 
         // Headers in the generated RouteMatch must be in sorted key order.
@@ -2414,7 +1975,7 @@ mod tests {
             .tls_routes
             .insert(GatewayState::key("default", "rejected-route"), rejected);
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
 
         let stream = config.stream.expect("stream config must be present");
 
@@ -2461,7 +2022,7 @@ mod tests {
             .tls_routes
             .insert(GatewayState::key("default", "catch-all-route"), catch_all);
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
 
         let stream = config.stream.expect("stream config must be present");
 
@@ -2499,7 +2060,7 @@ mod tests {
             .tls_routes
             .insert(GatewayState::key("default", "no-status-route"), no_status);
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
 
         // No stream config at all since no routes were rendered.
         // (tcp_routes is also empty, so stream is None)
@@ -2726,7 +2287,7 @@ mod tests {
             },
         );
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
         assert_eq!(
             config.routes.len(),
             1,
@@ -2766,7 +2327,7 @@ mod tests {
             },
         );
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
         assert_eq!(
             config.routes.len(),
             0,
@@ -2799,7 +2360,7 @@ mod tests {
             },
         );
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
         assert_eq!(
             config.routes.len(),
             0,
@@ -2852,7 +2413,7 @@ mod tests {
             );
         }
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
         assert_eq!(
             config.routes.len(),
             1,
@@ -2909,7 +2470,7 @@ mod tests {
             },
         );
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
         // TCPRoutes produce stream upstreams (no SNI routing).
         let stream = config
             .stream
@@ -2952,7 +2513,7 @@ mod tests {
             },
         );
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
         // No accepted routes → stream may be None or have empty upstreams.
         let no_upstreams = config
             .stream
@@ -2980,7 +2541,7 @@ mod tests {
             .tcp_routes
             .insert(GatewayState::key("default", "no-status-tcp"), route);
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
         let no_upstreams = config
             .stream
             .as_ref()
@@ -2989,7 +2550,7 @@ mod tests {
         assert!(no_upstreams, "TCPRoute with no status must not be rendered");
     }
 
-    // ── Cross-type symmetry: generate_config vs generate_config_deterministic ─
+    // ── Cross-type symmetry: generate_config parity ─
 
     /// Both code paths must apply the same accepted guard for HTTPRoutes.
     #[test]
@@ -3022,13 +2583,13 @@ mod tests {
             },
         );
 
-        let cfg_sorted = state.generate_config_deterministic();
+        let cfg_sorted = state.generate_config();
         let cfg_unsorted = state.generate_config();
 
         assert_eq!(
             cfg_sorted.routes.len(),
             0,
-            "generate_config_deterministic: rejected HTTPRoute must not be rendered"
+            "generate_config: rejected HTTPRoute must not be rendered"
         );
         assert_eq!(
             cfg_unsorted.routes.len(),
@@ -3059,7 +2620,7 @@ mod tests {
             .tls_routes
             .insert(GatewayState::key("default", "rejected-route"), rejected);
 
-        let cfg_sorted = state.generate_config_deterministic();
+        let cfg_sorted = state.generate_config();
         let cfg_unsorted = state.generate_config();
 
         let sorted_empty = cfg_sorted
@@ -3075,7 +2636,7 @@ mod tests {
 
         assert!(
             sorted_empty,
-            "generate_config_deterministic: rejected TLSRoute must not be rendered"
+            "generate_config: rejected TLSRoute must not be rendered"
         );
         assert!(
             unsorted_empty,
@@ -3120,7 +2681,7 @@ mod tests {
             .tls_routes
             .insert(GatewayState::key("default", "zzz-route"), second);
 
-        let config = state.generate_config_deterministic();
+        let config = state.generate_config();
         let stream = config.stream.expect("stream config must be present");
 
         // The SNI must be present exactly once.

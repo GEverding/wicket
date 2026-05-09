@@ -4,8 +4,7 @@
 //!
 //! This module defines the pure intermediate representation (`GatewayRuntimePlan`)
 //! that the planner produces and the applier consumes.  It is the contract between
-//! planning and application for managed-mode Gateways (those annotated with
-//! `wicket.io/managed-runtime: "true"`).
+//! planning and application for managed-runtime Gateways.
 //!
 //! ```text
 //!   RuntimePlanInput {
@@ -44,12 +43,6 @@
 //! gateway name is truncated and a 6-char lowercase hex hash of the full name
 //! is appended to preserve uniqueness.
 //!
-//! # Managed-runtime annotation
-//!
-//! A Gateway is in managed mode only when it carries the annotation
-//! `wicket.io/managed-runtime: "true"`.  Gateways without this annotation
-//! continue to use the config-synthesis-only path.
-
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
@@ -62,13 +55,6 @@ use crate::reconcilers::contracts::{
     ServicePortSpec, ServiceType,
 };
 use crate::reconcilers::store::PlannerSnapshot;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Annotation key that opts a Gateway into managed-runtime mode.
-pub const MANAGED_RUNTIME_ANNOTATION: &str = "wicket.io/managed-runtime";
 
 /// Prefix for all controller-owned object names.
 const OBJECT_NAME_PREFIX: &str = "wicket-gw-";
@@ -606,23 +592,6 @@ pub fn spec_hash_of(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Managed-runtime annotation check
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Returns `true` unless the Gateway explicitly sets `wicket.io/managed-runtime: "false"`.
-/// All Gateways default to managed-runtime (infrastructure provisioning).
-#[must_use]
-pub fn is_managed_runtime(gateway: &Gateway) -> bool {
-    gateway
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|a| a.get(MANAGED_RUNTIME_ANNOTATION))
-        .map(|v| v != "false")
-        .unwrap_or(true)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Service port derivation
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -795,7 +764,7 @@ pub fn listener_status_intents(gateway: &Gateway) -> Vec<ListenerStatusIntent> {
 ///
 /// Builds a `GatewayState` scoped to the target Gateway and its attached
 /// routes/endpoints, then delegates to
-/// `GatewayState::generate_config_deterministic()` for real config rendering.
+/// `GatewayState::generate_config()` for real config rendering.
 /// Using the deterministic variant guarantees that the same logical snapshot
 /// always produces the same TOML bytes and therefore the same `config_hash`,
 /// regardless of `HashMap` iteration order.
@@ -913,9 +882,9 @@ pub fn config_toml_from_snapshot(
     };
 
     // Use the deterministic variant so that HashMap iteration order does not
-    // affect the output.  generate_config_deterministic() sorts all map
+    // affect the output.  generate_config() sorts all map
     // iterations by key before processing.
-    let config: WicketConfig = state.generate_config_deterministic();
+    let config: WicketConfig = state.generate_config();
 
     // Serialize to TOML.  Surface any serialization failure as a planning
     // error rather than silently falling back to a minimal config.
@@ -1226,11 +1195,6 @@ mod tests {
                 namespace: Some(namespace.to_string()),
                 uid: Some(uid.to_string()),
                 generation: Some(1),
-                annotations: Some({
-                    let mut m = BTreeMap::new();
-                    m.insert(MANAGED_RUNTIME_ANNOTATION.to_string(), "true".to_string());
-                    m
-                }),
                 ..Default::default()
             },
             spec: GatewaySpec {
@@ -1468,59 +1432,6 @@ mod tests {
             spec_hash_of(&m, &ServiceType::ClusterIP, &ports_b, &[]).unwrap(),
             "service_ports change must change spec_hash"
         );
-    }
-
-    // ── Managed-runtime annotation ────────────────────────────────────────────
-
-    #[test]
-    fn is_managed_runtime_true_when_annotated() {
-        let gw = make_gateway("prod", "my-gw", "uid-1", vec![]);
-        assert!(is_managed_runtime(&gw));
-    }
-
-    #[test]
-    fn is_managed_runtime_false_when_not_annotated() {
-        let gw = Gateway {
-            metadata: ObjectMeta {
-                name: Some("my-gw".to_string()),
-                namespace: Some("prod".to_string()),
-                uid: Some("uid-1".to_string()),
-                ..Default::default()
-            },
-            spec: GatewaySpec {
-                gateway_class_name: "wicket".to_string(),
-                listeners: vec![],
-                addresses: vec![],
-                infrastructure: None,
-            },
-            status: None,
-        };
-        assert!(is_managed_runtime(&gw));
-    }
-
-    #[test]
-    fn is_managed_runtime_false_when_annotation_is_false() {
-        let gw = Gateway {
-            metadata: ObjectMeta {
-                name: Some("my-gw".to_string()),
-                namespace: Some("prod".to_string()),
-                uid: Some("uid-1".to_string()),
-                annotations: Some({
-                    let mut m = BTreeMap::new();
-                    m.insert(MANAGED_RUNTIME_ANNOTATION.to_string(), "false".to_string());
-                    m
-                }),
-                ..Default::default()
-            },
-            spec: GatewaySpec {
-                gateway_class_name: "wicket".to_string(),
-                listeners: vec![],
-                addresses: vec![],
-                infrastructure: None,
-            },
-            status: None,
-        };
-        assert!(!is_managed_runtime(&gw));
     }
 
     // ── Service port derivation ───────────────────────────────────────────────
@@ -2851,7 +2762,7 @@ mod tests {
     #[test]
     fn config_toml_from_snapshot_missing_gateway_returns_empty_config() {
         // When the gateway is not in the snapshot the GatewayState has no
-        // gateways, so generate_config_deterministic produces a default config.
+        // gateways, so generate_config produces a default config.
         // Serialization of the default config must still succeed.
         let snapshot = PlannerSnapshot {
             gateways: HashMap::new(),
