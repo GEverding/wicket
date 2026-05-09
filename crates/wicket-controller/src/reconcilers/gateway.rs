@@ -4204,6 +4204,88 @@ mod tests {
     }
 
     #[test]
+    fn applied_deployment_changed_forces_top_level_deployment_not_ready() {
+        let obs = ObservedRuntimeState {
+            ready_replicas: Some(1),
+            deploy_observed_generation: Some(3),
+            deploy_generation: Some(3),
+            updated_replicas: Some(1),
+            available_replicas: Some(1),
+            desired_replicas: Some(1),
+            ..Default::default()
+        };
+        let apply_result = RuntimeApplyResult {
+            deployment_changed: true,
+            rollout_triggered: false,
+            ..Default::default()
+        };
+        let input = super::ManagedRuntimeInput::Applied(
+            obs,
+            apply_result,
+            Box::new(SnapshotResult::NotReady),
+        );
+
+        let outcome = super::resolve_managed_status_outcome(input, false, Some(1));
+
+        assert!(!outcome.programmed);
+        assert!(!outcome.only_store_not_ready);
+        assert!(outcome.observation_fault.is_none());
+
+        let conditions = super::build_gateway_conditions(
+            outcome.programmed,
+            &outcome.observation_fault,
+            outcome.only_store_not_ready,
+            outcome.observed_generation,
+        );
+        let programmed = conditions
+            .iter()
+            .find(|condition| condition.type_ == "Programmed")
+            .expect("Programmed condition must be present");
+
+        assert_eq!(programmed.status, "False");
+        assert_eq!(programmed.reason, "DeploymentNotReady");
+        assert_eq!(programmed.observed_generation, Some(1));
+    }
+
+    #[test]
+    fn missing_ready_replicas_propagates_to_top_level_deployment_not_ready() {
+        let obs = ObservedRuntimeState {
+            ready_replicas: None,
+            deploy_observed_generation: Some(7),
+            deploy_generation: Some(7),
+            updated_replicas: Some(1),
+            available_replicas: Some(1),
+            desired_replicas: Some(1),
+            ..Default::default()
+        };
+        let input = super::ManagedRuntimeInput::Applied(
+            obs,
+            RuntimeApplyResult::default(),
+            Box::new(SnapshotResult::NotReady),
+        );
+
+        let outcome = super::resolve_managed_status_outcome(input, true, Some(7));
+
+        assert!(!outcome.programmed);
+        assert!(!outcome.only_store_not_ready);
+
+        let conditions = super::build_gateway_conditions(
+            outcome.programmed,
+            &outcome.observation_fault,
+            outcome.only_store_not_ready,
+            outcome.observed_generation,
+        );
+        let programmed = conditions
+            .iter()
+            .find(|condition| condition.type_ == "Programmed")
+            .expect("Programmed condition must be present");
+
+        assert_eq!(programmed.status, "False");
+        assert_eq!(programmed.reason, "DeploymentNotReady");
+        assert_eq!(programmed.observed_generation, Some(7));
+    }
+
+    #[test]
     fn gateway_conditions_priority_fault_over_store_not_ready() {
         // When both observation_fault and only_store_not_ready are set,
         // the observation fault must take priority.
