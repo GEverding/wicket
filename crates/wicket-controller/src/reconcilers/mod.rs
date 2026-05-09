@@ -8,13 +8,12 @@
 //! side-effect application.  All reconcilers are expected to follow those
 //! contracts.
 //!
-//! ## Config regeneration split
+//! ## Config regeneration
 //!
-//! Config generation is split into a pure planner and a side-effecting applier:
-//! - [`config_planner`]: `GlobalConfigPlanner` -- pure, sync, `GatewayState -> ConfigPlan`.
-//! - [`config_applier`]: `apply_config_plan` -- async, patches ConfigMap + metrics.
+//! Managed-runtime Gateways own their proxy ConfigMaps through
+//! [`runtime_plan`] and [`runtime_applier`]. The legacy central proxy ConfigMap
+//! path has been removed.
 
-mod config_applier;
 mod config_generator;
 mod context;
 mod gateway;
@@ -28,13 +27,11 @@ mod tcproute;
 mod tlsroute;
 
 pub mod attachment_planner;
-pub mod config_planner;
 pub mod contracts;
 pub mod runtime_applier;
 pub mod runtime_plan;
 pub mod status_helpers;
 
-pub use config_applier::apply_config_plan;
 pub use config_generator::*;
 pub use context::{trigger_config_update, *};
 pub use gateway::*;

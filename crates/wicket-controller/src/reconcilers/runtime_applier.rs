@@ -168,7 +168,7 @@ pub async fn apply_runtime_plan(
 
     // ── 2. ConfigMap (managed-runtime path) ───────────────────────────────────
     // Uses the managed-runtime-specific path that enforces owner refs and
-    // managed labels, rather than the raw data-only patch in config_applier.
+    // managed labels, rather than the old raw data-only central ConfigMap path.
     let config_result = apply_managed_configmap(plan, input.client, input.in_memory_config).await?;
     result.config_result = Some(config_result);
 
@@ -451,8 +451,7 @@ async fn apply_service_account(
 /// Apply the owned `ConfigMap` for a managed-runtime Gateway.
 ///
 /// This is a managed-runtime-specific path that enforces owner references and
-/// managed labels on the ConfigMap, unlike the raw data-only patch in
-/// `config_applier::apply_config_plan`.
+/// managed labels on the ConfigMap.
 ///
 /// Performs an ownership preflight: if a same-name ConfigMap exists without
 /// the controller's managed-by label, returns `ApplyError::NotOwned`.

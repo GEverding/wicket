@@ -152,7 +152,7 @@ spec:
     # ================================================================
     # Config reload alerts
     # ================================================================
-    - name: wicket-proxy-config
+    - name: wicket-proxy-reload-alerts
       rules:
         - alert: WicketConfigReloadFailing
           expr: |

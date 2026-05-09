@@ -45,14 +45,6 @@ struct Args {
     #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
     watch_all_namespaces: bool,
 
-    /// Name of the ConfigMap to update with proxy configuration
-    #[arg(long, default_value = "wicket-proxy-config")]
-    config_configmap_name: String,
-
-    /// Namespace of the ConfigMap to update (defaults to controller namespace)
-    #[arg(long)]
-    config_configmap_namespace: Option<String>,
-
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, short = 'l', default_value = "info")]
     log_level: String,
@@ -117,18 +109,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("invalid managed-runtime defaults: {}", e))?;
 
-    // Determine ConfigMap namespace (default to controller namespace)
-    let config_configmap_namespace = args
-        .config_configmap_namespace
-        .clone()
-        .unwrap_or_else(|| args.namespace.clone());
-
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         namespace = %args.namespace,
         watch_all_namespaces = args.watch_all_namespaces,
-        config_configmap_name = %args.config_configmap_name,
-        config_configmap_namespace = %config_configmap_namespace,
         "Starting Wicket Gateway API Controller"
     );
 
@@ -152,8 +136,6 @@ async fn main() -> anyhow::Result<()> {
         client.clone(),
         args.namespace.clone(),
         args.watch_all_namespaces,
-        args.config_configmap_name.clone(),
-        config_configmap_namespace.clone(),
         DEFAULT_TLS_CERT_DIR.to_string(),
         controller_config,
     ));
