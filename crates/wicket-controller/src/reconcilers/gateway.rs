@@ -1489,11 +1489,14 @@ pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::collections::BTreeMap;
 
     use kube::core::ObjectMeta;
 
-    use crate::crds::{Gateway, GatewaySpec, Listener, ProtocolType};
+    use crate::crds::{
+        Condition, Gateway, GatewaySpec, GatewayStatus, Listener, ListenerStatus, ProtocolType,
+    };
     use crate::reconcilers::runtime_plan::{
         config_map_name, deployment_name, is_managed_runtime, is_rollout_converged,
         owned_object_base_name, ObservedRuntimeState, MANAGED_RUNTIME_ANNOTATION,
@@ -1713,6 +1716,129 @@ mod tests {
         let c = crate::crds::Condition::not_accepted();
         assert_eq!(c.type_, "Accepted");
         assert_eq!(c.status, "False");
+    }
+
+    #[test]
+    fn gateway_status_unchanged_after_timestamp_preservation_is_noop() {
+        let existing = GatewayStatus {
+            addresses: vec![],
+            conditions: vec![Condition {
+                type_: "Programmed".to_string(),
+                status: "True".to_string(),
+                observed_generation: Some(11),
+                last_transition_time: "2024-01-01T00:00:00Z".to_string(),
+                reason: "Programmed".to_string(),
+                message: "Resource has been programmed".to_string(),
+            }],
+            listeners: vec![ListenerStatus {
+                name: "http".to_string(),
+                supported_kinds: vec![],
+                attached_routes: 3,
+                conditions: vec![Condition {
+                    type_: "Accepted".to_string(),
+                    status: "True".to_string(),
+                    observed_generation: Some(11),
+                    last_transition_time: "2024-01-01T01:00:00Z".to_string(),
+                    reason: "Accepted".to_string(),
+                    message: "Resource has been accepted".to_string(),
+                }],
+            }],
+        };
+
+        let mut status = GatewayStatus {
+            addresses: vec![],
+            conditions: vec![Condition {
+                type_: "Programmed".to_string(),
+                status: "True".to_string(),
+                observed_generation: Some(11),
+                last_transition_time: "2024-02-01T00:00:00Z".to_string(),
+                reason: "Programmed".to_string(),
+                message: "Resource has been programmed".to_string(),
+            }],
+            listeners: vec![ListenerStatus {
+                name: "http".to_string(),
+                supported_kinds: vec![],
+                attached_routes: 3,
+                conditions: vec![Condition {
+                    type_: "Accepted".to_string(),
+                    status: "True".to_string(),
+                    observed_generation: Some(11),
+                    last_transition_time: "2024-02-01T01:00:00Z".to_string(),
+                    reason: "Accepted".to_string(),
+                    message: "Resource has been accepted".to_string(),
+                }],
+            }],
+        };
+
+        preserve_gateway_status_timestamps(&mut status, &existing);
+
+        assert_eq!(
+            status.conditions[0].last_transition_time,
+            existing.conditions[0].last_transition_time
+        );
+        assert_eq!(
+            status.listeners[0].conditions[0].last_transition_time,
+            existing.listeners[0].conditions[0].last_transition_time
+        );
+        assert!(gateway_status_semantically_equal(&existing, &status));
+
+        let needs_patch = !gateway_status_semantically_equal(&existing, &status);
+        assert!(!needs_patch);
+    }
+
+    #[test]
+    fn gateway_status_rejects_stale_observed_generation() {
+        let existing = GatewayStatus {
+            addresses: vec![],
+            conditions: vec![Condition {
+                type_: "Programmed".to_string(),
+                status: "True".to_string(),
+                observed_generation: Some(11),
+                last_transition_time: "2024-01-01T00:00:00Z".to_string(),
+                reason: "Programmed".to_string(),
+                message: "Resource has been programmed".to_string(),
+            }],
+            listeners: vec![ListenerStatus {
+                name: "http".to_string(),
+                supported_kinds: vec![],
+                attached_routes: 3,
+                conditions: vec![Condition {
+                    type_: "Accepted".to_string(),
+                    status: "True".to_string(),
+                    observed_generation: Some(11),
+                    last_transition_time: "2024-01-01T01:00:00Z".to_string(),
+                    reason: "Accepted".to_string(),
+                    message: "Resource has been accepted".to_string(),
+                }],
+            }],
+        };
+
+        let stale = GatewayStatus {
+            addresses: vec![],
+            conditions: vec![Condition {
+                type_: "Programmed".to_string(),
+                status: "True".to_string(),
+                observed_generation: Some(10),
+                last_transition_time: "2024-02-01T00:00:00Z".to_string(),
+                reason: "Programmed".to_string(),
+                message: "Resource has been programmed".to_string(),
+            }],
+            listeners: vec![ListenerStatus {
+                name: "http".to_string(),
+                supported_kinds: vec![],
+                attached_routes: 3,
+                conditions: vec![Condition {
+                    type_: "Accepted".to_string(),
+                    status: "True".to_string(),
+                    observed_generation: Some(10),
+                    last_transition_time: "2024-02-01T01:00:00Z".to_string(),
+                    reason: "Accepted".to_string(),
+                    message: "Resource has been accepted".to_string(),
+                }],
+            }],
+        };
+
+        assert!(!gateway_status_semantically_equal(&existing, &stale));
     }
 
     // ── Programmed / rollout-convergence logic (unit-level, no async) ────────
@@ -2969,6 +3095,96 @@ mod tests {
         assert!(outcome.observation_fault.is_none());
     }
 
+    #[test]
+    fn managed_status_waits_for_full_rollout_convergence_before_programmed_true() {
+        use crate::reconcilers::runtime_applier::RuntimeApplyResult;
+        use crate::reconcilers::store::{PlannerSnapshot, SnapshotResult};
+        use std::collections::{HashMap, HashSet};
+
+        let gateway = make_gateway_with_annotation("prod", "my-gw", Some("true"));
+
+        let snapshot = SnapshotResult::Ready(PlannerSnapshot {
+            gateways: HashMap::from([("prod/my-gw".to_string(), gateway.clone())]),
+            gateway_classes: HashMap::new(),
+            http_routes: HashMap::new(),
+            tcp_routes: HashMap::new(),
+            tls_routes: HashMap::new(),
+            service_endpoints: HashMap::new(),
+            tls_secrets: HashMap::new(),
+            reference_grants: HashMap::new(),
+            service_ref_index: HashSet::new(),
+            namespace_labels: HashMap::new(),
+        });
+
+        let before = ObservedRuntimeState {
+            ready_replicas: Some(1),
+            deploy_observed_generation: Some(1),
+            deploy_generation: Some(2),
+            updated_replicas: Some(0),
+            available_replicas: Some(0),
+            desired_replicas: Some(1),
+            ..Default::default()
+        };
+
+        let after = ObservedRuntimeState {
+            ready_replicas: Some(1),
+            deploy_observed_generation: Some(2),
+            deploy_generation: Some(2),
+            updated_replicas: Some(1),
+            available_replicas: Some(1),
+            desired_replicas: Some(1),
+            ..Default::default()
+        };
+
+        let (before_listeners, before_programmed, before_warming, before_fault) =
+            build_managed_runtime_status(
+                &gateway,
+                "prod",
+                "my-gw",
+                super::ManagedRuntimeInput::Applied(
+                    before,
+                    RuntimeApplyResult::default(),
+                    Box::new(snapshot.clone()),
+                ),
+            );
+        let (after_listeners, after_programmed, after_warming, after_fault) =
+            build_managed_runtime_status(
+                &gateway,
+                "prod",
+                "my-gw",
+                super::ManagedRuntimeInput::Applied(
+                    after,
+                    RuntimeApplyResult::default(),
+                    Box::new(snapshot),
+                ),
+            );
+
+        assert!(!before_programmed, "partial rollout must not report programmed");
+        assert!(after_programmed, "converged rollout must report programmed");
+        assert!(!before_warming);
+        assert!(!after_warming);
+        assert!(before_fault.is_none());
+        assert!(after_fault.is_none());
+
+        let before_programmed_cond = before_listeners[0]
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Programmed")
+            .expect("listener must have Programmed condition");
+        assert_eq!(before_programmed_cond.status, "False");
+        assert_eq!(before_programmed_cond.reason, "DeploymentNotReady");
+        assert_eq!(before_programmed_cond.observed_generation, Some(1));
+
+        let after_programmed_cond = after_listeners[0]
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Programmed")
+            .expect("listener must have Programmed condition");
+        assert_eq!(after_programmed_cond.status, "True");
+        assert_eq!(after_programmed_cond.reason, "Programmed");
+        assert_eq!(after_programmed_cond.observed_generation, Some(1));
+    }
+
     // ── Deferred observation error: message fidelity end-to-end ──────────────
     //
     // Verify that the exact fault string from ManagedRuntimeError::ObservationError
@@ -4152,5 +4368,77 @@ mod tests {
         let conditions = super::build_gateway_conditions(true, &None, false, None);
         assert_eq!(conditions[0].observed_generation, None);
         assert_eq!(conditions[1].observed_generation, None);
+    }
+
+    #[test]
+    fn gateway_status_threads_reconciled_generation_into_conditions_and_listeners() {
+        let mut gw = make_gateway_with_annotation("prod", "my-gw", None);
+        gw.metadata.generation = Some(42);
+
+        let (listener_statuses, programmed, only_store_not_ready, fault) =
+            super::build_managed_runtime_status(
+                &gw,
+                "prod",
+                "my-gw",
+                super::ManagedRuntimeInput::StoreNotReady(ObservedRuntimeState::default()),
+            );
+
+        let conditions = super::build_gateway_conditions(
+            programmed,
+            &fault,
+            only_store_not_ready,
+            gw.metadata.generation,
+        );
+
+        let status = GatewayStatus {
+            addresses: vec![],
+            conditions,
+            listeners: listener_statuses,
+        };
+
+        assert!(status
+            .conditions
+            .iter()
+            .all(|c| c.observed_generation == Some(42)));
+        assert!(status.listeners.iter().all(|listener| listener
+            .conditions
+            .iter()
+            .all(|c| c.observed_generation == Some(42))));
+    }
+
+    #[test]
+    fn gateway_status_keeps_missing_generation_unset() {
+        let mut gw = make_gateway_with_annotation("prod", "my-gw", None);
+        gw.metadata.generation = None;
+
+        let (listener_statuses, programmed, only_store_not_ready, fault) =
+            super::build_managed_runtime_status(
+                &gw,
+                "prod",
+                "my-gw",
+                super::ManagedRuntimeInput::StoreNotReady(ObservedRuntimeState::default()),
+            );
+
+        let conditions = super::build_gateway_conditions(
+            programmed,
+            &fault,
+            only_store_not_ready,
+            gw.metadata.generation,
+        );
+
+        let status = GatewayStatus {
+            addresses: vec![],
+            conditions,
+            listeners: listener_statuses,
+        };
+
+        assert!(status
+            .conditions
+            .iter()
+            .all(|c| c.observed_generation.is_none()));
+        assert!(status.listeners.iter().all(|listener| listener
+            .conditions
+            .iter()
+            .all(|c| c.observed_generation.is_none())));
     }
 }

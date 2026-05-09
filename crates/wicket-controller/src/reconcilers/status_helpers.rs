@@ -41,3 +41,145 @@ pub fn preserve_condition_timestamps(new: &mut [Condition], existing: &[Conditio
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn condition(
+        type_: &str,
+        status: &str,
+        reason: &str,
+        message: &str,
+        observed_generation: Option<i64>,
+        last_transition_time: &str,
+    ) -> Condition {
+        Condition {
+            type_: type_.to_string(),
+            status: status.to_string(),
+            observed_generation,
+            last_transition_time: last_transition_time.to_string(),
+            reason: reason.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn conditions_semantically_equal_ignores_last_transition_time() {
+        let a = [condition(
+            "Accepted",
+            "True",
+            "Accepted",
+            "Resource has been accepted",
+            Some(7),
+            "2024-01-01T00:00:00Z",
+        )];
+        let b = [condition(
+            "Accepted",
+            "True",
+            "Accepted",
+            "Resource has been accepted",
+            Some(7),
+            "2024-01-02T00:00:00Z",
+        )];
+
+        assert!(conditions_semantically_equal(&a, &b));
+    }
+
+    #[test]
+    fn conditions_semantically_equal_detects_real_changes() {
+        let base = condition(
+            "Accepted",
+            "True",
+            "Accepted",
+            "Resource has been accepted",
+            Some(7),
+            "2024-01-01T00:00:00Z",
+        );
+
+        for changed in [
+            condition(
+                "Accepted",
+                "False",
+                "Accepted",
+                "Resource has been accepted",
+                Some(7),
+                "2024-01-02T00:00:00Z",
+            ),
+            condition(
+                "Accepted",
+                "True",
+                "Rejected",
+                "Resource has been accepted",
+                Some(7),
+                "2024-01-02T00:00:00Z",
+            ),
+            condition(
+                "Accepted",
+                "True",
+                "Accepted",
+                "Something else",
+                Some(7),
+                "2024-01-02T00:00:00Z",
+            ),
+            condition(
+                "Accepted",
+                "True",
+                "Accepted",
+                "Resource has been accepted",
+                Some(8),
+                "2024-01-02T00:00:00Z",
+            ),
+        ] {
+            assert!(!conditions_semantically_equal(&[base.clone()], &[changed]));
+        }
+    }
+
+    #[test]
+    fn preserve_condition_timestamps_keeps_matching_statuses_stable() {
+        let existing = [
+            condition(
+                "Accepted",
+                "True",
+                "Accepted",
+                "Resource has been accepted",
+                Some(7),
+                "2024-01-01T00:00:00Z",
+            ),
+            condition(
+                "Programmed",
+                "False",
+                "DeploymentNotReady",
+                "Managed runtime Deployment rollout has not converged",
+                Some(7),
+                "2024-01-01T01:00:00Z",
+            ),
+        ];
+        let mut new = vec![
+            condition(
+                "Accepted",
+                "True",
+                "Accepted",
+                "Resource has been accepted",
+                Some(7),
+                "2024-02-01T00:00:00Z",
+            ),
+            condition(
+                "Programmed",
+                "True",
+                "Programmed",
+                "Resource has been programmed",
+                Some(7),
+                "2024-02-01T01:00:00Z",
+            ),
+        ];
+
+        preserve_condition_timestamps(&mut new, &existing);
+
+        assert_eq!(
+            new[0].last_transition_time,
+            existing[0].last_transition_time
+        );
+        assert_eq!(new[1].last_transition_time, "2024-02-01T01:00:00Z");
+    }
+}

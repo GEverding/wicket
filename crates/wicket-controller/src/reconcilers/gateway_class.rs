@@ -28,7 +28,39 @@ pub enum GatewayClassError {
     StatusUpdateError(String),
 }
 
-/// Reconcile a GatewayClass resource.
+/// Build desired GatewayClass conditions.
+fn build_gateway_class_conditions(
+    existing_conditions: &[Condition],
+    generation: Option<i64>,
+) -> Vec<Condition> {
+    let desired_conditions = [
+        ("Accepted", true, "Accepted", "Resource has been accepted"),
+        (
+            "SupportedVersion",
+            true,
+            "SupportedVersion",
+            "Gateway API v1 is supported",
+        ),
+    ];
+
+    desired_conditions
+        .iter()
+        .map(|(type_, status, reason, message)| {
+            let mut cond = Condition::new(type_, *status, reason, message)
+                .with_observed_generation(generation);
+
+            let status_str = if *status { "True" } else { "False" };
+            if let Some(existing) = existing_conditions.iter().find(|c| c.type_ == *type_) {
+                if existing.status == status_str {
+                    cond.last_transition_time = existing.last_transition_time.clone();
+                }
+            }
+
+            cond
+        })
+        .collect()
+}
+
 pub async fn reconcile_gateway_class(
     gc: Arc<GatewayClass>,
     ctx: Arc<Context>,
@@ -59,7 +91,15 @@ pub async fn reconcile_gateway_class(
 
     let generation = gc.metadata.generation;
 
-    // Build desired conditions.
+    // Check if status already matches — avoid patching when nothing changed
+    // to prevent an infinite reconciliation loop.
+    let existing_conditions = gc
+        .status
+        .as_ref()
+        .map(|s| &s.conditions)
+        .cloned()
+        .unwrap_or_default();
+
     let desired_conditions = [
         ("Accepted", true, "Accepted", "Resource has been accepted"),
         (
@@ -69,15 +109,6 @@ pub async fn reconcile_gateway_class(
             "Gateway API v1 is supported",
         ),
     ];
-
-    // Check if status already matches — avoid patching when nothing changed
-    // to prevent an infinite reconciliation loop.
-    let existing_conditions = gc
-        .status
-        .as_ref()
-        .map(|s| &s.conditions)
-        .cloned()
-        .unwrap_or_default();
 
     let status_matches = desired_conditions
         .iter()
@@ -106,23 +137,7 @@ pub async fn reconcile_gateway_class(
 
     // Build new status, preserving lastTransitionTime for conditions whose
     // status hasn't changed.
-    let conditions: Vec<Condition> = desired_conditions
-        .iter()
-        .map(|(type_, status, reason, message)| {
-            let mut cond = Condition::new(type_, *status, reason, message)
-                .with_observed_generation(generation);
-
-            // Preserve lastTransitionTime if the condition status hasn't changed.
-            let status_str = if *status { "True" } else { "False" };
-            if let Some(existing) = existing_conditions.iter().find(|c| c.type_ == *type_) {
-                if existing.status == status_str {
-                    cond.last_transition_time = existing.last_transition_time.clone();
-                }
-            }
-
-            cond
-        })
-        .collect();
+    let conditions = build_gateway_class_conditions(&existing_conditions, generation);
 
     let status = GatewayClassStatus {
         conditions,
@@ -197,6 +212,176 @@ async fn update_gateway_class_metrics(client: &Client) {
         Err(e) => {
             tracing::warn!(error = %e, "Failed to list GatewayClasses for metrics");
         }
+    }
+}
+
+#[cfg(test)]
+fn gateway_class_status_matches(
+    existing_conditions: &[Condition],
+    generation: Option<i64>,
+) -> bool {
+    let desired_conditions = [
+        ("Accepted", true, "Accepted", "Resource has been accepted"),
+        (
+            "SupportedVersion",
+            true,
+            "SupportedVersion",
+            "Gateway API v1 is supported",
+        ),
+    ];
+
+    desired_conditions
+        .iter()
+        .all(|(type_, status, reason, _msg)| {
+            let status_str = if *status { "True" } else { "False" };
+            existing_conditions.iter().any(|c| {
+                c.type_ == *type_
+                    && c.status == status_str
+                    && c.reason == *reason
+                    && c.observed_generation == generation
+            })
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn condition(
+        type_: &str,
+        status: bool,
+        reason: &str,
+        message: &str,
+        generation: Option<i64>,
+        last_transition_time: &str,
+    ) -> Condition {
+        Condition {
+            type_: type_.to_string(),
+            status: if status { "True" } else { "False" }.to_string(),
+            observed_generation: generation,
+            last_transition_time: last_transition_time.to_string(),
+            reason: reason.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn gateway_class_status_matching_skips_timestamp_only_changes() {
+        let generation = Some(12);
+        let existing = vec![
+            condition(
+                "Accepted",
+                true,
+                "Accepted",
+                "Resource has been accepted",
+                generation,
+                "2024-01-01T00:00:00Z",
+            ),
+            condition(
+                "SupportedVersion",
+                true,
+                "SupportedVersion",
+                "Gateway API v1 is supported",
+                generation,
+                "2024-01-01T00:00:01Z",
+            ),
+        ];
+
+        assert!(gateway_class_status_matches(&existing, generation));
+
+        let updated = vec![
+            condition(
+                "Accepted",
+                true,
+                "Accepted",
+                "Resource has been accepted",
+                generation,
+                "2024-02-01T00:00:00Z",
+            ),
+            condition(
+                "SupportedVersion",
+                true,
+                "SupportedVersion",
+                "Gateway API v1 is supported",
+                generation,
+                "2024-02-01T00:00:01Z",
+            ),
+        ];
+
+        assert!(gateway_class_status_matches(&updated, generation));
+    }
+
+    #[test]
+    fn gateway_class_status_matching_rejects_real_changes() {
+        let generation = Some(12);
+        let existing = vec![
+            condition(
+                "Accepted",
+                true,
+                "Accepted",
+                "Resource has been accepted",
+                generation,
+                "2024-01-01T00:00:00Z",
+            ),
+            condition(
+                "SupportedVersion",
+                true,
+                "SupportedVersion",
+                "Gateway API v1 is supported",
+                generation,
+                "2024-01-01T00:00:01Z",
+            ),
+        ];
+
+        let wrong_reason = vec![
+            condition(
+                "Accepted",
+                true,
+                "Different",
+                "Resource has been accepted",
+                generation,
+                "2024-02-01T00:00:00Z",
+            ),
+            condition(
+                "SupportedVersion",
+                true,
+                "SupportedVersion",
+                "Gateway API v1 is supported",
+                generation,
+                "2024-02-01T00:00:01Z",
+            ),
+        ];
+
+        assert!(!gateway_class_status_matches(&wrong_reason, generation));
+        assert!(!gateway_class_status_matches(&existing, Some(13)));
+    }
+
+    #[test]
+    fn gateway_class_conditions_carry_current_generation() {
+        let existing = vec![condition(
+            "Accepted",
+            true,
+            "Accepted",
+            "Resource has been accepted",
+            Some(11),
+            "2024-01-01T00:00:00Z",
+        )];
+
+        let conditions = build_gateway_class_conditions(&existing, Some(12));
+
+        assert_eq!(conditions.len(), 2);
+        assert!(conditions.iter().all(|c| c.observed_generation == Some(12)));
+        assert_ne!(
+            conditions[0].observed_generation,
+            existing[0].observed_generation
+        );
+    }
+
+    #[test]
+    fn gateway_class_conditions_keep_missing_generation_unset() {
+        let conditions = build_gateway_class_conditions(&[], None);
+
+        assert!(conditions.iter().all(|c| c.observed_generation.is_none()));
     }
 }
 

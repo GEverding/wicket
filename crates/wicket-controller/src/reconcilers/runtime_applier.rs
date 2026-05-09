@@ -677,57 +677,7 @@ async fn apply_deployment(
         .collect();
 
     // Volumes and mounts for the ConfigMap and referenced TLS Secrets.
-    let volume_mount = VolumeMount {
-        name: "config".to_string(),
-        mount_path: "/etc/wicket".to_string(),
-        read_only: Some(true),
-        ..Default::default()
-    };
-
-    let config_volume = Volume {
-        name: "config".to_string(),
-        config_map: Some(ConfigMapVolumeSource {
-            name: plan.config_map_name.clone(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    let mut volume_mounts = vec![volume_mount];
-    let mut volumes = vec![config_volume];
-    let mut seen_volume_names: HashSet<String> = HashSet::new();
-    seen_volume_names.insert("config".to_string());
-
-    for mount in &plan.tls_secret_mounts {
-        let raw_name = format!("tls-{}", mount.secret_name);
-        let vol_name = if raw_name.len() > 63 {
-            raw_name[..63].to_string()
-        } else {
-            raw_name
-        };
-
-        if !seen_volume_names.insert(vol_name.clone()) {
-            continue;
-        }
-
-        volume_mounts.push(VolumeMount {
-            name: vol_name.clone(),
-            mount_path: mount.mount_path.clone(),
-            read_only: Some(true),
-            ..Default::default()
-        });
-
-        volumes.push(Volume {
-            name: vol_name,
-            secret: Some(SecretVolumeSource {
-                secret_name: Some(mount.secret_name.clone()),
-                default_mode: Some(0o400),
-                optional: Some(false),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-    }
+    let (volumes, volume_mounts) = build_pod_volumes_and_mounts(plan);
 
     // Env var exposing the config revision so the proxy can log it.
     // NOTE: this env var is derived from the spec-covered fields only; it does
@@ -835,6 +785,62 @@ async fn apply_deployment(
     Ok((changed, rollout))
 }
 
+/// Build the pod volumes and volume mounts for the managed proxy Deployment.
+fn build_pod_volumes_and_mounts(plan: &GatewayRuntimePlan) -> (Vec<Volume>, Vec<VolumeMount>) {
+    let config_volume = Volume {
+        name: "config".to_string(),
+        config_map: Some(ConfigMapVolumeSource {
+            name: plan.config_map_name.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let config_mount = VolumeMount {
+        name: "config".to_string(),
+        mount_path: "/etc/wicket".to_string(),
+        read_only: Some(true),
+        ..Default::default()
+    };
+
+    let mut volumes = vec![config_volume];
+    let mut volume_mounts = vec![config_mount];
+    let mut seen_volume_names: HashSet<String> = HashSet::new();
+    seen_volume_names.insert("config".to_string());
+
+    for mount in &plan.tls_secret_mounts {
+        let raw_name = format!("tls-{}", mount.secret_name);
+        let vol_name = if raw_name.len() > 63 {
+            raw_name[..63].to_string()
+        } else {
+            raw_name
+        };
+
+        if !seen_volume_names.insert(vol_name.clone()) {
+            continue;
+        }
+
+        volume_mounts.push(VolumeMount {
+            name: vol_name.clone(),
+            mount_path: mount.mount_path.clone(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+
+        volumes.push(Volume {
+            name: vol_name,
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(mount.secret_name.clone()),
+                default_mode: Some(0o400),
+                optional: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
+    (volumes, volume_mounts)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Resource requirements helper
 // ─────────────────────────────────────────────────────────────────────────────
@@ -896,7 +902,7 @@ fn build_resource_requirements(resources: &BTreeMap<String, String>) -> Resource
 mod tests {
     use super::*;
     use crate::reconcilers::contracts::{RuntimeMetadata, ServicePortSpec, ServiceType};
-    use crate::reconcilers::runtime_plan::GatewayRuntimePlan;
+    use crate::reconcilers::runtime_plan::{GatewayRuntimePlan, TlsSecretMount};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -933,6 +939,23 @@ mod tests {
             config_changed,
             spec_changed,
         }
+    }
+
+    fn make_tls_plan() -> GatewayRuntimePlan {
+        let mut plan = make_plan(false, true, ServiceType::ClusterIP, vec![]);
+        plan.tls_secret_mounts = vec![
+            TlsSecretMount {
+                secret_namespace: "prod".to_string(),
+                secret_name: "edge-cert".to_string(),
+                mount_path: "/etc/wicket/tls/edge-cert".to_string(),
+            },
+            TlsSecretMount {
+                secret_namespace: "prod".to_string(),
+                secret_name: "api-cert".to_string(),
+                mount_path: "/etc/wicket/tls/api-cert".to_string(),
+            },
+        ];
+        plan
     }
 
     // ── managed_labels ────────────────────────────────────────────────────────
@@ -1238,6 +1261,44 @@ mod tests {
             err.is_err(),
             "overflow must be an error, not silently coerced"
         );
+    }
+
+    #[test]
+    fn build_pod_volumes_and_mounts_projects_tls_secrets() {
+        let plan = make_tls_plan();
+        let (volumes, mounts) = build_pod_volumes_and_mounts(&plan);
+
+        assert_eq!(mounts.len(), 3);
+        assert_eq!(volumes.len(), 3);
+
+        let config_mount = mounts.iter().find(|m| m.name == "config").unwrap();
+        assert_eq!(config_mount.mount_path, "/etc/wicket");
+        assert_eq!(config_mount.read_only, Some(true));
+
+        for tls in &plan.tls_secret_mounts {
+            let mount = mounts
+                .iter()
+                .find(|m| m.mount_path == tls.mount_path)
+                .expect("TLS mount must exist");
+            let volume = volumes
+                .iter()
+                .find(|v| v.name == mount.name)
+                .expect("TLS volume must exist");
+
+            assert_eq!(mount.read_only, Some(true));
+            assert_eq!(
+                volume
+                    .secret
+                    .as_ref()
+                    .and_then(|s| s.secret_name.as_deref()),
+                Some(tls.secret_name.as_str())
+            );
+            assert_eq!(volume.secret.as_ref().and_then(|s| s.optional), Some(false));
+            assert_eq!(
+                volume.secret.as_ref().and_then(|s| s.default_mode),
+                Some(0o400)
+            );
+        }
     }
 
     // ── deployment_changed semantics ──────────────────────────────────────────

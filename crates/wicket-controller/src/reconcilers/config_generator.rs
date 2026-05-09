@@ -1313,6 +1313,126 @@ mod tests {
         assert!(upstream.backends.contains(&"10.0.0.1:80".to_string()));
     }
 
+    #[test]
+    fn test_https_only_listener_config_generation() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "test-gateway"),
+            Gateway {
+                metadata: ObjectMeta {
+                    name: Some("test-gateway".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                spec: GatewaySpec {
+                    gateway_class_name: "wicket".to_string(),
+                    listeners: vec![Listener {
+                        name: "https".to_string(),
+                        hostname: None,
+                        port: 8443,
+                        protocol: ProtocolType::HTTPS,
+                        tls: None,
+                        allowed_routes: None,
+                    }],
+                    addresses: vec![],
+                    infrastructure: None,
+                },
+                status: None,
+            },
+        );
+
+        let config = state.generate_config_deterministic();
+
+        assert_eq!(config.server.listen, "0.0.0.0:8443");
+        assert_eq!(config.server.https_listen.as_deref(), Some("0.0.0.0:8443"));
+        assert!(config.server.disable_http);
+    }
+
+    #[test]
+    fn test_mixed_http_https_listener_config_generation() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "test-gateway"),
+            Gateway {
+                metadata: ObjectMeta {
+                    name: Some("test-gateway".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                spec: GatewaySpec {
+                    gateway_class_name: "wicket".to_string(),
+                    listeners: vec![
+                        Listener {
+                            name: "http".to_string(),
+                            hostname: None,
+                            port: 8080,
+                            protocol: ProtocolType::HTTP,
+                            tls: None,
+                            allowed_routes: None,
+                        },
+                        Listener {
+                            name: "https".to_string(),
+                            hostname: None,
+                            port: 8443,
+                            protocol: ProtocolType::HTTPS,
+                            tls: None,
+                            allowed_routes: None,
+                        },
+                    ],
+                    addresses: vec![],
+                    infrastructure: None,
+                },
+                status: None,
+            },
+        );
+
+        let config = state.generate_config_deterministic();
+
+        assert_eq!(config.server.listen, "0.0.0.0:8080");
+        assert_eq!(config.server.https_listen.as_deref(), Some("0.0.0.0:8443"));
+        assert!(!config.server.disable_http);
+    }
+
+    #[test]
+    fn test_https_only_listener_config_toml_round_trip() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "test-gateway"),
+            Gateway {
+                metadata: ObjectMeta {
+                    name: Some("test-gateway".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                spec: GatewaySpec {
+                    gateway_class_name: "wicket".to_string(),
+                    listeners: vec![Listener {
+                        name: "https".to_string(),
+                        hostname: None,
+                        port: 8443,
+                        protocol: ProtocolType::HTTPS,
+                        tls: None,
+                        allowed_routes: None,
+                    }],
+                    addresses: vec![],
+                    infrastructure: None,
+                },
+                status: None,
+            },
+        );
+
+        let config = state.generate_config_deterministic();
+        let toml = toml::to_string(&config).expect("serialize https-only config");
+        let parsed: WicketConfig = toml::from_str(&toml).expect("parse https-only config");
+
+        assert_eq!(parsed.server.listen, "0.0.0.0:8443");
+        assert_eq!(parsed.server.https_listen.as_deref(), Some("0.0.0.0:8443"));
+        assert!(parsed.server.disable_http);
+    }
+
     /// Test: Config generation with valid Gateway + HTTPRoute + backends.
     #[test]
     fn test_config_generation_integration_with_valid_resources() {

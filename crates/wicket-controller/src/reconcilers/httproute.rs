@@ -73,6 +73,29 @@ fn httproute_status_semantically_equal(a: &HTTPRouteStatus, b: &HTTPRouteStatus)
     })
 }
 
+fn build_route_parent_status(
+    parent_ref: crate::crds::ParentReference,
+    controller_name: String,
+    accepted_condition: Condition,
+    route_generation: Option<i64>,
+    accepted: bool,
+) -> RouteParentStatus {
+    let conditions = if accepted {
+        vec![
+            accepted_condition.with_observed_generation(route_generation),
+            Condition::resolved_refs().with_observed_generation(route_generation),
+        ]
+    } else {
+        vec![accepted_condition.with_observed_generation(route_generation)]
+    };
+
+    RouteParentStatus {
+        parent_ref,
+        controller_name,
+        conditions,
+    }
+}
+
 /// Reconcile an HTTPRoute resource.
 pub async fn reconcile_httproute(
     route: Arc<HTTPRoute>,
@@ -108,6 +131,7 @@ pub async fn reconcile_httproute(
     // Validate parent references and check if they're managed by Wicket
     let mut parent_statuses = Vec::new();
     let mut has_valid_parent = false;
+    let route_generation = route.metadata.generation;
 
     for parent_ref in &route.spec.parent_refs {
         let parent_ns = parent_ref.namespace.as_deref().unwrap_or(&namespace);
@@ -133,18 +157,18 @@ pub async fn reconcile_httproute(
                     message = "Parent Gateway not found",
                     "Route parent validation failed"
                 );
-                parent_statuses.push(RouteParentStatus {
-                    parent_ref: parent_ref.clone(),
-                    // Use the constant so the written value always matches the
-                    // value checked by parents_accepted_by_wicket at render time.
-                    controller_name: WICKET_CONTROLLER_NAME.to_string(),
-                    conditions: vec![Condition::new(
+                parent_statuses.push(build_route_parent_status(
+                    parent_ref.clone(),
+                    WICKET_CONTROLLER_NAME.to_string(),
+                    Condition::new(
                         "Accepted",
                         false,
                         "InvalidParentRef",
                         "Parent Gateway not found",
-                    )],
-                });
+                    ),
+                    route_generation,
+                    false,
+                ));
                 continue;
             }
             Err(e) => {
@@ -206,19 +230,18 @@ pub async fn reconcile_httproute(
                 message = "Gateway is not managed by Wicket",
                 "Route parent validation failed"
             );
-            parent_statuses.push(RouteParentStatus {
-                parent_ref: parent_ref.clone(),
-                // Use the constant so every written status entry carries the
-                // same authoritative controller name that the accepted-route
-                // filter in config_generator checks.
-                controller_name: WICKET_CONTROLLER_NAME.to_string(),
-                conditions: vec![Condition::new(
+            parent_statuses.push(build_route_parent_status(
+                parent_ref.clone(),
+                WICKET_CONTROLLER_NAME.to_string(),
+                Condition::new(
                     "Accepted",
                     false,
                     "InvalidParentRef",
                     "Gateway is not managed by Wicket",
-                )],
-            });
+                ),
+                route_generation,
+                false,
+            ));
             continue;
         }
 
@@ -276,17 +299,13 @@ pub async fn reconcile_httproute(
             has_valid_parent = true;
         }
 
-        parent_statuses.push(RouteParentStatus {
-            parent_ref: parent_ref.clone(),
-            // Authoritative constant -- matches what config_generator filters on.
-            controller_name: WICKET_CONTROLLER_NAME.to_string(),
-            // Preserve existing ResolvedRefs=True behavior for this slice.
-            conditions: if is_accepted {
-                vec![accepted_condition, Condition::resolved_refs()]
-            } else {
-                vec![accepted_condition]
-            },
-        });
+        parent_statuses.push(build_route_parent_status(
+            parent_ref.clone(),
+            WICKET_CONTROLLER_NAME.to_string(),
+            accepted_condition,
+            route_generation,
+            is_accepted,
+        ));
     }
 
     // Update HTTPRoute status
@@ -1519,6 +1538,131 @@ mod tests {
                 status
             );
         }
+    }
+
+    #[test]
+    fn httproute_status_unchanged_after_timestamp_preservation_is_noop() {
+        let parent_ref = ParentReference {
+            group: "gateway.networking.k8s.io".to_string(),
+            kind: "Gateway".to_string(),
+            namespace: Some("default".to_string()),
+            name: "gw".to_string(),
+            section_name: Some("http".to_string()),
+            port: Some(80),
+        };
+
+        let existing = HTTPRouteStatus {
+            parents: vec![build_route_parent_status(
+                parent_ref.clone(),
+                WICKET_CONTROLLER_NAME.to_string(),
+                Condition {
+                    type_: "Accepted".to_string(),
+                    status: "True".to_string(),
+                    observed_generation: Some(9),
+                    last_transition_time: "2024-01-01T00:00:00Z".to_string(),
+                    reason: "Accepted".to_string(),
+                    message: "Resource has been accepted".to_string(),
+                },
+                Some(9),
+                true,
+            )],
+        };
+
+        let mut status = HTTPRouteStatus {
+            parents: vec![build_route_parent_status(
+                parent_ref,
+                WICKET_CONTROLLER_NAME.to_string(),
+                Condition {
+                    type_: "Accepted".to_string(),
+                    status: "True".to_string(),
+                    observed_generation: Some(9),
+                    last_transition_time: "2024-02-01T00:00:00Z".to_string(),
+                    reason: "Accepted".to_string(),
+                    message: "Resource has been accepted".to_string(),
+                },
+                Some(9),
+                true,
+            )],
+        };
+
+        preserve_httproute_status_timestamps(&mut status, &existing);
+
+        assert_eq!(
+            status.parents[0].conditions[0].last_transition_time,
+            existing.parents[0].conditions[0].last_transition_time
+        );
+        assert!(httproute_status_semantically_equal(&existing, &status));
+
+        let needs_patch = !httproute_status_semantically_equal(&existing, &status);
+        assert!(!needs_patch);
+    }
+
+    #[test]
+    fn route_parent_status_threads_route_generation_for_accepted_and_rejected_parents() {
+        let parent_ref = ParentReference {
+            group: "gateway.networking.k8s.io".to_string(),
+            kind: "Gateway".to_string(),
+            namespace: Some("default".to_string()),
+            name: "gw".to_string(),
+            section_name: Some("http".to_string()),
+            port: Some(80),
+        };
+
+        let accepted = build_route_parent_status(
+            parent_ref.clone(),
+            WICKET_CONTROLLER_NAME.to_string(),
+            Condition::accepted(),
+            Some(9),
+            true,
+        );
+        assert_eq!(accepted.conditions.len(), 2);
+        assert!(accepted
+            .conditions
+            .iter()
+            .all(|c| c.observed_generation == Some(9)));
+
+        let rejected = build_route_parent_status(
+            parent_ref,
+            WICKET_CONTROLLER_NAME.to_string(),
+            Condition::new("Accepted", false, "InvalidParentRef", "Gateway not found"),
+            Some(9),
+            false,
+        );
+        assert_eq!(rejected.conditions.len(), 1);
+        assert_eq!(rejected.conditions[0].observed_generation, Some(9));
+    }
+
+    #[test]
+    fn httproute_status_rejects_stale_observed_generation() {
+        let parent_ref = ParentReference {
+            group: "gateway.networking.k8s.io".to_string(),
+            kind: "Gateway".to_string(),
+            namespace: Some("default".to_string()),
+            name: "gw".to_string(),
+            section_name: Some("http".to_string()),
+            port: Some(80),
+        };
+
+        let current = HTTPRouteStatus {
+            parents: vec![build_route_parent_status(
+                parent_ref.clone(),
+                WICKET_CONTROLLER_NAME.to_string(),
+                Condition::accepted(),
+                Some(9),
+                true,
+            )],
+        };
+        let stale = HTTPRouteStatus {
+            parents: vec![build_route_parent_status(
+                parent_ref,
+                WICKET_CONTROLLER_NAME.to_string(),
+                Condition::accepted(),
+                Some(8),
+                true,
+            )],
+        };
+
+        assert!(!httproute_status_semantically_equal(&current, &stale));
     }
 
     // ── Plan-cache tests (Issue MED) ──────────────────────────────────────────

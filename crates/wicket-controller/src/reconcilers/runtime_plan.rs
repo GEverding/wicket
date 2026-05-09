@@ -1208,8 +1208,9 @@ impl Planner for GatewayRuntimePlanner {
 mod tests {
     use super::*;
     use crate::crds::{
-        BackendRef, Gateway, GatewaySpec, HTTPBackendRef, HTTPRoute, HTTPRouteRule, HTTPRouteSpec,
-        Listener, ParentReference, ProtocolType,
+        BackendRef, Gateway, GatewaySpec, GatewayTLSConfig, HTTPBackendRef, HTTPRoute,
+        HTTPRouteRule, HTTPRouteSpec, Listener, ParentReference, ProtocolType,
+        SecretObjectReference, TLSModeType,
     };
     use crate::reconcilers::config_generator::ServiceEndpoints;
     use crate::reconcilers::store::PlannerSnapshot;
@@ -1250,6 +1251,35 @@ mod tests {
             protocol,
             tls: None,
             allowed_routes: None,
+        }
+    }
+
+    fn make_https_listener(
+        name: &str,
+        port: u16,
+        cert_refs: Vec<SecretObjectReference>,
+    ) -> Listener {
+        Listener {
+            name: name.to_string(),
+            hostname: None,
+            port,
+            protocol: ProtocolType::HTTPS,
+            tls: Some(GatewayTLSConfig {
+                mode: TLSModeType::Terminate,
+                certificate_refs: cert_refs,
+                options: None,
+                frontend_validation: None,
+            }),
+            allowed_routes: None,
+        }
+    }
+
+    fn make_secret_ref(namespace: Option<&str>, name: &str) -> SecretObjectReference {
+        SecretObjectReference {
+            group: String::new(),
+            kind: "Secret".to_string(),
+            name: name.to_string(),
+            namespace: namespace.map(str::to_string),
         }
     }
 
@@ -1547,6 +1577,143 @@ mod tests {
     }
 
     #[test]
+    fn tls_secret_mounts_are_deduplicated_and_sorted() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-1",
+            vec![
+                make_https_listener(
+                    "https-a",
+                    443,
+                    vec![
+                        make_secret_ref(Some("prod"), "shared-cert"),
+                        make_secret_ref(Some("zeta"), "z-cert"),
+                    ],
+                ),
+                make_https_listener(
+                    "https-b",
+                    8443,
+                    vec![make_secret_ref(Some("prod"), "shared-cert")],
+                ),
+                make_https_listener("https-c", 9443, vec![make_secret_ref(None, "alpha-cert")]),
+            ],
+        );
+        let input = make_input(
+            "prod",
+            "my-gw",
+            make_snapshot(gw),
+            ObservedRuntimeState::default(),
+        );
+        let plan = GatewayRuntimePlanner.plan(&input).unwrap();
+
+        assert_eq!(
+            plan.tls_secret_mounts,
+            vec![
+                TlsSecretMount {
+                    secret_namespace: "prod".to_string(),
+                    secret_name: "alpha-cert".to_string(),
+                    mount_path: tls_mount_dir("alpha-cert"),
+                },
+                TlsSecretMount {
+                    secret_namespace: "prod".to_string(),
+                    secret_name: "shared-cert".to_string(),
+                    mount_path: tls_mount_dir("shared-cert"),
+                },
+                TlsSecretMount {
+                    secret_namespace: "zeta".to_string(),
+                    secret_name: "z-cert".to_string(),
+                    mount_path: tls_mount_dir("z-cert"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tls_secret_mounts_deduplicate_shared_secret_across_listeners() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-1",
+            vec![
+                make_https_listener(
+                    "https-a",
+                    443,
+                    vec![make_secret_ref(Some("prod"), "shared-cert")],
+                ),
+                make_https_listener(
+                    "https-b",
+                    8443,
+                    vec![make_secret_ref(Some("prod"), "shared-cert")],
+                ),
+            ],
+        );
+        let input = make_input(
+            "prod",
+            "my-gw",
+            make_snapshot(gw),
+            ObservedRuntimeState::default(),
+        );
+        let plan = GatewayRuntimePlanner.plan(&input).unwrap();
+
+        assert_eq!(plan.tls_secret_mounts.len(), 1);
+        assert_eq!(
+            plan.tls_secret_mounts[0],
+            TlsSecretMount {
+                secret_namespace: "prod".to_string(),
+                secret_name: "shared-cert".to_string(),
+                mount_path: tls_mount_dir("shared-cert"),
+            }
+        );
+    }
+
+    #[test]
+    fn generated_tls_paths_match_planned_mounts() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-1",
+            vec![make_https_listener(
+                "https",
+                443,
+                vec![make_secret_ref(None, "edge-cert")],
+            )],
+        );
+        let input = make_input(
+            "prod",
+            "my-gw",
+            make_snapshot(gw),
+            ObservedRuntimeState::default(),
+        );
+        let plan = GatewayRuntimePlanner.plan(&input).unwrap();
+
+        let mount = plan
+            .tls_secret_mounts
+            .iter()
+            .find(|m| m.secret_name == "edge-cert")
+            .expect("edge-cert mount must be planned");
+
+        assert!(
+            plan.config_toml
+                .contains(&format!("{}/tls.crt", mount.mount_path)),
+            "config must point at pod-mounted cert file"
+        );
+        assert!(
+            plan.config_toml
+                .contains(&format!("{}/tls.key", mount.mount_path)),
+            "config must point at pod-mounted key file"
+        );
+        assert!(
+            !plan.config_toml.contains("/var/run/wicket/tls"),
+            "config must not reference controller-local TLS write paths"
+        );
+        assert!(
+            !plan.tls_secret_mounts.is_empty(),
+            "config may not reference TLS cert files without mounted Secrets"
+        );
+    }
+
+    #[test]
     fn service_ports_mixed_udp_and_tcp_excludes_udp() {
         // A gateway with both a supported and an unsupported listener must
         // produce service ports only for the supported one.
@@ -1623,6 +1790,22 @@ mod tests {
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].name, "http-a");
         assert_eq!(ports[0].port, 80);
+    }
+
+    #[test]
+    fn service_ports_duplicate_https_443_is_deduped() {
+        let mut https_a = make_listener("https-a", 443, ProtocolType::HTTPS);
+        https_a.hostname = Some("a.example.com".to_string());
+        let mut https_b = make_listener("https-b", 443, ProtocolType::HTTPS);
+        https_b.hostname = Some("b.example.com".to_string());
+
+        let gw = make_gateway("prod", "my-gw", "uid-1", vec![https_a, https_b]);
+        let ports = service_ports_from_listeners(&gw).unwrap();
+
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].name, "https-a");
+        assert_eq!(ports[0].port, 443);
+        assert_eq!(ports[0].protocol, "TCP");
     }
 
     // ── Listener status intents ───────────────────────────────────────────────
@@ -2043,6 +2226,29 @@ mod tests {
         assert_eq!(plan.service_ports.len(), 1);
         assert_eq!(plan.service_ports[0].port, 80);
         assert_eq!(plan.service_ports[0].name, "http-a"); // first listener wins
+    }
+
+    #[test]
+    fn planner_dedupes_shared_https_443_and_keeps_spec_hash_stable() {
+        let mut https_a = make_listener("https-a", 443, ProtocolType::HTTPS);
+        https_a.hostname = Some("a.example.com".to_string());
+        let mut https_b = make_listener("https-b", 443, ProtocolType::HTTPS);
+        https_b.hostname = Some("b.example.com".to_string());
+
+        let gw = make_gateway("prod", "my-gw", "uid-abc", vec![https_a, https_b]);
+        let snap1 = make_snapshot(gw.clone());
+        let snap2 = make_snapshot(gw);
+
+        let input1 = make_input("prod", "my-gw", snap1, ObservedRuntimeState::default());
+        let input2 = make_input("prod", "my-gw", snap2, ObservedRuntimeState::default());
+
+        let plan1 = GatewayRuntimePlanner.plan(&input1).unwrap();
+        let plan2 = GatewayRuntimePlanner.plan(&input2).unwrap();
+
+        assert_eq!(plan1.service_ports.len(), 1);
+        assert_eq!(plan1.service_ports[0].port, 443);
+        assert_eq!(plan1.service_ports[0].protocol, "TCP");
+        assert_eq!(plan1.spec_hash, plan2.spec_hash);
     }
 
     #[test]

@@ -911,8 +911,13 @@ impl SharedStore {
 mod tests {
     use super::*;
     use crate::crds::{
-        BackendRef, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec, ParentReference, TCPRoute,
-        TLSRoute,
+        BackendRef, Gateway, GatewaySpec, HTTPBackendRef, HTTPRouteRule, HTTPRouteSpec, Listener,
+        ParentReference, ProtocolType, TCPRoute, TLSRoute,
+    };
+    use crate::reconcilers::attachment_planner::{AttachmentPlanInput, AttachmentPlanner};
+    use crate::reconcilers::contracts::Planner;
+    use crate::reconcilers::runtime_plan::{
+        ControllerConfig, GatewayRuntimePlanner, ObservedRuntimeState, RuntimePlanInput,
     };
     use kube::core::ObjectMeta;
 
@@ -927,6 +932,41 @@ mod tests {
             section_name: None,
             port: None,
         }
+    }
+
+    fn make_gateway(name: &str, namespace: &str) -> Gateway {
+        Gateway {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                uid: Some(format!("{namespace}-{name}-uid")),
+                generation: Some(7),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: "wicket".to_string(),
+                listeners: vec![Listener {
+                    name: "http".to_string(),
+                    hostname: None,
+                    port: 80,
+                    protocol: ProtocolType::HTTP,
+                    tls: None,
+                    allowed_routes: None,
+                }],
+                addresses: vec![],
+                infrastructure: None,
+            },
+            status: None,
+        }
+    }
+
+    fn ready_gateway_state(name: &str, namespace: &str) -> GatewayState {
+        let mut state = GatewayState::default();
+        let gateway = make_gateway(name, namespace);
+        state
+            .gateways
+            .insert(GatewayState::key(namespace, name), gateway);
+        state
     }
 
     fn make_http_route(name: &str, ns: &str, backend_ns: Option<&str>, backend: &str) -> HTTPRoute {
@@ -2590,6 +2630,87 @@ mod tests {
             matches!(store.planner_snapshot().await, SnapshotResult::Ready(_)),
             "planner snapshot must be Ready once all resource classes are populated"
         );
+    }
+
+    #[tokio::test]
+    async fn test_planner_snapshot_not_ready_while_gateway_is_observed_but_lists_are_still_warming()
+    {
+        let store = SharedStore::new();
+
+        store
+            .ingest_gateway_state(ready_gateway_state("gw", "default"))
+            .await;
+        store.mark_gateway_classes_listed().await;
+
+        assert!(!store.is_ready().await);
+        assert!(matches!(
+            store.planner_snapshot().await,
+            SnapshotResult::NotReady
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_planner_snapshot_ready_after_remaining_list_complete_signals_keeps_gateway_lookup(
+    ) {
+        let store = SharedStore::new();
+
+        store
+            .ingest_gateway_state(ready_gateway_state("gw", "default"))
+            .await;
+        store.mark_gateway_classes_listed().await;
+
+        assert!(matches!(
+            store.planner_snapshot().await,
+            SnapshotResult::NotReady
+        ));
+
+        store.mark_reference_grants_listed().await;
+        assert!(store.is_ready().await);
+
+        let snap = match store.planner_snapshot().await {
+            SnapshotResult::Ready(s) => s,
+            SnapshotResult::NotReady => panic!("expected ready"),
+        };
+
+        assert!(snap.gateway("default", "gw").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ready_planner_snapshot_supports_attachment_and_runtime_planning_for_observed_gateway(
+    ) {
+        let store = SharedStore::new();
+
+        store
+            .ingest_gateway_state(ready_gateway_state("gw", "default"))
+            .await;
+        store.mark_gateway_classes_listed().await;
+        store.mark_reference_grants_listed().await;
+
+        let snapshot = match store.planner_snapshot().await {
+            SnapshotResult::Ready(s) => s,
+            SnapshotResult::NotReady => panic!("expected ready"),
+        };
+
+        let attachment = AttachmentPlanner
+            .plan(&AttachmentPlanInput {
+                gateway_namespace: "default".to_string(),
+                gateway_name: "gw".to_string(),
+                gateway_generation: 7,
+                snapshot: snapshot.clone(),
+            })
+            .expect("attachment planning should see the gateway in snapshot");
+        assert_eq!(attachment.gateway_name, "gw");
+
+        let runtime = GatewayRuntimePlanner
+            .plan(&RuntimePlanInput {
+                gateway_namespace: "default".to_string(),
+                gateway_name: "gw".to_string(),
+                snapshot,
+                controller_config: ControllerConfig::default(),
+                observed: ObservedRuntimeState::default(),
+            })
+            .expect("runtime planning should see the gateway in snapshot");
+        assert_eq!(runtime.gateway_name, "gw");
     }
 
     // ── mark_*_listed must NOT be called on list failure ─────────────────────
