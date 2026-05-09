@@ -20,7 +20,7 @@ pub struct Config {
 
     /// Named upstream definitions
     #[serde(default)]
-    pub upstreams: HashMap<String, UpstreamConfig>,
+    pub upstreams: BTreeMap<String, UpstreamConfig>,
 
     /// Route definitions
     #[serde(default)]
@@ -33,6 +33,28 @@ pub struct Config {
     /// Stream (L4) proxy configuration (optional)
     #[serde(default)]
     pub stream: Option<StreamConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080"
+                    .parse()
+                    .expect("default listen address is valid"),
+                https_listen: None,
+                disable_http: false,
+                workers: None,
+                json_logs: true,
+                log_level: default_log_level(),
+                shutdown_timeout: default_shutdown_timeout(),
+            },
+            upstreams: BTreeMap::new(),
+            routes: Vec::new(),
+            tls: None,
+            stream: None,
+        }
+    }
 }
 
 /// Server-level configuration.

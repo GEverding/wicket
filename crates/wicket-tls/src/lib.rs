@@ -96,8 +96,8 @@ pub use acme::{AcmeError, AcmeProvider, AcmeProviderBuilder};
 pub use cert_manager::CertManager;
 pub use cert_store::CertStore;
 pub use config::{
-    AcmeCertConfig, AcmeConfig, AutoTlsDomain, DnsProviderConfig, FileCertConfig, TlsConfig,
-    TlsMode,
+    AcmeCertConfig, AcmeConfig, AutoTlsDomain, DnsProviderConfig, FileCertConfig, FileConfig,
+    TlsConfig, TlsMode,
 };
 pub use file_watcher::{FileWatcher, FileWatcherError};
 pub use pem::{load_certified_key, load_certs, load_private_key, PemError};

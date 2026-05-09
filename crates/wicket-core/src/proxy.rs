@@ -21,7 +21,7 @@ use pingora_load_balancing::selection::RoundRobin;
 use pingora_load_balancing::{health_check::TcpHealthCheck, LoadBalancer};
 use pingora_proxy::{ProxyHttp, Session};
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -218,7 +218,7 @@ impl WicketProxy {
 
     /// Build upstream load balancers from configuration.
     fn build_upstreams(
-        configs: &HashMap<String, UpstreamConfig>,
+        configs: &BTreeMap<String, UpstreamConfig>,
     ) -> Result<HashMap<String, Arc<UpstreamCluster>>> {
         let mut upstreams = HashMap::new();
 

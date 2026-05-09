@@ -4909,6 +4909,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wicket-config",
+ "wicket-tls",
  "x509-parser",
 ]
 

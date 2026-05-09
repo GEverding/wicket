@@ -1,7 +1,7 @@
 //! Configuration generator that converts Gateway API resources to Wicket TOML config.
 
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 
 use crate::crds::{
     Gateway, HTTPRoute, Listener, ProtocolType, RouteParentStatus, TCPRoute, TLSRoute,
@@ -9,205 +9,11 @@ use crate::crds::{
 };
 
 use wicket_config::RouteConfig;
-
-/// Generated Wicket configuration that matches wicket-config format.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct WicketConfig {
-    pub server: ServerConfig,
-
-    /// Upstream clusters keyed by name.  Uses `BTreeMap` so that TOML
-    /// serialization is deterministic (keys are emitted in sorted order).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub upstreams: BTreeMap<String, UpstreamConfig>,
-
-    /// Routes using the canonical wicket-config RouteConfig type.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub routes: Vec<RouteConfig>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tls: Option<TlsConfig>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream: Option<StreamConfig>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ServerConfig {
-    pub listen: String,
-
-    /// Optional explicit HTTPS listen address.
-    ///
-    /// Emitted when at least one Gateway listener uses the HTTPS protocol.
-    /// The proxy reads this into `wicket-config::ServerConfig.https_listen`
-    /// and binds HTTPS there, instead of using the legacy port mapping
-    /// (HTTP port + 363).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub https_listen: Option<String>,
-
-    /// When true, the proxy must NOT bind HTTP on `listen`.
-    ///
-    /// Set when the Gateway has only HTTPS listeners on the same port as
-    /// `listen`, so HTTP and HTTPS would otherwise collide.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub disable_http: bool,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workers: Option<usize>,
-
-    #[serde(default)]
-    pub json_logs: bool,
-
-    #[serde(default = "default_log_level")]
-    pub log_level: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shutdown_timeout: Option<u64>,
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            listen: "0.0.0.0:8080".to_string(),
-            https_listen: None,
-            disable_http: false,
-            workers: None,
-            json_logs: true,
-            log_level: default_log_level(),
-            shutdown_timeout: Some(30),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct UpstreamConfig {
-    pub backends: Vec<String>,
-
-    #[serde(default = "default_strategy")]
-    pub strategy: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub health_check: Option<HealthCheckConfig>,
-}
-
-fn default_strategy() -> String {
-    "round_robin".to_string()
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HealthCheckConfig {
-    pub path: String,
-
-    #[serde(default = "default_interval")]
-    pub interval: u64,
-
-    #[serde(default = "default_unhealthy_threshold")]
-    pub unhealthy_threshold: u32,
-}
-
-fn default_interval() -> u64 {
-    10
-}
-
-fn default_unhealthy_threshold() -> u32 {
-    3
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TlsConfig {
-    pub mode: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file: Option<FileTlsConfig>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acme: Option<AcmeTlsConfig>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FileTlsConfig {
-    #[serde(default)]
-    pub watch: bool,
-
-    #[serde(default = "default_poll_interval")]
-    pub poll_interval_secs: u64,
-
-    #[serde(default)]
-    pub certs: Vec<CertConfig>,
-}
-
-fn default_poll_interval() -> u64 {
-    30
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CertConfig {
-    pub name: String,
-    pub cert: String,
-    pub key: String,
-
-    #[serde(default)]
-    pub domains: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AcmeTlsConfig {
-    pub email: String,
-
-    #[serde(default)]
-    pub staging: bool,
-
-    pub storage: String,
-
-    #[serde(default = "default_renew_before_days")]
-    pub renew_before_days: u32,
-}
-
-fn default_renew_before_days() -> u32 {
-    30
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StreamConfig {
-    pub listen: String,
-
-    #[serde(default = "default_backlog")]
-    pub backlog: u32,
-
-    #[serde(default)]
-    pub reuseport: bool,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proxy_protocol: Option<String>,
-
-    /// SNI routing table.  Uses `BTreeMap` so that TOML serialization is
-    /// deterministic (keys are emitted in sorted order).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub sni_routes: BTreeMap<String, String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_upstream: Option<String>,
-
-    #[serde(default)]
-    pub upstreams: Vec<StreamUpstreamConfig>,
-}
-
-fn default_backlog() -> u32 {
-    8000
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StreamUpstreamConfig {
-    pub name: String,
-    pub servers: Vec<String>,
-}
+pub use wicket_config::{
+    Config as WicketConfig, HealthCheckConfig, LoadBalanceStrategy, ProxyProtocolConfig,
+    ServerConfig, StreamConfig, StreamUpstreamConfig, UpstreamConfig,
+};
+pub use wicket_tls::{FileCertConfig, FileConfig, TlsConfig, TlsMode};
 
 /// Endpoint information for a Kubernetes Service.
 ///
@@ -320,7 +126,7 @@ impl GatewayState {
         let mut config = WicketConfig::default();
         let mut upstreams: BTreeMap<String, UpstreamConfig> = BTreeMap::new();
         let mut routes = Vec::new();
-        let mut tls_certs: Vec<CertConfig> = Vec::new();
+        let mut tls_certs: Vec<FileCertConfig> = Vec::new();
         let mut stream_config: Option<StreamConfig> = None;
 
         // Collect and sort gateway entries.
@@ -373,12 +179,20 @@ impl GatewayState {
         // bind HTTP on the same port and TLS handshakes would fail.
         match (http_listeners.first(), https_listeners.first()) {
             (Some((_, http_l)), Some((_, https_l))) => {
-                config.server.listen = format!("0.0.0.0:{}", http_l.port);
-                config.server.https_listen = Some(format!("0.0.0.0:{}", https_l.port));
+                config.server.listen = format!("0.0.0.0:{}", http_l.port)
+                    .parse()
+                    .expect("generated HTTP listen address is valid");
+                config.server.https_listen = Some(
+                    format!("0.0.0.0:{}", https_l.port)
+                        .parse()
+                        .expect("generated HTTPS listen address is valid"),
+                );
                 config.server.disable_http = false;
             }
             (Some((_, http_l)), None) => {
-                config.server.listen = format!("0.0.0.0:{}", http_l.port);
+                config.server.listen = format!("0.0.0.0:{}", http_l.port)
+                    .parse()
+                    .expect("generated HTTP listen address is valid");
                 // No HTTPS listener; leave https_listen and disable_http at
                 // their defaults.
             }
@@ -386,8 +200,10 @@ impl GatewayState {
                 // HTTPS-only proxy: bind HTTPS on the listener port and skip
                 // HTTP entirely.  `listen` still holds the same port purely
                 // to satisfy the proxy's required field.
-                let addr = format!("0.0.0.0:{}", https_l.port);
-                config.server.listen = addr.clone();
+                let addr = format!("0.0.0.0:{}", https_l.port)
+                    .parse()
+                    .expect("generated HTTPS listen address is valid");
+                config.server.listen = addr;
                 config.server.https_listen = Some(addr);
                 config.server.disable_http = true;
             }
@@ -445,7 +261,7 @@ impl GatewayState {
                         upstream_name.clone(),
                         UpstreamConfig {
                             backends: backend_addrs,
-                            strategy: "round_robin".to_string(),
+                            strategy: LoadBalanceStrategy::RoundRobin,
                             health_check: None,
                         },
                     );
@@ -467,7 +283,7 @@ impl GatewayState {
                     });
 
                     if rule.matches.is_empty() {
-                        let route_config = wicket_config::RouteConfig {
+                        let route_config = RouteConfig {
                             name: Some(format!("{}-{}-rule{}", route_ns, route_name, rule_idx)),
                             upstream: upstream_name.clone(),
                             match_rules: wicket_config::RouteMatch {
@@ -523,7 +339,7 @@ impl GatewayState {
                                 .map(|h| (h.name.clone(), h.value.clone()))
                                 .collect();
 
-                            let route_config = wicket_config::RouteConfig {
+                            let route_config = RouteConfig {
                                 name: Some(format!(
                                     "{}-{}-rule{}-match{}",
                                     route_ns, route_name, rule_idx, match_idx
@@ -549,8 +365,8 @@ impl GatewayState {
 
         // Dedupe TLS certs by Secret (namespace/name).  Multiple listeners
         // may reference the same Secret with different hostnames; we emit
-        // one CertConfig per unique Secret and union the domains.
-        let mut cert_map: BTreeMap<String, CertConfig> = BTreeMap::new();
+        // one FileCertConfig per unique Secret and union the domains.
+        let mut cert_map: BTreeMap<String, FileCertConfig> = BTreeMap::new();
 
         for (gw_key, gateway) in &gw_entries {
             let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or("default");
@@ -563,12 +379,13 @@ impl GatewayState {
                         let cert_key = Self::key(cert_ns, &cert_ref.name);
 
                         if let Some((cert_path, key_path)) = self.tls_secrets.get(&cert_key) {
-                            let entry = cert_map.entry(cert_key).or_insert_with(|| CertConfig {
-                                name: cert_ref.name.clone(),
-                                cert: cert_path.clone(),
-                                key: key_path.clone(),
-                                domains: vec![],
-                            });
+                            let entry =
+                                cert_map.entry(cert_key).or_insert_with(|| FileCertConfig {
+                                    name: cert_ref.name.clone(),
+                                    cert: PathBuf::from(cert_path),
+                                    key: PathBuf::from(key_path),
+                                    domains: vec![],
+                                });
 
                             if let Some(ref hostname) = listener.hostname {
                                 if !entry.domains.contains(hostname) {
@@ -732,26 +549,33 @@ impl GatewayState {
 
             if let Some((_, listener)) = tcp_listeners.first() {
                 stream_config = Some(StreamConfig {
-                    listen: format!("0.0.0.0:{}", listener.port),
+                    listen: format!("0.0.0.0:{}", listener.port)
+                        .parse()
+                        .expect("generated stream listen address is valid"),
                     backlog: 8000,
                     reuseport: true,
-                    proxy_protocol: None,
-                    sni_routes: sni_routes_map,
+                    proxy_protocol: ProxyProtocolConfig::None,
+                    source_ips: vec![],
+                    sni_routes: sni_routes_map.into_iter().collect(),
                     default_upstream: catch_all_upstream,
                     upstreams: stream_upstreams,
+                    health_cooldown_secs: 30,
+                    connect_timeout_ms: 5000,
+                    max_connections: 10000,
+                    drain_timeout_secs: 30,
                 });
             }
         }
 
         if !tls_certs.is_empty() {
             config.tls = Some(TlsConfig {
-                mode: "file".to_string(),
-                file: Some(FileTlsConfig {
+                mode: TlsMode::File,
+                acme: None,
+                file: Some(FileConfig {
                     watch: true,
                     poll_interval_secs: 30,
                     certs: tls_certs,
                 }),
-                acme: None,
             });
         }
 
@@ -889,7 +713,7 @@ mod tests {
 
         let config = state.generate_config();
 
-        assert_eq!(config.server.listen, "0.0.0.0:8080");
+        assert_eq!(config.server.listen.to_string(), "0.0.0.0:8080");
         assert_eq!(config.upstreams.len(), 1);
         assert_eq!(config.routes.len(), 1);
 
@@ -929,8 +753,11 @@ mod tests {
 
         let config = state.generate_config();
 
-        assert_eq!(config.server.listen, "0.0.0.0:8443");
-        assert_eq!(config.server.https_listen.as_deref(), Some("0.0.0.0:8443"));
+        assert_eq!(config.server.listen.to_string(), "0.0.0.0:8443");
+        assert_eq!(
+            config.server.https_listen.map(|addr| addr.to_string()),
+            Some("0.0.0.0:8443".to_string())
+        );
         assert!(config.server.disable_http);
     }
 
@@ -975,8 +802,11 @@ mod tests {
 
         let config = state.generate_config();
 
-        assert_eq!(config.server.listen, "0.0.0.0:8080");
-        assert_eq!(config.server.https_listen.as_deref(), Some("0.0.0.0:8443"));
+        assert_eq!(config.server.listen.to_string(), "0.0.0.0:8080");
+        assert_eq!(
+            config.server.https_listen.map(|addr| addr.to_string()),
+            Some("0.0.0.0:8443".to_string())
+        );
         assert!(!config.server.disable_http);
     }
 
@@ -1045,8 +875,8 @@ mod tests {
 
         assert_eq!(file.certs.len(), 1);
         let cert = &file.certs[0];
-        assert_eq!(cert.cert, "/etc/wicket/tls/shared-cert.crt");
-        assert_eq!(cert.key, "/etc/wicket/tls/shared-cert.key");
+        assert_eq!(cert.cert, PathBuf::from("/etc/wicket/tls/shared-cert.crt"));
+        assert_eq!(cert.key, PathBuf::from("/etc/wicket/tls/shared-cert.key"));
         assert!(cert.domains.contains(&"a.example.com".to_string()));
         assert!(cert.domains.contains(&"b.example.com".to_string()));
     }
@@ -1084,8 +914,11 @@ mod tests {
         let toml = toml::to_string(&config).expect("serialize https-only config");
         let parsed: WicketConfig = toml::from_str(&toml).expect("parse https-only config");
 
-        assert_eq!(parsed.server.listen, "0.0.0.0:8443");
-        assert_eq!(parsed.server.https_listen.as_deref(), Some("0.0.0.0:8443"));
+        assert_eq!(parsed.server.listen.to_string(), "0.0.0.0:8443");
+        assert_eq!(
+            parsed.server.https_listen.map(|addr| addr.to_string()),
+            Some("0.0.0.0:8443".to_string())
+        );
         assert!(parsed.server.disable_http);
     }
 
@@ -1175,7 +1008,7 @@ mod tests {
         let config = state.generate_config();
 
         // Verify server config from Gateway listener
-        assert_eq!(config.server.listen, "0.0.0.0:8080");
+        assert_eq!(config.server.listen.to_string(), "0.0.0.0:8080");
 
         // Verify upstreams from HTTPRoute backend
         assert_eq!(config.upstreams.len(), 1);

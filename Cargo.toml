@@ -19,6 +19,7 @@ repository = "https://github.com/GEverding/wicket"
 # Internal crates
 wicket-config = { path = "crates/wicket-config" }
 wicket-core = { path = "crates/wicket-core" }
+wicket-tls = { path = "crates/wicket-tls" }
 
 # eBPF sockmap (optional, Linux only)
 wicket-sockmap = { path = "crates/wicket-sockmap" }
