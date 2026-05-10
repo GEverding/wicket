@@ -167,6 +167,19 @@ pub enum AttachmentStatus {
         /// Name of the target backend.
         target_name: String,
     },
+
+    /// A core `Service` backend ref points at a Service that does not exist.
+    ///
+    /// This keeps the route attached/accepted while allowing `ResolvedRefs` to
+    /// report `False` for missing same-namespace Services.
+    BackendNotFound {
+        /// Namespace of the route that holds the unresolved ref.
+        route_namespace: String,
+        /// Namespace of the target backend.
+        target_namespace: String,
+        /// Name of the target backend.
+        target_name: String,
+    },
 }
 
 impl AttachmentStatus {
@@ -178,14 +191,19 @@ impl AttachmentStatus {
     /// `ResolvedRefs=False` condition.
     #[must_use]
     pub fn is_attached(&self) -> bool {
-        matches!(self, Self::Attached | Self::RefNotPermitted { .. })
+        matches!(
+            self,
+            Self::Attached | Self::RefNotPermitted { .. } | Self::BackendNotFound { .. }
+        )
     }
 
     /// Returns the Gateway API reason string for the `Accepted` condition.
     #[must_use]
     pub fn accepted_reason(&self) -> &'static str {
         match self {
-            Self::Attached | Self::RefNotPermitted { .. } => "Accepted",
+            Self::Attached | Self::RefNotPermitted { .. } | Self::BackendNotFound { .. } => {
+                "Accepted"
+            }
             Self::NoMatchingParent => "NoMatchingParent",
             Self::NotAllowedByListenerProtocol => "NotAllowedByListenerProtocol",
             Self::NotAllowedByListenerNamespacePolicy => "NotAllowedByListenerNamespacePolicy",
@@ -202,6 +220,7 @@ impl AttachmentStatus {
     pub fn resolved_refs_reason(&self) -> Option<&'static str> {
         match self {
             Self::RefNotPermitted { .. } => Some("RefNotPermitted"),
+            Self::BackendNotFound { .. } => Some("BackendNotFound"),
             _ => None,
         }
     }
@@ -792,10 +811,15 @@ fn namespace_allowed(
             match selector {
                 None => false, // Selector specified but no selector expression -- deny.
                 Some(sel) => {
-                    match namespace_labels.get(route_namespace) {
-                        None => false, // Labels not available -- safe denial.
-                        Some(labels) => label_selector_matches(sel, labels),
-                    }
+                    let mut labels = namespace_labels
+                        .get(route_namespace)
+                        .cloned()
+                        .unwrap_or_default();
+                    labels.insert(
+                        "kubernetes.io/metadata.name".to_string(),
+                        route_namespace.to_string(),
+                    );
+                    label_selector_matches(sel, &labels)
                 }
             }
         }
@@ -874,11 +898,11 @@ fn kind_allowed(allowed_routes: Option<&AllowedRoutes>, route_kind: &RouteKind) 
 // Internal: cross-namespace backend ref check
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns `Some((target_ns, target_name))` if any backend ref in the route
-/// is a cross-namespace core `Service` reference that is NOT covered by a
-/// `ReferenceGrant` in the target namespace.
+/// Returns the first unresolved core `Service` backend ref, if any.
 ///
-/// Returns `None` if all refs are either same-namespace or covered by a grant.
+/// Same-namespace missing Services yield `BackendNotFound`; cross-namespace
+/// refs without a matching `ReferenceGrant` yield `RefNotPermitted`.
+/// Non-core refs are skipped.
 ///
 /// A backend ref is treated as a core `Service` ref when:
 /// - `kind` is `"Service"` or empty (the Gateway API default), AND
@@ -894,7 +918,7 @@ fn first_unresolved_backend_ref_for_kind(
     route_kind_str: &str,
     backend_refs: &[crate::crds::BackendRef],
     snapshot: &PlannerSnapshot,
-) -> Option<(String, String)> {
+) -> Option<AttachmentStatus> {
     for br in backend_refs {
         // Only check core-group Service refs.
         let kind_is_service = br.kind.is_empty() || br.kind == "Service";
@@ -904,9 +928,24 @@ fn first_unresolved_backend_ref_for_kind(
         }
 
         let target_ns = match br.namespace.as_deref() {
-            Some(ns) if ns != route_namespace => ns,
-            _ => continue,
+            Some(ns) => ns,
+            None => route_namespace,
         };
+
+        let target_key =
+            crate::reconcilers::config_generator::GatewayState::key(target_ns, &br.name);
+
+        if target_ns == route_namespace && !snapshot.service_endpoints.contains_key(&target_key) {
+            return Some(AttachmentStatus::BackendNotFound {
+                route_namespace: route_namespace.to_string(),
+                target_namespace: target_ns.to_string(),
+                target_name: br.name.clone(),
+            });
+        }
+
+        if target_ns == route_namespace {
+            continue;
+        }
 
         let grants = snapshot.reference_grants_in_namespace(target_ns);
         let permitted = grants.iter().any(|g| {
@@ -919,7 +958,11 @@ fn first_unresolved_backend_ref_for_kind(
         });
 
         if !permitted {
-            return Some((target_ns.to_string(), br.name.clone()));
+            return Some(AttachmentStatus::RefNotPermitted {
+                route_namespace: route_namespace.to_string(),
+                target_namespace: target_ns.to_string(),
+                target_name: br.name.clone(),
+            });
         }
     }
     None
@@ -1218,7 +1261,7 @@ fn evaluate_route_attachment_inner(ctx: RouteEvalContext<'_>) -> Vec<RouteAttach
         }
 
         // ── Cross-namespace backend ref check ─────────────────────────────────
-        if let Some((target_ns, target_name)) = first_unresolved_backend_ref_for_kind(
+        if let Some(status) = first_unresolved_backend_ref_for_kind(
             route_namespace,
             route_kind.as_str(),
             backend_refs,
@@ -1231,11 +1274,7 @@ fn evaluate_route_attachment_inner(ctx: RouteEvalContext<'_>) -> Vec<RouteAttach
                 listener_name: Some(listener.name.clone()),
                 parent_ref_section_name: section_name.map(str::to_string),
                 parent_ref_port,
-                status: AttachmentStatus::RefNotPermitted {
-                    route_namespace: route_namespace.to_string(),
-                    target_namespace: target_ns,
-                    target_name,
-                },
+                status,
                 observed_generation,
             });
             continue;
@@ -1282,6 +1321,7 @@ mod tests {
         http_routes: HashMap<String, HTTPRoute>,
         tcp_routes: HashMap<String, TCPRoute>,
         tls_routes: HashMap<String, TLSRoute>,
+        service_endpoints: HashMap<String, crate::reconcilers::config_generator::ServiceEndpoints>,
         reference_grants: HashMap<String, ReferenceGrant>,
         namespace_labels: HashMap<String, BTreeMap<String, String>>,
     }
@@ -1327,6 +1367,19 @@ mod tests {
             self
         }
 
+        fn with_service_endpoint(mut self, namespace: &str, name: &str) -> Self {
+            let key = format!("{}/{}", namespace, name);
+            self.service_endpoints.insert(
+                key,
+                crate::reconcilers::config_generator::ServiceEndpoints {
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                    endpoints: vec!["127.0.0.1:80".to_string()],
+                },
+            );
+            self
+        }
+
         fn with_reference_grant(mut self, grant: ReferenceGrant) -> Self {
             let key = format!(
                 "{}/{}",
@@ -1349,7 +1402,7 @@ mod tests {
                 http_routes: self.http_routes,
                 tcp_routes: self.tcp_routes,
                 tls_routes: self.tls_routes,
-                service_endpoints: HashMap::new(),
+                service_endpoints: self.service_endpoints,
                 tls_secrets: HashMap::new(),
                 reference_grants: self.reference_grants,
                 service_ref_index: HashSet::new(),
@@ -1618,6 +1671,7 @@ mod tests {
         let snapshot = SnapshotBuilder::default()
             .with_gateway(gw)
             .with_http_route(route)
+            .with_service_endpoint("prod", "my-svc")
             .build();
 
         let plan = AttachmentPlanner
@@ -1630,6 +1684,105 @@ mod tests {
             plan.listener_summaries[0].attached_routes, 1,
             "listener should count one attached route"
         );
+    }
+
+    #[test]
+    fn gateway_with_one_attached_route_counts_one_listener_attachment() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let route = make_http_route(
+            "prod",
+            "route-a",
+            vec![make_parent_ref("prod", "my-gw", Some("http"))],
+            vec![make_http_backend_ref(None, "svc-a")],
+        );
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route)
+            .with_service_endpoint("prod", "svc-a")
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input("prod", "my-gw", snapshot))
+            .unwrap();
+
+        assert_eq!(plan.listener_summary("http").unwrap().attached_routes, 1);
+    }
+
+    #[test]
+    fn gateway_with_two_attached_routes_counts_two_listener_attachments() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let route_a = make_http_route(
+            "prod",
+            "route-a",
+            vec![make_parent_ref("prod", "my-gw", Some("http"))],
+            vec![make_http_backend_ref(None, "svc-a")],
+        );
+        let route_b = make_http_route(
+            "prod",
+            "route-b",
+            vec![make_parent_ref("prod", "my-gw", Some("http"))],
+            vec![make_http_backend_ref(None, "svc-b")],
+        );
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route_a)
+            .with_http_route(route_b)
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input("prod", "my-gw", snapshot))
+            .unwrap();
+
+        assert_eq!(plan.listener_summary("http").unwrap().attached_routes, 2);
+    }
+
+    #[test]
+    fn unresolved_route_still_counts_as_attached_route() {
+        let allowed = AllowedRoutes {
+            namespaces: Some(RouteNamespaces {
+                from: FromNamespaces::All,
+                selector: None,
+            }),
+            kinds: vec![],
+        };
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            vec![make_listener_with_allowed(
+                "http",
+                80,
+                ProtocolType::HTTP,
+                allowed,
+            )],
+        );
+        let route = make_http_route(
+            "app-ns",
+            "route-a",
+            vec![make_parent_ref("prod", "my-gw", Some("http"))],
+            vec![make_http_backend_ref(Some("backend-ns"), "svc-a")],
+        );
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route)
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input("prod", "my-gw", snapshot))
+            .unwrap();
+
+        assert!(matches!(
+            plan.route_results[0].status,
+            AttachmentStatus::RefNotPermitted { .. }
+        ));
+        assert_eq!(plan.listener_summary("http").unwrap().attached_routes, 1);
     }
 
     #[test]
@@ -1648,6 +1801,7 @@ mod tests {
         let snapshot = SnapshotBuilder::default()
             .with_gateway(gw)
             .with_tcp_route(route)
+            .with_service_endpoint("prod", "db-svc")
             .build();
 
         let plan = AttachmentPlanner
@@ -1674,6 +1828,7 @@ mod tests {
         let snapshot = SnapshotBuilder::default()
             .with_gateway(gw)
             .with_tls_route(route)
+            .with_service_endpoint("prod", "tls-svc")
             .build();
 
         let plan = AttachmentPlanner
@@ -1731,6 +1886,7 @@ mod tests {
         let snapshot = SnapshotBuilder::default()
             .with_gateway(gw)
             .with_tcp_route(route)
+            .with_service_endpoint("prod", "db-svc")
             .build();
 
         let plan = AttachmentPlanner
@@ -1889,6 +2045,53 @@ mod tests {
             plan.route_results[0].status,
             AttachmentStatus::NotAllowedByListenerNamespacePolicy
         );
+    }
+
+    #[test]
+    fn route_allowed_when_selector_policy_matches_standard_namespace_label_without_cached_labels() {
+        let allowed = AllowedRoutes {
+            namespaces: Some(RouteNamespaces {
+                from: FromNamespaces::Selector,
+                selector: Some(LabelSelector {
+                    match_labels: Some({
+                        let mut m = BTreeMap::new();
+                        m.insert(
+                            "kubernetes.io/metadata.name".to_string(),
+                            "app-ns".to_string(),
+                        );
+                        m
+                    }),
+                    match_expressions: vec![],
+                }),
+            }),
+            kinds: vec![],
+        };
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            vec![make_listener_with_allowed(
+                "http",
+                80,
+                ProtocolType::HTTP,
+                allowed,
+            )],
+        );
+        let route = make_http_route(
+            "app-ns",
+            "my-route",
+            vec![make_parent_ref("prod", "my-gw", Some("http"))],
+            vec![],
+        );
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route)
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input("prod", "my-gw", snapshot))
+            .unwrap();
+
+        assert_eq!(plan.route_results[0].status, AttachmentStatus::Attached);
     }
 
     #[test]
@@ -2167,6 +2370,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.route_results[0].status, AttachmentStatus::Attached);
+    }
+
+    #[test]
+    fn same_ns_backend_ref_missing_service_is_still_attached() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            vec![make_listener_with_allowed(
+                "http",
+                80,
+                ProtocolType::HTTP,
+                AllowedRoutes {
+                    namespaces: Some(RouteNamespaces {
+                        from: FromNamespaces::All,
+                        selector: None,
+                    }),
+                    kinds: vec![],
+                },
+            )],
+        );
+        let route = make_http_route(
+            "app-ns",
+            "my-route",
+            vec![make_parent_ref("prod", "my-gw", Some("http"))],
+            vec![make_http_backend_ref(None, "does-not-exist")],
+        );
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route)
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input("prod", "my-gw", snapshot))
+            .unwrap();
+
+        assert!(matches!(
+            &plan.route_results[0].status,
+            AttachmentStatus::BackendNotFound { target_name, .. } if target_name == "does-not-exist"
+        ));
+        assert_eq!(plan.listener_summaries[0].attached_routes, 1);
     }
 
     #[test]
@@ -2701,6 +2944,7 @@ mod tests {
         let snapshot = SnapshotBuilder::default()
             .with_gateway(gw)
             .with_tcp_route(route)
+            .with_service_endpoint("prod", "db-svc")
             .build();
 
         let plan = AttachmentPlanner
@@ -2817,6 +3061,18 @@ mod tests {
         assert!(s.is_attached());
         assert_eq!(s.accepted_reason(), "Accepted");
         assert_eq!(s.resolved_refs_reason(), Some("RefNotPermitted"));
+    }
+
+    #[test]
+    fn backend_not_found_is_attached_at_listener_level() {
+        let s = AttachmentStatus::BackendNotFound {
+            route_namespace: "ns".to_string(),
+            target_namespace: "ns".to_string(),
+            target_name: "svc".to_string(),
+        };
+        assert!(s.is_attached());
+        assert_eq!(s.accepted_reason(), "Accepted");
+        assert_eq!(s.resolved_refs_reason(), Some("BackendNotFound"));
     }
 
     #[test]

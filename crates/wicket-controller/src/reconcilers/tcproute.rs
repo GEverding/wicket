@@ -583,9 +583,9 @@ fn condition_from_plan(
 /// Returns a human-readable message for an `AttachmentStatus` rejection.
 fn attachment_status_message(status: &AttachmentStatus) -> &'static str {
     match status {
-        AttachmentStatus::Attached | AttachmentStatus::RefNotPermitted { .. } => {
-            "Route is accepted by the listener"
-        }
+        AttachmentStatus::Attached
+        | AttachmentStatus::RefNotPermitted { .. }
+        | AttachmentStatus::BackendNotFound { .. } => "Route is accepted by the listener",
         AttachmentStatus::NoMatchingParent => {
             "No listener matches the parentRef sectionName or port"
         }

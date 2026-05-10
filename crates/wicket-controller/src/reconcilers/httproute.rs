@@ -79,11 +79,14 @@ fn build_route_parent_status(
     accepted_condition: Condition,
     route_generation: Option<i64>,
     accepted: bool,
+    resolved_refs_condition: Option<Condition>,
 ) -> RouteParentStatus {
     let conditions = if accepted {
         vec![
             accepted_condition.with_observed_generation(route_generation),
-            Condition::resolved_refs().with_observed_generation(route_generation),
+            resolved_refs_condition
+                .unwrap_or_else(Condition::resolved_refs)
+                .with_observed_generation(route_generation),
         ]
     } else {
         vec![accepted_condition.with_observed_generation(route_generation)]
@@ -165,6 +168,7 @@ pub async fn reconcile_httproute(
                     ),
                     route_generation,
                     false,
+                    None,
                 ));
                 continue;
             }
@@ -238,6 +242,7 @@ pub async fn reconcile_httproute(
                 ),
                 route_generation,
                 false,
+                None,
             ));
             continue;
         }
@@ -247,49 +252,53 @@ pub async fn reconcile_httproute(
         //    Gateway-wide refs (no sectionName) gate on at least one HTTP-compatible
         //    listener to avoid accepting routes against TCP/TLS-only gateways while
         //    still avoiding multi-listener aggregation ambiguity in this slice.
-        let accepted_condition = if let Some(section_name) = &parent_ref.section_name {
-            planner_accepted_condition_for_section_cached(
-                &planner_snapshot,
-                &gateway,
-                &namespace,
-                &name,
-                section_name,
-                parent_ref.port,
-                &mut plan_cache,
-            )
-        } else {
-            // Gateway-wide parentRef: no sectionName -> require at least one
-            // HTTP/HTTPS listener so an HTTPRoute is not accepted against a
-            // TCP/TLS-only gateway.  When parentRef.port is set, that port
-            // must match a compatible listener (not merely any HTTP listener).
-            let matching_http = gateway.spec.listeners.iter().any(|l| {
-                matches!(
-                    l.protocol,
-                    crate::crds::ProtocolType::HTTP | crate::crds::ProtocolType::HTTPS
-                ) && parent_ref.port.is_none_or(|p| l.port == p)
-            });
-
-            if matching_http {
-                Condition::accepted()
-            } else {
-                tracing::debug!(
-                    namespace = %namespace,
-                    route = %name,
-                    parent_ref = %parent_ref.name,
-                    parent_namespace = %parent_ns,
-                    port = ?parent_ref.port,
-                    reason = "NoMatchingListener",
-                    message = "Gateway has no HTTP/HTTPS listener matching the parentRef port",
-                    "Route listener validation failed"
-                );
-                Condition::new(
-                    "Accepted",
-                    false,
-                    "NoMatchingListener",
-                    "Gateway has no HTTP/HTTPS listener matching the parentRef port",
+        let (accepted_condition, resolved_refs_condition) =
+            if let Some(section_name) = &parent_ref.section_name {
+                planner_parent_conditions_for_section_cached(
+                    &planner_snapshot,
+                    &gateway,
+                    &namespace,
+                    &name,
+                    section_name,
+                    parent_ref.port,
+                    &mut plan_cache,
                 )
-            }
-        };
+            } else {
+                // Gateway-wide parentRef: no sectionName -> require at least one
+                // HTTP/HTTPS listener so an HTTPRoute is not accepted against a
+                // TCP/TLS-only gateway.  When parentRef.port is set, that port
+                // must match a compatible listener (not merely any HTTP listener).
+                let matching_http = gateway.spec.listeners.iter().any(|l| {
+                    matches!(
+                        l.protocol,
+                        crate::crds::ProtocolType::HTTP | crate::crds::ProtocolType::HTTPS
+                    ) && parent_ref.port.is_none_or(|p| l.port == p)
+                });
+
+                if matching_http {
+                    (Condition::accepted(), None)
+                } else {
+                    tracing::debug!(
+                        namespace = %namespace,
+                        route = %name,
+                        parent_ref = %parent_ref.name,
+                        parent_namespace = %parent_ns,
+                        port = ?parent_ref.port,
+                        reason = "NoMatchingListener",
+                        message = "Gateway has no HTTP/HTTPS listener matching the parentRef port",
+                        "Route listener validation failed"
+                    );
+                    (
+                        Condition::new(
+                            "Accepted",
+                            false,
+                            "NoMatchingListener",
+                            "Gateway has no HTTP/HTTPS listener matching the parentRef port",
+                        ),
+                        None,
+                    )
+                }
+            };
 
         let is_accepted = accepted_condition.status == "True";
         if is_accepted {
@@ -302,6 +311,11 @@ pub async fn reconcile_httproute(
             accepted_condition,
             route_generation,
             is_accepted,
+            if is_accepted {
+                resolved_refs_condition
+            } else {
+                None
+            },
         ));
     }
 
@@ -420,6 +434,7 @@ pub async fn reconcile_httproute(
 /// - Named listener exists, is HTTP/HTTPS, port matches (or absent) -> `Accepted=True`.
 /// - Named listener NOT found in spec -> `NoMatchingParent` (explicit
 ///   sectionName naming a non-existent listener must never fail open).
+#[cfg(test)]
 fn planner_accepted_condition_for_section_cached(
     planner_snapshot: &SnapshotResult<super::store::PlannerSnapshot>,
     gateway: &Gateway,
@@ -429,6 +444,28 @@ fn planner_accepted_condition_for_section_cached(
     port: Option<u16>,
     plan_cache: &mut HashMap<(String, String, i64), AttachmentPlan>,
 ) -> Condition {
+    planner_parent_conditions_for_section_cached(
+        planner_snapshot,
+        gateway,
+        route_namespace,
+        route_name,
+        section_name,
+        port,
+        plan_cache,
+    )
+    .0
+}
+
+/// Compute the parentRef conditions for an HTTPRoute `sectionName`.
+fn planner_parent_conditions_for_section_cached(
+    planner_snapshot: &SnapshotResult<super::store::PlannerSnapshot>,
+    gateway: &Gateway,
+    route_namespace: &str,
+    route_name: &str,
+    section_name: &str,
+    port: Option<u16>,
+    plan_cache: &mut HashMap<(String, String, i64), AttachmentPlan>,
+) -> (Condition, Option<Condition>) {
     let snapshot = match planner_snapshot {
         SnapshotResult::Ready(s) => s,
         SnapshotResult::NotReady => {
@@ -438,7 +475,10 @@ fn planner_accepted_condition_for_section_cached(
                 section_name = %section_name,
                 "Planner snapshot not ready; checking Gateway spec for HTTP-only rule"
             );
-            return http_only_condition_from_spec(gateway, section_name, port);
+            return (
+                http_only_condition_from_spec(gateway, section_name, port),
+                None,
+            );
         }
     };
 
@@ -473,7 +513,10 @@ fn planner_accepted_condition_for_section_cached(
                     error = %e,
                     "AttachmentPlanner error; checking Gateway spec for HTTP-only rule"
                 );
-                return http_only_condition_from_spec(gateway, section_name, port);
+                return (
+                    http_only_condition_from_spec(gateway, section_name, port),
+                    None,
+                );
             }
         }
     }
@@ -481,7 +524,12 @@ fn planner_accepted_condition_for_section_cached(
     // Safe: we just inserted above if missing.
     let plan = match plan_cache.get(&cache_key) {
         Some(p) => p,
-        None => return http_only_condition_from_spec(gateway, section_name, port),
+        None => {
+            return (
+                http_only_condition_from_spec(gateway, section_name, port),
+                None,
+            )
+        }
     };
 
     condition_from_plan(
@@ -626,11 +674,21 @@ fn condition_from_plan(
     route_name: &str,
     section_name: &str,
     port: Option<u16>,
-) -> Condition {
+) -> (Condition, Option<Condition>) {
     let result = plan.result_for_route_parent_ref(route_namespace, route_name, section_name, port);
 
     match result {
-        Some(r) if r.status.is_attached() => Condition::accepted(),
+        Some(r) if r.status.is_attached() => {
+            let resolved_refs_condition = r.status.resolved_refs_reason().map(|reason| {
+                Condition::new(
+                    "ResolvedRefs",
+                    false,
+                    reason,
+                    "Backend reference could not be resolved",
+                )
+            });
+            (Condition::accepted(), resolved_refs_condition)
+        }
         Some(r) => {
             let reason = r.status.accepted_reason();
             let message = attachment_status_message(&r.status);
@@ -641,7 +699,7 @@ fn condition_from_plan(
                 reason = %reason,
                 "AttachmentPlanner rejected parentRef"
             );
-            Condition::new("Accepted", false, reason, message)
+            (Condition::new("Accepted", false, reason, message), None)
         }
         None => {
             // No result found (e.g. route not yet in the store snapshot).
@@ -652,7 +710,10 @@ fn condition_from_plan(
                 section_name = %section_name,
                 "No planner result for parentRef; applying HTTP-only spec check"
             );
-            http_only_condition_from_spec(gateway, section_name, port)
+            (
+                http_only_condition_from_spec(gateway, section_name, port),
+                None,
+            )
         }
     }
 }
@@ -660,9 +721,9 @@ fn condition_from_plan(
 /// Returns a human-readable message for an `AttachmentStatus` rejection.
 fn attachment_status_message(status: &AttachmentStatus) -> &'static str {
     match status {
-        AttachmentStatus::Attached | AttachmentStatus::RefNotPermitted { .. } => {
-            "Route is accepted by the listener"
-        }
+        AttachmentStatus::Attached
+        | AttachmentStatus::RefNotPermitted { .. }
+        | AttachmentStatus::BackendNotFound { .. } => "Route is accepted by the listener",
         AttachmentStatus::NoMatchingParent => {
             "No listener matches the parentRef sectionName or port"
         }
@@ -1340,6 +1401,44 @@ mod tests {
         assert_eq!(cond.reason, "Accepted");
     }
 
+    #[test]
+    fn planner_parent_status_sets_resolved_refs_false_for_missing_same_ns_service() {
+        let gw = make_gw_with_listener("prod", "my-gw", "http", 80, ProtocolType::HTTP);
+        let route =
+            make_http_route_with_section("prod", "my-route", "prod", "my-gw", Some("http"), None);
+        let snapshot = SnapshotResult::Ready(make_snapshot(gw.clone(), route));
+        let mut cache = HashMap::new();
+
+        let (accepted_condition, resolved_refs_condition) =
+            planner_parent_conditions_for_section_cached(
+                &snapshot, &gw, "prod", "my-route", "http", None, &mut cache,
+            );
+
+        assert_eq!(accepted_condition.type_, "Accepted");
+        assert_eq!(accepted_condition.status, "True");
+
+        let parent = build_route_parent_status(
+            ParentReference {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "Gateway".to_string(),
+                namespace: Some("prod".to_string()),
+                name: "my-gw".to_string(),
+                section_name: Some("http".to_string()),
+                port: None,
+            },
+            WICKET_CONTROLLER_NAME.to_string(),
+            accepted_condition,
+            Some(1),
+            true,
+            resolved_refs_condition,
+        );
+
+        assert_eq!(parent.conditions[0].type_, "Accepted");
+        assert_eq!(parent.conditions[0].status, "True");
+        assert_eq!(parent.conditions[1].type_, "ResolvedRefs");
+        assert_eq!(parent.conditions[1].status, "False");
+    }
+
     /// Planner returns Accepted=False / NoMatchingParent when sectionName doesn't exist.
     #[test]
     fn planner_no_matching_parent_for_unknown_section_name() {
@@ -1548,6 +1647,11 @@ mod tests {
             AttachmentStatus::NotAllowedByListenerNamespacePolicy,
             AttachmentStatus::NotAllowedByListenerKindPolicy,
             AttachmentStatus::NoMatchingListenerHostname,
+            AttachmentStatus::BackendNotFound {
+                route_namespace: "ns".to_string(),
+                target_namespace: "ns".to_string(),
+                target_name: "svc".to_string(),
+            },
             AttachmentStatus::RefNotPermitted {
                 route_namespace: "ns".to_string(),
                 target_namespace: "other".to_string(),
@@ -1590,6 +1694,7 @@ mod tests {
                 },
                 Some(9),
                 true,
+                None,
             )],
         };
 
@@ -1607,6 +1712,7 @@ mod tests {
                 },
                 Some(9),
                 true,
+                None,
             )],
         };
 
@@ -1639,6 +1745,7 @@ mod tests {
             Condition::accepted(),
             Some(9),
             true,
+            None,
         );
         assert_eq!(accepted.conditions.len(), 2);
         assert!(accepted
@@ -1652,6 +1759,7 @@ mod tests {
             Condition::new("Accepted", false, "InvalidParentRef", "Gateway not found"),
             Some(9),
             false,
+            None,
         );
         assert_eq!(rejected.conditions.len(), 1);
         assert_eq!(rejected.conditions[0].observed_generation, Some(9));
@@ -1675,6 +1783,7 @@ mod tests {
                 Condition::accepted(),
                 Some(9),
                 true,
+                None,
             )],
         };
         let stale = HTTPRouteStatus {
@@ -1684,6 +1793,7 @@ mod tests {
                 Condition::accepted(),
                 Some(8),
                 true,
+                None,
             )],
         };
 

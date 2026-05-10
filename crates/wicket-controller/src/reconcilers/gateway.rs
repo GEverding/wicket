@@ -1141,7 +1141,6 @@ fn listener_status_intents_with_attachment_with_tls_validation(
             {
                 intent.resolved_refs = false;
                 intent.resolved_refs_reason = Some("InvalidCertificateRef".to_string());
-                intent.attached_routes = 0;
             }
             intent
         })
@@ -1644,9 +1643,10 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     use crate::crds::{
-        AllowedRoutes, Condition, Gateway, GatewaySpec, GatewayStatus, GatewayTLSConfig, Listener,
-        ListenerStatus, ProtocolType, RouteGroupKind as CrdRouteGroupKind, SecretObjectReference,
-        TLSModeType,
+        AllowedRoutes, BackendRef, Condition, FromNamespaces, Gateway, GatewaySpec, GatewayStatus,
+        GatewayTLSConfig, HTTPBackendRef, HTTPRoute, HTTPRouteRule, HTTPRouteSpec, Listener,
+        ListenerStatus, ParentReference, ProtocolType, RouteGroupKind as CrdRouteGroupKind,
+        RouteNamespaces, SecretObjectReference, TLSModeType,
     };
     use crate::reconcilers::runtime_applier::RuntimeApplyResult;
     use crate::reconcilers::runtime_plan::{
@@ -1720,6 +1720,44 @@ mod tests {
             ("/cert.pem".to_string(), "/key.pem".to_string()),
         );
         snapshot_with_gateway(gateway, tls_secrets)
+    }
+
+    fn snapshot_with_gateway_and_http_routes(
+        gateway: Gateway,
+        http_routes: Vec<HTTPRoute>,
+    ) -> SnapshotResult<PlannerSnapshot> {
+        let key = format!(
+            "{}/{}",
+            gateway.metadata.namespace.as_deref().unwrap_or("default"),
+            gateway.metadata.name.as_deref().unwrap_or("")
+        );
+        let mut gateways = HashMap::new();
+        gateways.insert(key, gateway);
+
+        let http_routes = http_routes
+            .into_iter()
+            .map(|route| {
+                let key = format!(
+                    "{}/{}",
+                    route.metadata.namespace.as_deref().unwrap_or("default"),
+                    route.metadata.name.as_deref().unwrap_or("")
+                );
+                (key, route)
+            })
+            .collect();
+
+        SnapshotResult::Ready(PlannerSnapshot {
+            gateways,
+            gateway_classes: HashMap::new(),
+            http_routes,
+            tcp_routes: HashMap::new(),
+            tls_routes: HashMap::new(),
+            service_endpoints: HashMap::new(),
+            tls_secrets: HashMap::new(),
+            reference_grants: HashMap::new(),
+            service_ref_index: HashSet::new(),
+            namespace_labels: HashMap::new(),
+        })
     }
 
     fn make_deployment(
@@ -1823,6 +1861,36 @@ mod tests {
         listeners
     }
 
+    fn build_converged_listener_statuses_with_snapshot(
+        gateway: &Gateway,
+        snapshot: SnapshotResult<PlannerSnapshot>,
+    ) -> Vec<ListenerStatus> {
+        let namespace = gateway.metadata.namespace.as_deref().unwrap_or("default");
+        let name = gateway.metadata.name.as_deref().unwrap_or("");
+        let (listeners, programmed, only_store_not_ready, fault) = build_managed_runtime_status(
+            gateway,
+            namespace,
+            name,
+            ManagedRuntimeInput::Applied(
+                converged_obs(),
+                RuntimeApplyResult::default(),
+                Box::new(snapshot),
+            ),
+        );
+
+        assert!(
+            programmed,
+            "converged test input must yield Programmed=True"
+        );
+        assert!(
+            !only_store_not_ready,
+            "converged test input must not report controller warmup"
+        );
+        assert!(fault.is_none(), "converged test input must not fault");
+
+        listeners
+    }
+
     fn listener_named<'a>(listeners: &'a [ListenerStatus], name: &str) -> &'a ListenerStatus {
         listeners
             .iter()
@@ -1863,6 +1931,62 @@ mod tests {
             kind: kind.to_string(),
             name: name.to_string(),
             namespace: namespace.map(str::to_string),
+        }
+    }
+
+    fn gateway_parent_ref(
+        gateway_namespace: &str,
+        gateway_name: &str,
+        section_name: &str,
+    ) -> ParentReference {
+        ParentReference {
+            group: "gateway.networking.k8s.io".to_string(),
+            kind: "Gateway".to_string(),
+            namespace: Some(gateway_namespace.to_string()),
+            name: gateway_name.to_string(),
+            section_name: Some(section_name.to_string()),
+            port: None,
+        }
+    }
+
+    fn http_backend_ref(namespace: Option<&str>, name: &str) -> HTTPBackendRef {
+        HTTPBackendRef {
+            backend_ref: BackendRef {
+                group: "".to_string(),
+                kind: "Service".to_string(),
+                name: name.to_string(),
+                namespace: namespace.map(str::to_string),
+                port: Some(80),
+                weight: 1,
+            },
+            filters: vec![],
+        }
+    }
+
+    fn make_http_route(
+        namespace: &str,
+        name: &str,
+        parent_refs: Vec<ParentReference>,
+        backend_refs: Vec<HTTPBackendRef>,
+    ) -> HTTPRoute {
+        HTTPRoute {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            spec: HTTPRouteSpec {
+                parent_refs,
+                hostnames: vec![],
+                rules: vec![HTTPRouteRule {
+                    name: None,
+                    matches: vec![],
+                    filters: vec![],
+                    backend_refs,
+                    timeouts: None,
+                }],
+            },
+            status: None,
         }
     }
 
@@ -4730,7 +4854,17 @@ mod tests {
                 frontend_validation: None,
             });
 
-            let listeners = build_converged_listener_statuses(&gateway);
+            let route = make_http_route(
+                "prod",
+                "route-a",
+                vec![gateway_parent_ref("prod", "my-gw", "https")],
+                vec![http_backend_ref(None, "svc-a")],
+            );
+
+            let listeners = build_converged_listener_statuses_with_snapshot(
+                &gateway,
+                snapshot_with_gateway_and_http_routes(gateway.clone(), vec![route]),
+            );
             let listener = listener_named(&listeners, "https");
             let resolved_refs = listener_condition(listener, "ResolvedRefs");
 
@@ -4748,8 +4882,8 @@ mod tests {
                 "case {case_name} should preserve HTTPRoute supportedKinds"
             );
             assert_eq!(
-                listener.attached_routes, 0,
-                "case {case_name} should report zero attached routes"
+                listener.attached_routes, 1,
+                "case {case_name} should preserve attached routes"
             );
         }
     }
@@ -4792,5 +4926,84 @@ mod tests {
         assert_eq!(resolved_refs.status, "True");
         assert_eq!(listener.supported_kinds, vec![http_route_kind()]);
         assert_eq!(listener.attached_routes, 0);
+    }
+
+    #[test]
+    fn gateway_listener_status_reports_one_attached_route_conformance() {
+        let gateway = make_gateway("prod", "my-gw");
+        let route = make_http_route(
+            "prod",
+            "route-a",
+            vec![gateway_parent_ref("prod", "my-gw", "http")],
+            vec![http_backend_ref(None, "svc-a")],
+        );
+
+        let listeners = build_converged_listener_statuses_with_snapshot(
+            &gateway,
+            snapshot_with_gateway_and_http_routes(gateway.clone(), vec![route]),
+        );
+        let listener = listener_named(&listeners, "http");
+
+        assert_eq!(listener.attached_routes, 1);
+        assert_eq!(listener_condition(listener, "Accepted").status, "True");
+        assert_eq!(listener_condition(listener, "ResolvedRefs").status, "True");
+    }
+
+    #[test]
+    fn gateway_listener_status_reports_two_attached_routes_conformance() {
+        let gateway = make_gateway("prod", "my-gw");
+        let route_a = make_http_route(
+            "prod",
+            "route-a",
+            vec![gateway_parent_ref("prod", "my-gw", "http")],
+            vec![http_backend_ref(None, "svc-a")],
+        );
+        let route_b = make_http_route(
+            "prod",
+            "route-b",
+            vec![gateway_parent_ref("prod", "my-gw", "http")],
+            vec![http_backend_ref(None, "svc-b")],
+        );
+
+        let listeners = build_converged_listener_statuses_with_snapshot(
+            &gateway,
+            snapshot_with_gateway_and_http_routes(gateway.clone(), vec![route_a, route_b]),
+        );
+        let listener = listener_named(&listeners, "http");
+
+        assert_eq!(listener.attached_routes, 2);
+        assert_eq!(listener_condition(listener, "Accepted").status, "True");
+        assert_eq!(listener_condition(listener, "ResolvedRefs").status, "True");
+    }
+
+    #[test]
+    fn gateway_listener_status_reports_attached_routes_when_resolved_refs_false_conformance() {
+        let mut gateway = make_gateway("prod", "my-gw");
+        gateway.spec.listeners[0].allowed_routes = Some(AllowedRoutes {
+            namespaces: Some(RouteNamespaces {
+                from: FromNamespaces::All,
+                selector: None,
+            }),
+            kinds: vec![],
+        });
+        let route = make_http_route(
+            "app-ns",
+            "route-a",
+            vec![gateway_parent_ref("prod", "my-gw", "http")],
+            vec![http_backend_ref(Some("backend-ns"), "svc-a")],
+        );
+
+        let listeners = build_converged_listener_statuses_with_snapshot(
+            &gateway,
+            snapshot_with_gateway_and_http_routes(gateway.clone(), vec![route]),
+        );
+        let listener = listener_named(&listeners, "http");
+        let accepted = listener_condition(listener, "Accepted");
+        let resolved_refs = listener_condition(listener, "ResolvedRefs");
+
+        assert_eq!(listener.attached_routes, 1);
+        assert_eq!(accepted.status, "True");
+        assert_eq!(resolved_refs.status, "False");
+        assert_eq!(resolved_refs.reason, "RefNotPermitted");
     }
 }

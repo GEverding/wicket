@@ -1023,9 +1023,20 @@ pub fn listener_status_intents_with_attachment(
             // Non-accepted listeners must always report zero attached routes.
             // A listener that is not accepted cannot have routes meaningfully
             // attached to it, so reporting a non-zero count would be misleading.
-            if intent.accepted && intent.resolved_refs {
+            if intent.accepted {
                 if let Some(summary) = ap.listener_summary(&intent.name) {
                     intent.attached_routes = summary.attached_routes;
+                }
+                if intent.resolved_refs
+                    && ap
+                        .results_for_listener(&intent.name, true)
+                        .iter()
+                        .any(|result| {
+                            result.status.resolved_refs_reason() == Some("RefNotPermitted")
+                        })
+                {
+                    intent.resolved_refs = false;
+                    intent.resolved_refs_reason = Some("RefNotPermitted".to_string());
                 }
             }
             intent
@@ -2707,6 +2718,168 @@ mod tests {
         let tcp = intents.iter().find(|i| i.name == "tcp").unwrap();
         assert_eq!(tcp.attached_routes, 1);
         assert!(tcp.accepted);
+    }
+
+    #[test]
+    fn listener_status_intents_with_attachment_reports_one_attached_route() {
+        use crate::reconcilers::attachment_planner::{AttachmentPlan, ListenerAttachmentSummary};
+
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let ap = AttachmentPlan {
+            gateway_namespace: "prod".to_string(),
+            gateway_name: "my-gw".to_string(),
+            gateway_generation: 1,
+            route_results: vec![],
+            listener_summaries: vec![ListenerAttachmentSummary {
+                listener_name: "http".to_string(),
+                attached_routes: 1,
+                supported_kinds: vec![],
+                listener_accepted: true,
+                listener_rejection_reason: None,
+            }],
+        };
+
+        let intents = listener_status_intents_with_attachment(&gw, Some(&ap));
+
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].attached_routes, 1);
+        assert!(intents[0].accepted);
+        assert!(intents[0].resolved_refs);
+    }
+
+    #[test]
+    fn listener_status_intents_with_attachment_reports_two_attached_routes() {
+        use crate::reconcilers::attachment_planner::{AttachmentPlan, ListenerAttachmentSummary};
+
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let ap = AttachmentPlan {
+            gateway_namespace: "prod".to_string(),
+            gateway_name: "my-gw".to_string(),
+            gateway_generation: 1,
+            route_results: vec![],
+            listener_summaries: vec![ListenerAttachmentSummary {
+                listener_name: "http".to_string(),
+                attached_routes: 2,
+                supported_kinds: vec![],
+                listener_accepted: true,
+                listener_rejection_reason: None,
+            }],
+        };
+
+        let intents = listener_status_intents_with_attachment(&gw, Some(&ap));
+
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].attached_routes, 2);
+        assert!(intents[0].accepted);
+        assert!(intents[0].resolved_refs);
+    }
+
+    #[test]
+    fn listener_status_intents_with_attachment_propagates_ref_not_permitted_reason() {
+        use crate::reconcilers::attachment_planner::{
+            AttachmentPlan, AttachmentStatus, ListenerAttachmentSummary, RouteAttachmentResult,
+            RouteKind,
+        };
+
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            "uid-abc",
+            vec![make_listener("http", 80, ProtocolType::HTTP)],
+        );
+        let ap = AttachmentPlan {
+            gateway_namespace: "prod".to_string(),
+            gateway_name: "my-gw".to_string(),
+            gateway_generation: 1,
+            route_results: vec![RouteAttachmentResult {
+                route_namespace: "app-ns".to_string(),
+                route_name: "route-a".to_string(),
+                route_kind: RouteKind::HTTPRoute,
+                listener_name: Some("http".to_string()),
+                parent_ref_section_name: Some("http".to_string()),
+                parent_ref_port: Some(80),
+                status: AttachmentStatus::RefNotPermitted {
+                    route_namespace: "app-ns".to_string(),
+                    target_namespace: "backend-ns".to_string(),
+                    target_name: "svc-a".to_string(),
+                },
+                observed_generation: 1,
+            }],
+            listener_summaries: vec![ListenerAttachmentSummary {
+                listener_name: "http".to_string(),
+                attached_routes: 1,
+                supported_kinds: vec![],
+                listener_accepted: true,
+                listener_rejection_reason: None,
+            }],
+        };
+
+        let intents = listener_status_intents_with_attachment(&gw, Some(&ap));
+
+        assert_eq!(intents.len(), 1);
+        assert!(intents[0].accepted);
+        assert!(!intents[0].resolved_refs);
+        assert_eq!(
+            intents[0].resolved_refs_reason.as_deref(),
+            Some("RefNotPermitted")
+        );
+        assert_eq!(intents[0].attached_routes, 1);
+    }
+
+    #[test]
+    fn listener_status_intents_with_attachment_keeps_attached_routes_when_resolved_refs_false() {
+        use crate::crds::RouteGroupKind as CrdRouteGroupKind;
+        use crate::reconcilers::attachment_planner::{AttachmentPlan, ListenerAttachmentSummary};
+
+        let mut listener = make_listener("http", 80, ProtocolType::HTTP);
+        listener.allowed_routes = Some(crate::crds::AllowedRoutes {
+            namespaces: None,
+            kinds: vec![
+                CrdRouteGroupKind {
+                    group: GATEWAY_API_GROUP.to_string(),
+                    kind: "HTTPRoute".to_string(),
+                },
+                CrdRouteGroupKind {
+                    group: GATEWAY_API_GROUP.to_string(),
+                    kind: "TCPRoute".to_string(),
+                },
+            ],
+        });
+        let gw = make_gateway("prod", "my-gw", "uid-abc", vec![listener]);
+        let ap = AttachmentPlan {
+            gateway_namespace: "prod".to_string(),
+            gateway_name: "my-gw".to_string(),
+            gateway_generation: 1,
+            route_results: vec![],
+            listener_summaries: vec![ListenerAttachmentSummary {
+                listener_name: "http".to_string(),
+                attached_routes: 1,
+                supported_kinds: vec![],
+                listener_accepted: true,
+                listener_rejection_reason: None,
+            }],
+        };
+
+        let intents = listener_status_intents_with_attachment(&gw, Some(&ap));
+
+        assert_eq!(intents.len(), 1);
+        assert!(intents[0].accepted);
+        assert!(!intents[0].resolved_refs);
+        assert_eq!(
+            intents[0].resolved_refs_reason.as_deref(),
+            Some("InvalidRouteKinds")
+        );
+        assert_eq!(intents[0].attached_routes, 1);
     }
 
     #[test]
