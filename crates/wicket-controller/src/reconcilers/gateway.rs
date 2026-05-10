@@ -137,6 +137,64 @@ fn gateway_refs_from_keys(keys: Vec<(String, String)>) -> Vec<ObjectRef<Gateway>
     refs
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DeployObservation {
+    current_spec_hash: Option<String>,
+    ready_replicas: Option<u32>,
+    deploy_observed_generation: Option<i64>,
+    deploy_generation: Option<i64>,
+    updated_replicas: Option<u32>,
+    available_replicas: Option<u32>,
+    desired_replicas: Option<u32>,
+}
+
+fn observe_deployment(deploy: &Deployment) -> DeployObservation {
+    let current_spec_hash = deploy
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(SPEC_REVISION_ANNOTATION))
+        .cloned()
+        .or_else(|| {
+            deploy
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.metadata.as_ref())
+                .and_then(|metadata| metadata.annotations.as_ref())
+                .and_then(|annotations| annotations.get(SPEC_REVISION_ANNOTATION))
+                .cloned()
+        });
+
+    let status = deploy.status.as_ref();
+
+    let ready_replicas = status
+        .and_then(|s| s.ready_replicas)
+        .and_then(|r| u32::try_from(r).ok());
+    let deploy_observed_generation = status.and_then(|s| s.observed_generation);
+    let deploy_generation = deploy.metadata.generation;
+    let updated_replicas = status
+        .and_then(|s| s.updated_replicas)
+        .and_then(|r| u32::try_from(r).ok());
+    let available_replicas = status
+        .and_then(|s| s.available_replicas)
+        .and_then(|r| u32::try_from(r).ok());
+    let desired_replicas = deploy.spec.as_ref().map(|spec| {
+        spec.replicas
+            .and_then(|r| u32::try_from(r).ok())
+            .unwrap_or(1)
+    });
+
+    DeployObservation {
+        current_spec_hash,
+        ready_replicas,
+        deploy_observed_generation,
+        deploy_generation,
+        updated_replicas,
+        available_replicas,
+        desired_replicas,
+    }
+}
+
 /// Reconcile a Gateway resource.
 pub async fn reconcile_gateway(
     gateway: Arc<Gateway>,
@@ -623,81 +681,11 @@ async fn observe_runtime_state(
         }
     };
 
-    // ── Deployment ────────────────────────────────────────────────────────────
-    //
-    // Read all rollout-convergence fields from DeploymentStatus so that
-    // `is_rollout_converged()` can gate `Programmed=True` on full rollout
-    // completion rather than just `ready_replicas > 0`.
-    struct DeployObservation {
-        current_spec_hash: Option<String>,
-        ready_replicas: Option<u32>,
-        deploy_observed_generation: Option<i64>,
-        deploy_generation: Option<i64>,
-        updated_replicas: Option<u32>,
-        available_replicas: Option<u32>,
-        desired_replicas: Option<u32>,
-    }
-
     let deploy_obs: DeployObservation = {
         let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
         match deploy_api.get(&deploy_name).await {
-            Ok(deploy) => {
-                let spec_hash = deploy
-                    .metadata
-                    .annotations
-                    .as_ref()
-                    .and_then(|a| a.get(SPEC_REVISION_ANNOTATION))
-                    .cloned();
-
-                let status = deploy.status.as_ref();
-
-                // ready_replicas: pods with Ready condition.
-                let ready = status
-                    .and_then(|s| s.ready_replicas)
-                    .and_then(|r| u32::try_from(r).ok());
-
-                // observed_generation: generation the Deployment controller processed.
-                let deploy_obs_gen = status.and_then(|s| s.observed_generation);
-
-                // deploy_generation: current desired generation of the Deployment spec.
-                let deploy_gen = deploy.metadata.generation;
-
-                // updated_replicas: pods on the current pod template.
-                let updated = status
-                    .and_then(|s| s.updated_replicas)
-                    .and_then(|r| u32::try_from(r).ok());
-
-                // available_replicas: pods available for >= minReadySeconds.
-                let available = status
-                    .and_then(|s| s.available_replicas)
-                    .and_then(|r| u32::try_from(r).ok());
-
-                // desired_replicas: from DeploymentSpec.replicas (defaults to 1 if absent).
-                let desired = deploy
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.replicas)
-                    .and_then(|r| u32::try_from(r).ok());
-
-                DeployObservation {
-                    current_spec_hash: spec_hash,
-                    ready_replicas: ready,
-                    deploy_observed_generation: deploy_obs_gen,
-                    deploy_generation: deploy_gen,
-                    updated_replicas: updated,
-                    available_replicas: available,
-                    desired_replicas: desired,
-                }
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => DeployObservation {
-                current_spec_hash: None,
-                ready_replicas: None,
-                deploy_observed_generation: None,
-                deploy_generation: None,
-                updated_replicas: None,
-                available_replicas: None,
-                desired_replicas: None,
-            },
+            Ok(deploy) => observe_deployment(&deploy),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => DeployObservation::default(),
             Err(e) => {
                 // Non-404: surface as a real error.
                 tracing::warn!(
@@ -1649,8 +1637,11 @@ pub async fn run_gateway_controller(ctx: Arc<Context>) -> Result<(), kube::Error
 mod tests {
     use super::*;
 
+    use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+    use k8s_openapi::api::core::v1::{PodSpec, PodTemplateSpec};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
     use kube::core::ObjectMeta;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use crate::crds::{
         AllowedRoutes, Condition, Gateway, GatewaySpec, GatewayStatus, GatewayTLSConfig, Listener,
@@ -1729,6 +1720,80 @@ mod tests {
             ("/cert.pem".to_string(), "/key.pem".to_string()),
         );
         snapshot_with_gateway(gateway, tls_secrets)
+    }
+
+    fn make_deployment(
+        metadata_revision: Option<&str>,
+        template_revision: Option<&str>,
+        replicas: Option<i32>,
+    ) -> Deployment {
+        let metadata_annotations = metadata_revision.map(|revision| {
+            let mut annotations = BTreeMap::new();
+            annotations.insert(SPEC_REVISION_ANNOTATION.to_string(), revision.to_string());
+            annotations
+        });
+
+        let template_annotations = template_revision.map(|revision| {
+            let mut annotations = BTreeMap::new();
+            annotations.insert(SPEC_REVISION_ANNOTATION.to_string(), revision.to_string());
+            annotations
+        });
+
+        Deployment {
+            metadata: ObjectMeta {
+                name: Some("deploy".to_string()),
+                namespace: Some("default".to_string()),
+                generation: Some(7),
+                annotations: metadata_annotations,
+                ..Default::default()
+            },
+            spec: Some(DeploymentSpec {
+                replicas,
+                selector: LabelSelector {
+                    match_labels: Some(BTreeMap::from([("app".to_string(), "wicket".to_string())])),
+                    ..Default::default()
+                },
+                template: PodTemplateSpec {
+                    metadata: Some(ObjectMeta {
+                        annotations: template_annotations,
+                        ..Default::default()
+                    }),
+                    spec: Some(PodSpec {
+                        containers: vec![],
+                        ..Default::default()
+                    }),
+                },
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn deployment_observation_uses_pod_template_spec_revision_fallback() {
+        let deploy = make_deployment(None, Some("template-hash"), Some(2));
+
+        let obs = observe_deployment(&deploy);
+
+        assert_eq!(obs.current_spec_hash.as_deref(), Some("template-hash"));
+    }
+
+    #[test]
+    fn deployment_observation_prefers_deployment_spec_revision_annotation() {
+        let deploy = make_deployment(Some("metadata-hash"), Some("template-hash"), Some(2));
+
+        let obs = observe_deployment(&deploy);
+
+        assert_eq!(obs.current_spec_hash.as_deref(), Some("metadata-hash"));
+    }
+
+    #[test]
+    fn deployment_observation_defaults_absent_replicas_to_one() {
+        let deploy = make_deployment(Some("metadata-hash"), Some("template-hash"), None);
+
+        let obs = observe_deployment(&deploy);
+
+        assert_eq!(obs.desired_replicas, Some(1));
     }
 
     fn build_converged_listener_statuses(gateway: &Gateway) -> Vec<ListenerStatus> {

@@ -378,26 +378,28 @@ impl GatewayState {
                         let cert_ns = cert_ref.namespace.as_deref().unwrap_or(gw_ns);
                         let cert_key = Self::key(cert_ns, &cert_ref.name);
 
-                        if let Some((cert_path, key_path)) = self.tls_secrets.get(&cert_key) {
-                            let entry =
-                                cert_map.entry(cert_key).or_insert_with(|| FileCertConfig {
-                                    name: cert_ref.name.clone(),
-                                    cert: PathBuf::from(cert_path),
-                                    key: PathBuf::from(key_path),
-                                    domains: vec![],
-                                });
+                        let Some(ref hostname) = listener.hostname else {
+                            continue;
+                        };
 
-                            if let Some(ref hostname) = listener.hostname {
-                                if !entry.domains.contains(hostname) {
-                                    entry.domains.push(hostname.clone());
-                                }
-                            }
+                        let Some((cert_path, key_path)) = self.tls_secrets.get(&cert_key) else {
+                            continue;
+                        };
+
+                        let entry = cert_map.entry(cert_key).or_insert_with(|| FileCertConfig {
+                            name: cert_ref.name.clone(),
+                            cert: PathBuf::from(cert_path),
+                            key: PathBuf::from(key_path),
+                            domains: vec![],
+                        });
+
+                        if !entry.domains.contains(hostname) {
+                            entry.domains.push(hostname.clone());
                         }
                     }
                 }
             }
         }
-
         tls_certs.extend(cert_map.into_values());
 
         // Process TCPRoutes and TLSRoutes for stream config (sorted).
@@ -879,6 +881,128 @@ mod tests {
         assert_eq!(cert.key, PathBuf::from("/etc/wicket/tls/shared-cert.key"));
         assert!(cert.domains.contains(&"a.example.com".to_string()));
         assert!(cert.domains.contains(&"b.example.com".to_string()));
+    }
+
+    #[test]
+    fn https_listeners_shared_cert_accumulate_hostnames_and_skip_empty_domains() {
+        let mut state = GatewayState::default();
+
+        state.tls_secrets.insert(
+            GatewayState::key("default", "shared-cert"),
+            (
+                "/etc/wicket/tls/shared-cert.crt".to_string(),
+                "/etc/wicket/tls/shared-cert.key".to_string(),
+            ),
+        );
+
+        let tls_config = GatewayTLSConfig {
+            mode: TLSModeType::Terminate,
+            certificate_refs: vec![SecretObjectReference {
+                group: "".to_string(),
+                kind: "Secret".to_string(),
+                name: "shared-cert".to_string(),
+                namespace: Some("default".to_string()),
+            }],
+            options: None,
+            frontend_validation: None,
+        };
+
+        state.gateways.insert(
+            GatewayState::key("default", "test-gateway"),
+            Gateway {
+                metadata: ObjectMeta {
+                    name: Some("test-gateway".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                spec: GatewaySpec {
+                    gateway_class_name: "wicket".to_string(),
+                    listeners: vec![
+                        Listener {
+                            name: "https-a".to_string(),
+                            hostname: None,
+                            port: 443,
+                            protocol: ProtocolType::HTTPS,
+                            tls: Some(tls_config.clone()),
+                            allowed_routes: None,
+                        },
+                        Listener {
+                            name: "https-b".to_string(),
+                            hostname: Some("second-example.org".to_string()),
+                            port: 443,
+                            protocol: ProtocolType::HTTPS,
+                            tls: Some(tls_config),
+                            allowed_routes: None,
+                        },
+                    ],
+                    addresses: vec![],
+                    infrastructure: None,
+                },
+                status: None,
+            },
+        );
+
+        let config = state.generate_config();
+        let parsed: WicketConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let tls = parsed.tls.expect("tls config");
+        let file = tls.file.expect("file tls config");
+
+        assert_eq!(file.certs.len(), 1);
+        let cert = &file.certs[0];
+        assert_eq!(cert.domains, vec!["second-example.org".to_string()]);
+    }
+
+    #[test]
+    fn hostname_less_https_listener_does_not_emit_unusable_file_tls_config() {
+        let mut state = GatewayState::default();
+
+        state.tls_secrets.insert(
+            GatewayState::key("default", "shared-cert"),
+            (
+                "/etc/wicket/tls/shared-cert.crt".to_string(),
+                "/etc/wicket/tls/shared-cert.key".to_string(),
+            ),
+        );
+
+        let tls_config = GatewayTLSConfig {
+            mode: TLSModeType::Terminate,
+            certificate_refs: vec![SecretObjectReference {
+                group: "".to_string(),
+                kind: "Secret".to_string(),
+                name: "shared-cert".to_string(),
+                namespace: Some("default".to_string()),
+            }],
+            options: None,
+            frontend_validation: None,
+        };
+
+        state.gateways.insert(
+            GatewayState::key("default", "test-gateway"),
+            Gateway {
+                metadata: ObjectMeta {
+                    name: Some("test-gateway".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                spec: GatewaySpec {
+                    gateway_class_name: "wicket".to_string(),
+                    listeners: vec![Listener {
+                        name: "https".to_string(),
+                        hostname: None,
+                        port: 443,
+                        protocol: ProtocolType::HTTPS,
+                        tls: Some(tls_config),
+                        allowed_routes: None,
+                    }],
+                    addresses: vec![],
+                    infrastructure: None,
+                },
+                status: None,
+            },
+        );
+
+        let config = state.generate_config();
+        assert!(config.tls.is_none());
     }
 
     #[test]

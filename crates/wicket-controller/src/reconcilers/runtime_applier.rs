@@ -55,9 +55,9 @@ use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::api::core::v1::Service as K8sService;
 use k8s_openapi::api::core::v1::{
-    ConfigMapVolumeSource, Container, ContainerPort, EnvVar, PodSpec, PodTemplateSpec,
-    ResourceRequirements, SecretVolumeSource, ServiceAccount, ServicePort, ServiceSpec, Volume,
-    VolumeMount,
+    ConfigMapVolumeSource, Container, ContainerPort, EnvVar, PodSecurityContext, PodSpec,
+    PodTemplateSpec, ResourceRequirements, SecretVolumeSource, SecurityContext, ServiceAccount,
+    ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -95,6 +95,12 @@ const LABEL_GW_NAME: &str = "wicket.io/gateway-name";
 
 /// Field manager name used for server-side apply / merge-patch calls.
 const FIELD_MANAGER: &str = "wicket-controller";
+
+/// UID/GID used by the managed-runtime proxy container.
+const PROXY_RUNTIME_UID: i64 = 65532;
+
+/// fsGroup used so TLS secret volumes are group-readable.
+const PROXY_RUNTIME_FSGROUP: i64 = 65532;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Apply result
@@ -687,6 +693,7 @@ async fn apply_deployment(
         image: Some(plan.runtime_metadata.image.clone()),
         ports: Some(container_ports),
         volume_mounts: Some(volume_mounts),
+        security_context: Some(managed_runtime_container_security_context()),
         env: Some(vec![EnvVar {
             name: "WICKET_SPEC_REVISION".to_string(),
             value: Some(plan.spec_hash.clone()),
@@ -710,6 +717,7 @@ async fn apply_deployment(
         }),
         spec: Some(PodSpec {
             service_account_name: Some(plan.service_account_name.clone()),
+            security_context: Some(managed_runtime_pod_security_context()),
             containers: vec![container],
             volumes: Some(volumes),
             node_selector: if plan.runtime_metadata.node_selector.is_empty() {
@@ -829,7 +837,7 @@ fn build_pod_volumes_and_mounts(plan: &GatewayRuntimePlan) -> (Vec<Volume>, Vec<
             name: vol_name,
             secret: Some(SecretVolumeSource {
                 secret_name: Some(mount.secret_name.clone()),
-                default_mode: Some(0o400),
+                default_mode: Some(0o440),
                 optional: Some(false),
                 ..Default::default()
             }),
@@ -838,6 +846,27 @@ fn build_pod_volumes_and_mounts(plan: &GatewayRuntimePlan) -> (Vec<Volume>, Vec<
     }
 
     (volumes, volume_mounts)
+}
+
+fn managed_runtime_pod_security_context() -> PodSecurityContext {
+    PodSecurityContext {
+        fs_group: Some(PROXY_RUNTIME_FSGROUP),
+        run_as_non_root: Some(true),
+        run_as_user: Some(PROXY_RUNTIME_UID),
+        run_as_group: Some(PROXY_RUNTIME_UID),
+        ..Default::default()
+    }
+}
+
+fn managed_runtime_container_security_context() -> SecurityContext {
+    SecurityContext {
+        run_as_non_root: Some(true),
+        run_as_user: Some(PROXY_RUNTIME_UID),
+        run_as_group: Some(PROXY_RUNTIME_UID),
+        allow_privilege_escalation: Some(false),
+        read_only_root_filesystem: Some(true),
+        ..Default::default()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1295,9 +1324,51 @@ mod tests {
             assert_eq!(volume.secret.as_ref().and_then(|s| s.optional), Some(false));
             assert_eq!(
                 volume.secret.as_ref().and_then(|s| s.default_mode),
-                Some(0o400)
+                Some(0o440)
             );
         }
+    }
+
+    #[test]
+    fn build_pod_volumes_and_mounts_sets_tls_secret_default_mode_group_readable() {
+        let plan = make_tls_plan();
+        let (volumes, _) = build_pod_volumes_and_mounts(&plan);
+
+        for tls in &plan.tls_secret_mounts {
+            let volume = volumes
+                .iter()
+                .find(|v| {
+                    v.name
+                        == format!("tls-{}", tls.secret_name)
+                            .chars()
+                            .take(63)
+                            .collect::<String>()
+                })
+                .expect("TLS volume must exist");
+            assert_eq!(
+                volume.secret.as_ref().and_then(|s| s.default_mode),
+                Some(0o440)
+            );
+        }
+    }
+
+    #[test]
+    fn apply_deployment_pod_spec_sets_non_root_security_context() {
+        let sc = managed_runtime_pod_security_context();
+
+        assert_eq!(sc.fs_group, Some(PROXY_RUNTIME_FSGROUP));
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.run_as_user, Some(PROXY_RUNTIME_UID));
+        assert_eq!(sc.run_as_group, Some(PROXY_RUNTIME_UID));
+    }
+
+    #[test]
+    fn apply_deployment_container_sets_non_root_security_context() {
+        let sc = managed_runtime_container_security_context();
+
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.run_as_user, Some(PROXY_RUNTIME_UID));
+        assert_eq!(sc.run_as_group, Some(PROXY_RUNTIME_UID));
     }
 
     // ── deployment_changed semantics ──────────────────────────────────────────

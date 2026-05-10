@@ -1633,6 +1633,8 @@ mod tests {
                 vec![make_secret_ref(None, "edge-cert")],
             )],
         );
+        let mut gw = gw;
+        gw.spec.listeners[0].hostname = Some("edge.example.com".to_string());
         let input = make_input(
             "prod",
             "my-gw",
