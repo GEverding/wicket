@@ -935,7 +935,7 @@ fn first_unresolved_backend_ref_for_kind(
         let target_key =
             crate::reconcilers::config_generator::GatewayState::key(target_ns, &br.name);
 
-        if target_ns == route_namespace && !snapshot.service_endpoints.contains_key(&target_key) {
+        if target_ns == route_namespace && !snapshot.service_presence.contains(&target_key) {
             return Some(AttachmentStatus::BackendNotFound {
                 route_namespace: route_namespace.to_string(),
                 target_namespace: target_ns.to_string(),
@@ -1322,6 +1322,7 @@ mod tests {
         tcp_routes: HashMap<String, TCPRoute>,
         tls_routes: HashMap<String, TLSRoute>,
         service_endpoints: HashMap<String, crate::reconcilers::config_generator::ServiceEndpoints>,
+        service_presence: HashSet<String>,
         reference_grants: HashMap<String, ReferenceGrant>,
         namespace_labels: HashMap<String, BTreeMap<String, String>>,
     }
@@ -1369,6 +1370,7 @@ mod tests {
 
         fn with_service_endpoint(mut self, namespace: &str, name: &str) -> Self {
             let key = format!("{}/{}", namespace, name);
+            self.service_presence.insert(key.clone());
             self.service_endpoints.insert(
                 key,
                 crate::reconcilers::config_generator::ServiceEndpoints {
@@ -1377,6 +1379,12 @@ mod tests {
                     endpoints: vec!["127.0.0.1:80".to_string()],
                 },
             );
+            self
+        }
+
+        fn with_service_presence(mut self, namespace: &str, name: &str) -> Self {
+            self.service_presence
+                .insert(format!("{}/{}", namespace, name));
             self
         }
 
@@ -1403,6 +1411,7 @@ mod tests {
                 tcp_routes: self.tcp_routes,
                 tls_routes: self.tls_routes,
                 service_endpoints: self.service_endpoints,
+                service_presence: self.service_presence,
                 tls_secrets: HashMap::new(),
                 reference_grants: self.reference_grants,
                 service_ref_index: HashSet::new(),
@@ -2373,7 +2382,49 @@ mod tests {
     }
 
     #[test]
-    fn same_ns_backend_ref_missing_service_is_still_attached() {
+    fn same_ns_backend_ref_existing_service_with_no_endpoints_is_attached() {
+        let gw = make_gateway(
+            "prod",
+            "my-gw",
+            vec![make_listener_with_allowed(
+                "http",
+                80,
+                ProtocolType::HTTP,
+                AllowedRoutes {
+                    namespaces: Some(RouteNamespaces {
+                        from: FromNamespaces::All,
+                        selector: None,
+                    }),
+                    kinds: vec![],
+                },
+            )],
+        );
+        let route = make_http_route(
+            "app-ns",
+            "my-route",
+            vec![make_parent_ref("prod", "my-gw", Some("http"))],
+            vec![make_http_backend_ref(None, "existing-svc")],
+        );
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route)
+            .with_service_presence("app-ns", "existing-svc")
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input("prod", "my-gw", snapshot))
+            .unwrap();
+
+        assert!(matches!(
+            &plan.route_results[0].status,
+            AttachmentStatus::Attached
+        ));
+        assert_eq!(plan.route_results[0].status.resolved_refs_reason(), None);
+        assert_eq!(plan.listener_summaries[0].attached_routes, 1);
+    }
+
+    #[test]
+    fn same_ns_backend_ref_missing_service_is_backend_not_found() {
         let gw = make_gateway(
             "prod",
             "my-gw",
@@ -2409,7 +2460,10 @@ mod tests {
             &plan.route_results[0].status,
             AttachmentStatus::BackendNotFound { target_name, .. } if target_name == "does-not-exist"
         ));
-        assert_eq!(plan.listener_summaries[0].attached_routes, 1);
+        assert_eq!(
+            plan.route_results[0].status.resolved_refs_reason(),
+            Some("BackendNotFound")
+        );
     }
 
     #[test]
@@ -2756,6 +2810,128 @@ mod tests {
         assert_eq!(plan.route_results[0].status, AttachmentStatus::Attached);
         assert_eq!(plan.listener_summary("http").unwrap().attached_routes, 0);
         assert_eq!(plan.listener_summary("https").unwrap().attached_routes, 1);
+    }
+
+    #[test]
+    fn httproute_listener_port_matching_conformance_shadow() {
+        let gw = make_gateway(
+            "gateway-conformance-infra",
+            "httproute-listener-port-matching",
+            vec![
+                make_listener("listener-1", 80, ProtocolType::HTTP),
+                make_listener("listener-2", 8080, ProtocolType::HTTP),
+                make_listener("listener-3", 8080, ProtocolType::HTTP),
+                make_listener("listener-4", 8090, ProtocolType::HTTP),
+                make_listener("listener-5", 8090, ProtocolType::HTTP),
+            ],
+        );
+
+        let route_v1 = make_http_route(
+            "gateway-conformance-infra",
+            "backend-v1",
+            vec![make_parent_ref_with_port(
+                "gateway-conformance-infra",
+                "httproute-listener-port-matching",
+                None,
+                80,
+            )],
+            vec![make_http_backend_ref(None, "infra-backend-v1")],
+        );
+        let route_v2 = make_http_route(
+            "gateway-conformance-infra",
+            "backend-v2",
+            vec![make_parent_ref_with_port(
+                "gateway-conformance-infra",
+                "httproute-listener-port-matching",
+                None,
+                8080,
+            )],
+            vec![make_http_backend_ref(None, "infra-backend-v2")],
+        );
+        let route_v3 = make_http_route(
+            "gateway-conformance-infra",
+            "backend-v3",
+            vec![make_parent_ref_with_port(
+                "gateway-conformance-infra",
+                "httproute-listener-port-matching",
+                Some("listener-4"),
+                8090,
+            )],
+            vec![make_http_backend_ref(None, "infra-backend-v3")],
+        );
+
+        let snapshot = SnapshotBuilder::default()
+            .with_gateway(gw)
+            .with_http_route(route_v1)
+            .with_http_route(route_v2)
+            .with_http_route(route_v3)
+            .with_service_endpoint("gateway-conformance-infra", "infra-backend-v1")
+            .with_service_endpoint("gateway-conformance-infra", "infra-backend-v2")
+            .with_service_endpoint("gateway-conformance-infra", "infra-backend-v3")
+            .build();
+
+        let plan = AttachmentPlanner
+            .plan(&make_input(
+                "gateway-conformance-infra",
+                "httproute-listener-port-matching",
+                snapshot,
+            ))
+            .unwrap();
+
+        let v1: Vec<_> = plan
+            .route_results
+            .iter()
+            .filter(|r| r.route_name == "backend-v1")
+            .collect();
+        assert_eq!(v1.len(), 1);
+        assert_eq!(v1[0].status, AttachmentStatus::Attached);
+        assert_eq!(v1[0].listener_name.as_deref(), Some("listener-1"));
+
+        let v2: Vec<_> = plan
+            .route_results
+            .iter()
+            .filter(|r| r.route_name == "backend-v2")
+            .collect();
+        assert_eq!(v2.len(), 2);
+        assert!(v2.iter().all(|r| r.status == AttachmentStatus::Attached));
+        assert!(v2
+            .iter()
+            .any(|r| r.listener_name.as_deref() == Some("listener-2")));
+        assert!(v2
+            .iter()
+            .any(|r| r.listener_name.as_deref() == Some("listener-3")));
+
+        let v3 = plan
+            .result_for_route_parent_ref(
+                "gateway-conformance-infra",
+                "backend-v3",
+                "listener-4",
+                Some(8090),
+            )
+            .unwrap();
+        assert_eq!(v3.status, AttachmentStatus::Attached);
+        assert_eq!(v3.listener_name.as_deref(), Some("listener-4"));
+
+        assert_eq!(
+            plan.listener_summary("listener-1").unwrap().attached_routes,
+            1
+        );
+        assert_eq!(
+            plan.listener_summary("listener-2").unwrap().attached_routes,
+            1
+        );
+        assert_eq!(
+            plan.listener_summary("listener-3").unwrap().attached_routes,
+            1
+        );
+        assert_eq!(
+            plan.listener_summary("listener-4").unwrap().attached_routes,
+            1
+        );
+        assert_eq!(
+            plan.listener_summary("listener-5").unwrap().attached_routes,
+            0
+        );
     }
 
     // ── Hostname compatibility (HIGH) ─────────────────────────────────────────

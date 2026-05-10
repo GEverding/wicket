@@ -78,19 +78,15 @@ fn build_route_parent_status(
     controller_name: String,
     accepted_condition: Condition,
     route_generation: Option<i64>,
-    accepted: bool,
     resolved_refs_condition: Option<Condition>,
 ) -> RouteParentStatus {
-    let conditions = if accepted {
-        vec![
-            accepted_condition.with_observed_generation(route_generation),
-            resolved_refs_condition
-                .unwrap_or_else(Condition::resolved_refs)
-                .with_observed_generation(route_generation),
-        ]
-    } else {
-        vec![accepted_condition.with_observed_generation(route_generation)]
-    };
+    let mut conditions = vec![accepted_condition.with_observed_generation(route_generation)];
+
+    conditions.push(
+        resolved_refs_condition
+            .unwrap_or_else(Condition::resolved_refs)
+            .with_observed_generation(route_generation),
+    );
 
     RouteParentStatus {
         parent_ref,
@@ -167,7 +163,6 @@ pub async fn reconcile_httproute(
                         "Parent Gateway not found",
                     ),
                     route_generation,
-                    false,
                     None,
                 ));
                 continue;
@@ -241,7 +236,6 @@ pub async fn reconcile_httproute(
                     "Gateway is not managed by Wicket",
                 ),
                 route_generation,
-                false,
                 None,
             ));
             continue;
@@ -264,40 +258,14 @@ pub async fn reconcile_httproute(
                     &mut plan_cache,
                 )
             } else {
-                // Gateway-wide parentRef: no sectionName -> require at least one
-                // HTTP/HTTPS listener so an HTTPRoute is not accepted against a
-                // TCP/TLS-only gateway.  When parentRef.port is set, that port
-                // must match a compatible listener (not merely any HTTP listener).
-                let matching_http = gateway.spec.listeners.iter().any(|l| {
-                    matches!(
-                        l.protocol,
-                        crate::crds::ProtocolType::HTTP | crate::crds::ProtocolType::HTTPS
-                    ) && parent_ref.port.is_none_or(|p| l.port == p)
-                });
-
-                if matching_http {
-                    (Condition::accepted(), None)
-                } else {
-                    tracing::debug!(
-                        namespace = %namespace,
-                        route = %name,
-                        parent_ref = %parent_ref.name,
-                        parent_namespace = %parent_ns,
-                        port = ?parent_ref.port,
-                        reason = "NoMatchingListener",
-                        message = "Gateway has no HTTP/HTTPS listener matching the parentRef port",
-                        "Route listener validation failed"
-                    );
-                    (
-                        Condition::new(
-                            "Accepted",
-                            false,
-                            "NoMatchingListener",
-                            "Gateway has no HTTP/HTTPS listener matching the parentRef port",
-                        ),
-                        None,
-                    )
-                }
+                http_route_gateway_wide_condition_from_spec(
+                    &gateway,
+                    &namespace,
+                    &name,
+                    &parent_ref.name,
+                    parent_ns,
+                    parent_ref.port,
+                )
             };
 
         let is_accepted = accepted_condition.status == "True";
@@ -310,12 +278,7 @@ pub async fn reconcile_httproute(
             WICKET_CONTROLLER_NAME.to_string(),
             accepted_condition,
             route_generation,
-            is_accepted,
-            if is_accepted {
-                resolved_refs_condition
-            } else {
-                None
-            },
+            resolved_refs_condition,
         ));
     }
 
@@ -622,6 +585,46 @@ fn http_only_condition_from_spec(
                 "No listener matches the parentRef sectionName",
             )
         }
+    }
+}
+
+fn http_route_gateway_wide_condition_from_spec(
+    gateway: &Gateway,
+    namespace: &str,
+    route_name: &str,
+    parent_name: &str,
+    parent_namespace: &str,
+    port: Option<u16>,
+) -> (Condition, Option<Condition>) {
+    let matching_http = gateway.spec.listeners.iter().any(|l| {
+        matches!(
+            l.protocol,
+            crate::crds::ProtocolType::HTTP | crate::crds::ProtocolType::HTTPS
+        ) && port.is_none_or(|p| l.port == p)
+    });
+
+    if matching_http {
+        (Condition::accepted(), None)
+    } else {
+        tracing::debug!(
+            namespace = %namespace,
+            route = %route_name,
+            parent_ref = %parent_name,
+            parent_namespace = %parent_namespace,
+            port = ?port,
+            reason = "NoMatchingParent",
+            message = "Gateway has no HTTP/HTTPS listener matching the parentRef port",
+            "Route listener validation failed"
+        );
+        (
+            Condition::new(
+                "Accepted",
+                false,
+                "NoMatchingParent",
+                "Gateway has no HTTP/HTTPS listener matching the parentRef port",
+            ),
+            None,
+        )
     }
 }
 
@@ -1300,6 +1303,7 @@ mod tests {
             tcp_routes: HashMap::new(),
             tls_routes: HashMap::new(),
             service_endpoints: HashMap::new(),
+            service_presence: std::collections::HashSet::new(),
             tls_secrets: HashMap::new(),
             reference_grants: HashMap::new(),
             service_ref_index: HashSet::new(),
@@ -1429,7 +1433,6 @@ mod tests {
             WICKET_CONTROLLER_NAME.to_string(),
             accepted_condition,
             Some(1),
-            true,
             resolved_refs_condition,
         );
 
@@ -1556,6 +1559,7 @@ mod tests {
             tcp_routes: HashMap::new(),
             tls_routes: HashMap::new(),
             service_endpoints: HashMap::new(),
+            service_presence: std::collections::HashSet::new(),
             tls_secrets: HashMap::new(),
             reference_grants: HashMap::new(),
             service_ref_index: HashSet::new(),
@@ -1586,6 +1590,7 @@ mod tests {
             tcp_routes: HashMap::new(),
             tls_routes: HashMap::new(),
             service_endpoints: HashMap::new(),
+            service_presence: std::collections::HashSet::new(),
             tls_secrets: HashMap::new(),
             reference_grants: HashMap::new(),
             service_ref_index: HashSet::new(),
@@ -1633,6 +1638,62 @@ mod tests {
         assert_eq!(cond.type_, "Accepted");
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, "NoMatchingParent");
+    }
+
+    #[test]
+    fn gateway_wide_parent_ref_port_mismatch_gives_no_matching_parent() {
+        let gw = make_gw_with_listener("prod", "my-gw", "http", 80, ProtocolType::HTTP);
+
+        let (cond, resolved_refs) = http_route_gateway_wide_condition_from_spec(
+            &gw,
+            "prod",
+            "my-route",
+            "my-gw",
+            "prod",
+            Some(81),
+        );
+
+        assert_eq!(cond.type_, "Accepted");
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, "NoMatchingParent");
+        assert!(resolved_refs.is_none());
+    }
+
+    #[test]
+    fn gateway_wide_parent_ref_port_mismatch_keeps_resolved_refs_true() {
+        let gw = make_gw_with_listener("prod", "my-gw", "http", 80, ProtocolType::HTTP);
+        let parent_ref = ParentReference {
+            group: "gateway.networking.k8s.io".to_string(),
+            kind: "Gateway".to_string(),
+            namespace: Some("prod".to_string()),
+            name: "my-gw".to_string(),
+            section_name: None,
+            port: Some(81),
+        };
+
+        let (accepted_condition, resolved_refs_condition) =
+            http_route_gateway_wide_condition_from_spec(
+                &gw,
+                "prod",
+                "my-route",
+                &parent_ref.name,
+                "prod",
+                parent_ref.port,
+            );
+
+        let parent_status = build_route_parent_status(
+            parent_ref,
+            WICKET_CONTROLLER_NAME.to_string(),
+            accepted_condition,
+            Some(1),
+            resolved_refs_condition,
+        );
+
+        assert_eq!(parent_status.conditions[0].type_, "Accepted");
+        assert_eq!(parent_status.conditions[0].status, "False");
+        assert_eq!(parent_status.conditions[0].reason, "NoMatchingParent");
+        assert_eq!(parent_status.conditions[1].type_, "ResolvedRefs");
+        assert_eq!(parent_status.conditions[1].status, "True");
     }
 
     /// attachment_status_message returns non-empty strings for all variants.
@@ -1693,7 +1754,6 @@ mod tests {
                     message: "Resource has been accepted".to_string(),
                 },
                 Some(9),
-                true,
                 None,
             )],
         };
@@ -1711,7 +1771,6 @@ mod tests {
                     message: "Resource has been accepted".to_string(),
                 },
                 Some(9),
-                true,
                 None,
             )],
         };
@@ -1744,7 +1803,6 @@ mod tests {
             WICKET_CONTROLLER_NAME.to_string(),
             Condition::accepted(),
             Some(9),
-            true,
             None,
         );
         assert_eq!(accepted.conditions.len(), 2);
@@ -1758,11 +1816,12 @@ mod tests {
             WICKET_CONTROLLER_NAME.to_string(),
             Condition::new("Accepted", false, "InvalidParentRef", "Gateway not found"),
             Some(9),
-            false,
             None,
         );
-        assert_eq!(rejected.conditions.len(), 1);
+        assert_eq!(rejected.conditions.len(), 2);
         assert_eq!(rejected.conditions[0].observed_generation, Some(9));
+        assert_eq!(rejected.conditions[1].type_, "ResolvedRefs");
+        assert_eq!(rejected.conditions[1].observed_generation, Some(9));
     }
 
     #[test]
@@ -1782,7 +1841,6 @@ mod tests {
                 WICKET_CONTROLLER_NAME.to_string(),
                 Condition::accepted(),
                 Some(9),
-                true,
                 None,
             )],
         };
@@ -1792,7 +1850,6 @@ mod tests {
                 WICKET_CONTROLLER_NAME.to_string(),
                 Condition::accepted(),
                 Some(8),
-                true,
                 None,
             )],
         };
@@ -1904,6 +1961,7 @@ mod tests {
             tcp_routes: HashMap::new(),
             tls_routes: HashMap::new(),
             service_endpoints: HashMap::new(),
+            service_presence: std::collections::HashSet::new(),
             tls_secrets: HashMap::new(),
             reference_grants: HashMap::new(),
             service_ref_index: std::collections::HashSet::new(),

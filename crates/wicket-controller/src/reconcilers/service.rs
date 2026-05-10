@@ -473,6 +473,10 @@ pub async fn reconcile_service(
 
     tracing::debug!(namespace = %namespace, name = %name, "Reconciling Service");
 
+    ctx.store
+        .upsert_service_presence(GatewayState::key(&namespace, &name))
+        .await;
+
     // Check if this service is referenced by any route
     let is_referenced = is_service_referenced(&ctx, &namespace, &name).await;
 
@@ -554,7 +558,14 @@ pub async fn run_service_controller(ctx: Arc<Context>) -> Result<(), kube::Error
     loop {
         attempt += 1;
         match tokio::time::timeout(Duration::from_secs(30), api.list(&Default::default())).await {
-            Ok(Ok(_)) => {
+            Ok(Ok(services)) => {
+                let mut service_presence = std::collections::HashSet::new();
+                for service in services.items {
+                    let namespace = service.namespace().unwrap_or_default();
+                    let name = service.name_any();
+                    service_presence.insert(GatewayState::key(&namespace, &name));
+                }
+                ctx.store.replace_service_presence(service_presence).await;
                 ctx.store.mark_listed(ResourceClass::Services).await;
                 tracing::debug!(attempt, "Service initial list complete; store flag set");
                 break;

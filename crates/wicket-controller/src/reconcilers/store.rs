@@ -148,6 +148,8 @@ pub struct PlannerSnapshot {
     pub tls_routes: HashMap<String, TLSRoute>,
     /// Service endpoints by `namespace/name`.
     pub service_endpoints: HashMap<String, ServiceEndpoints>,
+    /// Known Services by `namespace/name`.
+    pub service_presence: HashSet<String>,
     /// TLS secrets by `namespace/name` -> `(cert_path, key_path)`.
     pub tls_secrets: HashMap<String, (String, String)>,
     /// ReferenceGrants by `namespace/name`.
@@ -595,6 +597,7 @@ pub struct StoreInner {
     pub tcp_routes: HashMap<String, TCPRoute>,
     pub tls_routes: HashMap<String, TLSRoute>,
     pub service_endpoints: HashMap<String, ServiceEndpoints>,
+    pub service_presence: HashSet<String>,
     /// TLS secrets by namespace/name -> (cert_path, key_path).
     pub tls_secrets: HashMap<String, (String, String)>,
     pub reference_grants: HashMap<String, ReferenceGrant>,
@@ -799,6 +802,7 @@ impl StoreInner {
             tcp_routes: self.tcp_routes.clone(),
             tls_routes: self.tls_routes.clone(),
             service_endpoints: self.service_endpoints.clone(),
+            service_presence: self.service_presence.clone(),
             tls_secrets: self.tls_secrets.clone(),
             reference_grants: self.reference_grants.clone(),
             service_ref_index: self.service_ref_index.clone(),
@@ -1109,6 +1113,21 @@ impl SharedStore {
             .await
             .service_endpoints
             .insert(key, endpoints);
+    }
+
+    /// Upsert a known Service presence entry.
+    pub async fn upsert_service_presence(&self, key: String) {
+        self.inner.write().await.service_presence.insert(key);
+    }
+
+    /// Replace all known Service presence entries.
+    pub async fn replace_service_presence(&self, service_presence: HashSet<String>) {
+        self.inner.write().await.service_presence = service_presence;
+    }
+
+    /// Remove a known Service presence entry.
+    pub async fn remove_service_presence(&self, key: &str) {
+        self.inner.write().await.service_presence.remove(key);
     }
 
     /// Remove service endpoints.
