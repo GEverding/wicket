@@ -1,0 +1,110 @@
+name: wicket
+arch: ${WICKET_NFPM_ARCH}
+platform: linux
+version: ${WICKET_NFPM_VERSION}
+release: 1
+section: utils
+priority: optional
+maintainer: Wicket Maintainers <wicket@geverding.com>
+description: |
+  Wicket standalone reverse proxy and graceful HTTP upgrade service.
+
+  Packaged for systemd-managed Debian and RPM installs.
+homepage: https://github.com/GEverding/wicket
+license: Apache-2.0
+depends:
+  - systemd
+contents:
+  - src: ${WICKET_RELEASE_BIN}
+    dst: /usr/bin/wicket
+    expand: true
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - src: ${WICKET_UPGRADE_HELPER}
+    dst: /usr/lib/wicket/wicket-upgrade
+    expand: true
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - dst: /usr/lib/wicket
+    type: dir
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - src: ${WICKET_SERVICE_UNIT}
+    dst: /lib/systemd/system/wicket.service
+    packager: deb
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ${WICKET_SERVICE_UNIT}
+    dst: /usr/lib/systemd/system/wicket.service
+    packager: rpm
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: ${WICKET_DEFAULT_CONFIG}
+    dst: /etc/wicket/wicket.toml
+    type: config|noreplace
+    expand: true
+    file_info:
+      mode: 0640
+      owner: root
+      group: wicket
+  - src: ${WICKET_DEFAULT_CONFIG}
+    dst: /usr/share/doc/wicket/examples/wicket.toml
+    expand: true
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - dst: /usr/share/doc/wicket/examples
+    type: dir
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - dst: /etc/wicket
+    type: dir
+    file_info:
+      mode: 0750
+      owner: root
+      group: wicket
+  - dst: /etc/wicket/tls
+    type: dir
+    file_info:
+      mode: 0750
+      owner: root
+      group: wicket
+  - dst: /var/lib/wicket
+    type: dir
+    file_info:
+      mode: 0750
+      owner: wicket
+      group: wicket
+  - dst: /var/lib/wicket/acme
+    type: dir
+    file_info:
+      mode: 0750
+      owner: wicket
+      group: wicket
+scripts:
+  preinstall: packaging/nfpm/deb/preinstall.sh
+  postinstall: packaging/nfpm/deb/postinstall.sh
+  preremove: packaging/nfpm/deb/preremove.sh
+  postremove: packaging/nfpm/deb/postremove.sh
+overrides:
+  rpm:
+    scripts:
+      preinstall: packaging/nfpm/rpm/preinstall.sh
+      postinstall: packaging/nfpm/rpm/postinstall.sh
+      preremove: packaging/nfpm/rpm/preremove.sh
+      postremove: packaging/nfpm/rpm/postremove.sh

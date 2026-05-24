@@ -1997,8 +1997,10 @@ mod tests {
         let store = SharedStore::new();
         assert!(!store.is_ready().await);
 
-        let mut inner = StoreInner::default();
-        inner.phase = all_ready_phase();
+        let inner = StoreInner {
+            phase: all_ready_phase(),
+            ..Default::default()
+        };
         store.replace_all(inner).await;
 
         assert!(store.is_ready().await);
@@ -2008,8 +2010,10 @@ mod tests {
     async fn test_replace_all_rebuilds_index() {
         let store = SharedStore::new();
 
-        let mut inner = StoreInner::default();
-        inner.phase = all_ready_phase();
+        let mut inner = StoreInner {
+            phase: all_ready_phase(),
+            ..Default::default()
+        };
         let route = make_http_route("r", "default", None, "bulk-svc");
         inner.http_routes.insert("default/r".to_string(), route);
         // Intentionally do NOT call rebuild_service_index() here --
@@ -2027,8 +2031,10 @@ mod tests {
         // Caller supplies a stale/wrong index; replace_all must rebuild it.
         let store = SharedStore::new();
 
-        let mut inner = StoreInner::default();
-        inner.phase = all_ready_phase();
+        let mut inner = StoreInner {
+            phase: all_ready_phase(),
+            ..Default::default()
+        };
         let route = make_http_route("r", "default", None, "real-svc");
         inner.http_routes.insert("default/r".to_string(), route);
         // Inject a stale index that claims "fake-svc" is referenced.

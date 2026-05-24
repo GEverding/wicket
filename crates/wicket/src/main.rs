@@ -14,7 +14,10 @@ use pingora_core::prelude::*;
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::services::listening::Service as ListeningService;
 use pingora_proxy::http_proxy_service;
+use std::ffi::OsStr;
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,6 +63,18 @@ struct Args {
     /// Prometheus metrics server address
     #[arg(long, default_value = "0.0.0.0:9090")]
     metrics_addr: String,
+
+    /// Enable Pingora binary upgrade mode
+    #[arg(long)]
+    upgrade: bool,
+
+    /// Path to the PID file used by Pingora when daemon mode is enabled
+    #[arg(long, default_value = "/run/wicket/wicket.pid")]
+    pid_file: String,
+
+    /// Path to the upgrade socket used for Pingora binary handoff
+    #[arg(long, default_value = "/run/wicket/upgrade.sock")]
+    upgrade_sock: String,
 }
 
 fn main() {
@@ -188,6 +203,12 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         "Starting Wicket proxy"
     );
 
+    if args.upgrade && config.stream.is_some() {
+        anyhow::bail!(
+            "graceful binary upgrade is HTTP-only in v1 and unsupported when stream listeners are configured"
+        );
+    }
+
     // Create a tokio runtime for async operations (TLS/ACME, stream proxy,
     // signal handling, config watcher).  We enter it immediately so that
     // `tokio::spawn`, `TcpListener::from_std`, and signal handlers used
@@ -264,13 +285,21 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         pingora_conf.threads = workers;
     }
 
+    // Pingora's grace period defaults to 5 minutes. In standalone mode we
+    // want `server.shutdown_timeout` to bound the full graceful drain window,
+    // so start runtime shutdown immediately and let Pingora wait up to the
+    // configured shutdown timeout for active work to finish.
+    pingora_conf.grace_period_seconds = Some(0);
+
     // Wire up graceful shutdown timeout
     pingora_conf.graceful_shutdown_timeout_seconds = Some(config.server.shutdown_timeout);
+    pingora_conf.pid_file = args.pid_file.clone();
+    pingora_conf.upgrade_sock = args.upgrade_sock.clone();
 
     // Create the Pingora server with our configuration
     let mut server = Server::new_with_opt_and_conf(
         Some(Opt {
-            upgrade: false,
+            upgrade: args.upgrade,
             daemon: false,
             nocapture: false,
             test: false,
@@ -278,8 +307,6 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         }),
         pingora_conf,
     );
-
-    server.bootstrap();
 
     // Register custom proxy metrics with Prometheus
     // These will automatically appear at the /metrics endpoint
@@ -316,11 +343,10 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     // `disable_http` is set by the controller for HTTPS-only Gateways so
     // that HTTP and HTTPS do not contend for the same port.
     if !config.server.disable_http {
-        proxy_service.add_tcp(&config.server.listen.to_string());
-        info!(
-            address = %config.server.listen,
-            "HTTP proxy listening"
-        );
+        for address in config.server.http_listen_addrs() {
+            proxy_service.add_tcp(&address.to_string());
+            info!(address = %address, "HTTP proxy listening");
+        }
     } else {
         info!("HTTP listener disabled (server.disable_http = true)");
     }
@@ -504,8 +530,183 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         }
     });
 
+    // Bootstrap only after the likely-fallible proxy/service setup is complete.
+    server.bootstrap();
+
+    // Publish the serving PID only once startup has crossed the bootstrap boundary.
+    let _pid_guard = PidFileGuard::install(&args.pid_file)?;
+
+    let startup_status = if args.upgrade {
+        "HTTP upgrade takeover complete"
+    } else {
+        "HTTP service ready"
+    };
+
+    systemd_notify_ready(startup_status)?;
+
     // Run the server (blocks until shutdown)
     server.run_forever();
+}
+
+struct PidFileGuard {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl PidFileGuard {
+    fn install(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let pid = std::process::id();
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create PID file directory: {}", parent.display())
+            })?;
+        }
+
+        write_pid_file(&path, pid)?;
+
+        Ok(Self { path, pid })
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        if pid_file_matches_pid(&self.path, self.pid).unwrap_or(false) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
+    use std::io::Write;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wicket.pid".to_string());
+    let tmp_path = parent.join(format!(".{}.{}.tmp", file_name, pid));
+
+    {
+        let mut file = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("Failed to create temp PID file: {}", tmp_path.display()))?;
+
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(0o640))
+            .with_context(|| format!("Failed to set permissions on {}", tmp_path.display()))?;
+
+        writeln!(file, "{pid}")
+            .with_context(|| format!("Failed to write PID to {}", tmp_path.display()))?;
+    }
+
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to atomically replace PID file {} with {}",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn pid_file_matches_pid(path: &Path, pid: u32) -> Result<bool> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to read PID file {}", path.display()))
+        }
+    };
+
+    let current_pid = contents.trim().parse::<u32>().ok();
+    Ok(current_pid == Some(pid))
+}
+
+fn systemd_notify_ready(status: &str) -> Result<()> {
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return Ok(());
+    };
+
+    let pid = std::process::id().to_string();
+    systemd_notify(
+        socket.as_os_str(),
+        &[
+            ("READY", "1"),
+            ("MAINPID", pid.as_str()),
+            ("STATUS", status),
+        ],
+    )
+}
+
+fn systemd_notify(socket: &OsStr, fields: &[(&str, &str)]) -> Result<()> {
+    let payload = fields
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let bytes = payload.as_bytes();
+
+    if socket.as_bytes().first() == Some(&b'@') {
+        systemd_notify_abstract(socket, bytes)
+    } else {
+        let sock = UnixDatagram::unbound().context("Failed to create notify socket")?;
+        sock.send_to(bytes, Path::new(socket)).with_context(|| {
+            format!(
+                "Failed to send systemd notification to {}",
+                Path::new(socket).display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+fn systemd_notify_abstract(socket: &OsStr, payload: &[u8]) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let socket_bytes = socket.as_bytes();
+    let name = socket_bytes
+        .get(1..)
+        .ok_or_else(|| anyhow::anyhow!("invalid abstract notify socket"))?;
+
+    if name.len() + 2 > std::mem::size_of::<libc::sockaddr_un>() {
+        anyhow::bail!("abstract notify socket path is too long");
+    }
+
+    let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+
+    for (slot, byte) in addr.sun_path.iter_mut().skip(1).zip(name.iter()) {
+        *slot = *byte as libc::c_char;
+    }
+
+    let sock = UnixDatagram::unbound().context("Failed to create notify socket")?;
+    let fd = sock.as_raw_fd();
+    let addr_len = (std::mem::size_of::<libc::sa_family_t>() + 1 + name.len()) as libc::socklen_t;
+
+    let rc = unsafe {
+        libc::sendto(
+            fd,
+            payload.as_ptr() as *const libc::c_void,
+            payload.len(),
+            0,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            addr_len,
+        )
+    };
+
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("Failed to send systemd notification")
+            .with_context(|| format!("notify socket={}", socket.to_string_lossy()));
+    }
+
+    Ok(())
 }
 
 /// Compute the HTTPS listen address from the HTTP listen address.

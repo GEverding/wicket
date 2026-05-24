@@ -26,3 +26,5 @@
 - [kube-rs Controller Strategy](./adr/kube-rs-controller-strategy.md)
 - [Unified TLS Serving](./adr/unified-tls-serving.md)
 - [Controller-Managed Gateway Runtime](./adr/controller-managed-gateway-runtime.md)
+- [Standalone Graceful HTTP Binary Upgrades](./adr/standalone-graceful-http-binary-upgrades.md)
+- [Standalone Packaged Filesystem Layout](./adr/standalone-packaged-filesystem-layout.md)

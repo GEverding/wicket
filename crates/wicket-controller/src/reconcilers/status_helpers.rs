@@ -131,7 +131,10 @@ mod tests {
                 "2024-01-02T00:00:00Z",
             ),
         ] {
-            assert!(!conditions_semantically_equal(&[base.clone()], &[changed]));
+            assert!(!conditions_semantically_equal(
+                std::slice::from_ref(&base),
+                &[changed]
+            ));
         }
     }
 

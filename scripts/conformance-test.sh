@@ -267,8 +267,9 @@ log "Supplementary RBAC applied"
 
 section "Configure Controller"
 kubectl -n "${SYSTEM_NAMESPACE}" set env "deployment/${CONTROLLER_DEPLOYMENT}" WICKET_PROXY_IMAGE="wicket:conformance"
+kubectl -n "${SYSTEM_NAMESPACE}" set env "deployment/${CONTROLLER_DEPLOYMENT}" WICKET_DEFAULT_SERVICE_TYPE="LoadBalancer"
 kubectl -n "${SYSTEM_NAMESPACE}" rollout status "deployment/${CONTROLLER_DEPLOYMENT}" --timeout=120s
-log "Controller configured with local proxy image"
+log "Controller configured with local proxy image and LoadBalancer managed-runtime services"
 
 section "Clone gateway-api"
 if [[ ! -d "${GATEWAY_API_DIR}" ]]; then

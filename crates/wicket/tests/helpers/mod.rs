@@ -17,6 +17,7 @@ use wicket_core::{HttpReloadHandle, WicketProxy};
 
 /// A test harness that runs a real Pingora proxy on a background thread.
 pub struct TestProxy {
+    #[allow(dead_code)]
     pub addr: SocketAddr,
     pub reload_handle: HttpReloadHandle,
     // The thread is leaked on drop; Pingora's run_forever() has no clean
@@ -37,9 +38,11 @@ impl TestProxy {
         let listen_str = addr.to_string();
 
         let thread = std::thread::spawn(move || {
-            let mut pingora_conf = ServerConf::default();
-            pingora_conf.threads = 1;
-            pingora_conf.graceful_shutdown_timeout_seconds = Some(1);
+            let pingora_conf = ServerConf {
+                threads: 1,
+                graceful_shutdown_timeout_seconds: Some(1),
+                ..Default::default()
+            };
 
             let mut server = Server::new_with_opt_and_conf(
                 Some(Opt {

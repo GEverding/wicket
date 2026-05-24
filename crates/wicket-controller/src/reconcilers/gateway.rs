@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Node, NodeAddress, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::{
-    api::{Api, Patch, PatchParams},
+    api::{Api, ListParams, Patch, PatchParams},
     runtime::{
         controller::{Action, Controller},
         reflector::ObjectRef,
@@ -135,6 +135,42 @@ fn gateway_refs_from_keys(keys: Vec<(String, String)>) -> Vec<ObjectRef<Gateway>
             .then_with(|| a.name.cmp(&b.name))
     });
     refs
+}
+
+fn node_addresses_from_nodes(nodes: &[Node]) -> Vec<GatewayStatusAddress> {
+    let mut addresses = std::collections::HashSet::new();
+
+    for node in nodes {
+        let Some(status) = &node.status else {
+            continue;
+        };
+        let Some(node_addrs) = &status.addresses else {
+            continue;
+        };
+
+        let external = node_addrs
+            .iter()
+            .find(|addr| addr.type_ == "ExternalIP")
+            .map(|addr: &NodeAddress| addr.address.clone());
+        let internal = node_addrs
+            .iter()
+            .find(|addr| addr.type_ == "InternalIP")
+            .map(|addr: &NodeAddress| addr.address.clone());
+
+        if let Some(address) = external.or(internal) {
+            addresses.insert(address);
+        }
+    }
+
+    let mut addresses: Vec<_> = addresses
+        .into_iter()
+        .map(|value| GatewayStatusAddress {
+            type_: AddressType::IPAddress,
+            value,
+        })
+        .collect();
+    addresses.sort_by(|a, b| a.value.cmp(&b.value));
+    addresses
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1261,6 +1297,23 @@ async fn get_gateway_addresses(
                             }
                         }
                     }
+
+                    if addresses.is_empty() {
+                        let node_api: Api<Node> = Api::all(client.clone());
+                        match node_api.list(&ListParams::default()).await {
+                            Ok(nodes) => {
+                                addresses = node_addresses_from_nodes(&nodes.items);
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    namespace = %namespace,
+                                    gateway = %gateway_name,
+                                    error = %error,
+                                    "failed to list Nodes for Gateway address fallback"
+                                );
+                            }
+                        }
+                    }
                 } else if spec.type_.as_deref() == Some("NodePort") {
                     // For NodePort, we could potentially get node IPs
                     // but that's complex - skip for now
@@ -1809,6 +1862,28 @@ mod tests {
         }
     }
 
+    fn make_node(name: &str, addresses: Vec<(&str, &str)>) -> Node {
+        Node {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            status: Some(k8s_openapi::api::core::v1::NodeStatus {
+                addresses: Some(
+                    addresses
+                        .into_iter()
+                        .map(|(type_, address)| NodeAddress {
+                            type_: type_.to_string(),
+                            address: address.to_string(),
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn deployment_observation_uses_pod_template_spec_revision_fallback() {
         let deploy = make_deployment(None, Some("template-hash"), Some(2));
@@ -1834,6 +1909,34 @@ mod tests {
         let obs = observe_deployment(&deploy);
 
         assert_eq!(obs.desired_replicas, Some(1));
+    }
+
+    #[test]
+    fn node_addresses_prefer_externalip_and_dedup_sort() {
+        let nodes = vec![
+            make_node("node-b", vec![("InternalIP", "10.0.0.2")]),
+            make_node(
+                "node-a",
+                vec![("ExternalIP", "203.0.113.10"), ("InternalIP", "10.0.0.1")],
+            ),
+            make_node("node-c", vec![("ExternalIP", "203.0.113.10")]),
+        ];
+
+        let addresses = node_addresses_from_nodes(&nodes);
+
+        assert_eq!(
+            addresses,
+            vec![
+                GatewayStatusAddress {
+                    type_: AddressType::IPAddress,
+                    value: "10.0.0.2".into()
+                },
+                GatewayStatusAddress {
+                    type_: AddressType::IPAddress,
+                    value: "203.0.113.10".into()
+                },
+            ]
+        );
     }
 
     fn build_converged_listener_statuses(gateway: &Gateway) -> Vec<ListenerStatus> {

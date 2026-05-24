@@ -21,6 +21,7 @@ pub struct RequestLog {
 pub struct HttpMockBackend {
     pub addr: SocketAddr,
     requests: Arc<Mutex<Vec<RequestLog>>>,
+    #[allow(dead_code)]
     response_body: String,
     _handle: tokio::task::JoinHandle<()>,
 }
@@ -105,6 +106,7 @@ impl HttpMockBackend {
     }
 
     /// Get all captured requests.
+    #[allow(dead_code)]
     pub async fn requests(&self) -> Vec<RequestLog> {
         self.requests.lock().await.clone()
     }
@@ -120,11 +122,13 @@ impl HttpMockBackend {
     }
 
     /// Clear all captured requests.
+    #[allow(dead_code)]
     pub async fn clear(&self) {
         self.requests.lock().await.clear();
     }
 
     /// Get the response body this backend returns.
+    #[allow(dead_code)]
     pub fn response_body(&self) -> &str {
         &self.response_body
     }

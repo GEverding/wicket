@@ -1,6 +1,7 @@
 //! Configuration generator that converts Gateway API resources to Wicket TOML config.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use crate::crds::{
@@ -179,20 +180,14 @@ impl GatewayState {
         // bind HTTP on the same port and TLS handshakes would fail.
         match (http_listeners.first(), https_listeners.first()) {
             (Some((_, http_l)), Some((_, https_l))) => {
-                config.server.listen = format!("0.0.0.0:{}", http_l.port)
-                    .parse()
-                    .expect("generated HTTP listen address is valid");
-                config.server.https_listen = Some(
-                    format!("0.0.0.0:{}", https_l.port)
-                        .parse()
-                        .expect("generated HTTPS listen address is valid"),
-                );
+                config.server.listen = SocketAddr::from(([0, 0, 0, 0], http_l.port));
+                config.server.http_listens = Self::additional_http_listens(&http_listeners);
+                config.server.https_listen = Some(SocketAddr::from(([0, 0, 0, 0], https_l.port)));
                 config.server.disable_http = false;
             }
             (Some((_, http_l)), None) => {
-                config.server.listen = format!("0.0.0.0:{}", http_l.port)
-                    .parse()
-                    .expect("generated HTTP listen address is valid");
+                config.server.listen = SocketAddr::from(([0, 0, 0, 0], http_l.port));
+                config.server.http_listens = Self::additional_http_listens(&http_listeners);
                 // No HTTPS listener; leave https_listen and disable_http at
                 // their defaults.
             }
@@ -200,9 +195,7 @@ impl GatewayState {
                 // HTTPS-only proxy: bind HTTPS on the listener port and skip
                 // HTTP entirely.  `listen` still holds the same port purely
                 // to satisfy the proxy's required field.
-                let addr = format!("0.0.0.0:{}", https_l.port)
-                    .parse()
-                    .expect("generated HTTPS listen address is valid");
+                let addr = SocketAddr::from(([0, 0, 0, 0], https_l.port));
                 config.server.listen = addr;
                 config.server.https_listen = Some(addr);
                 config.server.disable_http = true;
@@ -588,6 +581,20 @@ impl GatewayState {
         config
     }
 
+    fn additional_http_listens(http_listeners: &[(String, &Listener)]) -> Vec<SocketAddr> {
+        let mut addrs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for (_, listener) in http_listeners.iter().skip(1) {
+            let addr = SocketAddr::from(([0, 0, 0, 0], listener.port));
+            if seen.insert(addr) {
+                addrs.push(addr);
+            }
+        }
+
+        addrs
+    }
+
     /// Parse Duration string to seconds.
     fn parse_duration_to_secs(duration: &str) -> Option<u64> {
         // Gateway API uses Go duration format like "10s", "1m", "1h"
@@ -716,6 +723,7 @@ mod tests {
         let config = state.generate_config();
 
         assert_eq!(config.server.listen.to_string(), "0.0.0.0:8080");
+        assert!(config.server.http_listens.is_empty());
         assert_eq!(config.upstreams.len(), 1);
         assert_eq!(config.routes.len(), 1);
 
@@ -756,6 +764,7 @@ mod tests {
         let config = state.generate_config();
 
         assert_eq!(config.server.listen.to_string(), "0.0.0.0:8443");
+        assert!(config.server.http_listens.is_empty());
         assert_eq!(
             config.server.https_listen.map(|addr| addr.to_string()),
             Some("0.0.0.0:8443".to_string())
@@ -805,10 +814,59 @@ mod tests {
         let config = state.generate_config();
 
         assert_eq!(config.server.listen.to_string(), "0.0.0.0:8080");
+        assert!(config.server.http_listens.is_empty());
         assert_eq!(
             config.server.https_listen.map(|addr| addr.to_string()),
             Some("0.0.0.0:8443".to_string())
         );
+        assert!(!config.server.disable_http);
+    }
+
+    #[test]
+    fn test_multi_http_listener_config_generation() {
+        let mut state = GatewayState::default();
+
+        state.gateways.insert(
+            GatewayState::key("default", "test-gateway"),
+            Gateway {
+                metadata: ObjectMeta {
+                    name: Some("test-gateway".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                spec: GatewaySpec {
+                    gateway_class_name: "wicket".to_string(),
+                    listeners: vec![
+                        Listener {
+                            name: "http-a".to_string(),
+                            hostname: None,
+                            port: 8080,
+                            protocol: ProtocolType::HTTP,
+                            tls: None,
+                            allowed_routes: None,
+                        },
+                        Listener {
+                            name: "http-b".to_string(),
+                            hostname: None,
+                            port: 8081,
+                            protocol: ProtocolType::HTTP,
+                            tls: None,
+                            allowed_routes: None,
+                        },
+                    ],
+                    addresses: vec![],
+                    infrastructure: None,
+                },
+                status: None,
+            },
+        );
+
+        let config = state.generate_config();
+
+        assert_eq!(config.server.listen.to_string(), "0.0.0.0:8080");
+        assert_eq!(config.server.http_listens.len(), 1);
+        assert_eq!(config.server.http_listens[0].to_string(), "0.0.0.0:8081");
+        assert!(config.server.https_listen.is_none());
         assert!(!config.server.disable_http);
     }
 
@@ -1039,6 +1097,7 @@ mod tests {
         let parsed: WicketConfig = toml::from_str(&toml).expect("parse https-only config");
 
         assert_eq!(parsed.server.listen.to_string(), "0.0.0.0:8443");
+        assert!(parsed.server.http_listens.is_empty());
         assert_eq!(
             parsed.server.https_listen.map(|addr| addr.to_string()),
             Some("0.0.0.0:8443".to_string())

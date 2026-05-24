@@ -1,0 +1,22 @@
+[Unit]
+Description=Wicket reverse proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=wicket
+Group=wicket
+RuntimeDirectory=wicket
+RuntimeDirectoryMode=0750
+StateDirectory=wicket
+StateDirectoryMode=0750
+ExecStart=/usr/bin/wicket --config /etc/wicket/wicket.toml --pid-file /run/wicket/wicket.pid --upgrade-sock /run/wicket/upgrade.sock
+ExecReload=/usr/lib/wicket/wicket-upgrade /usr/bin/wicket --config /etc/wicket/wicket.toml --pid-file /run/wicket/wicket.pid --upgrade-sock /run/wicket/upgrade.sock
+Restart=on-failure
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

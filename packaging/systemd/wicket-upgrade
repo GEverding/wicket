@@ -1,0 +1,112 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    exit 2
+}
+
+WICKET_BIN=${1:-}
+shift || true
+
+CONFIG=
+PID_FILE=
+UPGRADE_SOCK=
+TIMEOUT_SECONDS=${WICKET_UPGRADE_TIMEOUT_SECONDS:-30}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --config)
+            CONFIG=${2:-}
+            shift 2
+            ;;
+        --pid-file)
+            PID_FILE=${2:-}
+            shift 2
+            ;;
+        --upgrade-sock)
+            UPGRADE_SOCK=${2:-}
+            shift 2
+            ;;
+        --timeout-seconds)
+            TIMEOUT_SECONDS=${2:-}
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+if [ -z "$WICKET_BIN" ] || [ -z "$CONFIG" ] || [ -z "$PID_FILE" ] || [ -z "$UPGRADE_SOCK" ]; then
+    usage
+fi
+
+if ! IFS= read -r incumbent_pid < "$PID_FILE"; then
+    exit 1
+fi
+
+case "$incumbent_pid" in
+    ''|*[!0-9]*) exit 1 ;;
+esac
+
+if ! kill -0 "$incumbent_pid" 2>/dev/null; then
+    exit 1
+fi
+
+rm -f "$UPGRADE_SOCK"
+
+"$WICKET_BIN" --upgrade --config "$CONFIG" --pid-file "$PID_FILE" --upgrade-sock "$UPGRADE_SOCK" &
+child_pid=$!
+
+success=0
+cleanup() {
+    if [ "$success" -eq 0 ]; then
+        kill "$child_pid" 2>/dev/null || true
+        wait "$child_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup INT TERM HUP EXIT
+
+waited=0
+while :; do
+    if ! kill -0 "$child_pid" 2>/dev/null; then
+        exit 1
+    fi
+    if [ -S "$UPGRADE_SOCK" ]; then
+        break
+    fi
+    if [ "$waited" -ge "$TIMEOUT_SECONDS" ]; then
+        exit 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+done
+
+kill -QUIT "$incumbent_pid"
+
+waited=0
+while :; do
+    if ! kill -0 "$child_pid" 2>/dev/null; then
+        exit 1
+    fi
+
+    if IFS= read -r current_pid < "$PID_FILE"; then
+        case "$current_pid" in
+            "$child_pid")
+                success=1
+                trap - INT TERM HUP EXIT
+                exit 0
+                ;;
+        esac
+    fi
+
+    if [ "$waited" -ge "$TIMEOUT_SECONDS" ]; then
+        exit 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+done

@@ -39,9 +39,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig {
-                listen: "0.0.0.0:8080"
-                    .parse()
-                    .expect("default listen address is valid"),
+                listen: SocketAddr::from(([0, 0, 0, 0], 8080)),
+                http_listens: Vec::new(),
                 https_listen: None,
                 disable_http: false,
                 workers: None,
@@ -62,6 +61,14 @@ impl Default for Config {
 pub struct ServerConfig {
     /// Address to listen on (e.g., "0.0.0.0:8080")
     pub listen: SocketAddr,
+
+    /// Additional HTTP listen sockets beyond `listen`.
+    ///
+    /// When empty, the proxy binds only `listen` for HTTP (the legacy
+    /// single-port behavior).  When populated, the proxy binds `listen` plus
+    /// each additional socket in this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_listens: Vec<SocketAddr>,
 
     /// Optional explicit HTTPS listen address.
     ///
@@ -99,6 +106,23 @@ pub struct ServerConfig {
     /// Graceful shutdown timeout in seconds
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout: u64,
+}
+
+impl ServerConfig {
+    /// All HTTP listen sockets, with `listen` first and duplicates removed.
+    #[must_use]
+    pub fn http_listen_addrs(&self) -> Vec<SocketAddr> {
+        let mut addrs = Vec::with_capacity(1 + self.http_listens.len());
+        let mut seen = HashSet::new();
+
+        for addr in std::iter::once(self.listen).chain(self.http_listens.iter().copied()) {
+            if seen.insert(addr) {
+                addrs.push(addr);
+            }
+        }
+
+        addrs
+    }
 }
 
 /// Configuration for an upstream (backend) service.
@@ -807,6 +831,38 @@ path_prefix = "/"
         assert_eq!(config.server.listen.port(), 8080);
         assert_eq!(config.upstreams.len(), 1);
         assert_eq!(config.routes.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_multi_http_listens() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+http_listens = ["127.0.0.1:8081", "127.0.0.1:8082"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        assert_eq!(config.server.listen.port(), 8080);
+        assert_eq!(config.server.http_listens.len(), 2);
+        assert_eq!(config.server.http_listens[0].port(), 8081);
+        assert_eq!(config.server.http_listens[1].port(), 8082);
+        assert_eq!(
+            config
+                .server
+                .http_listen_addrs()
+                .iter()
+                .map(|addr| addr.port())
+                .collect::<Vec<_>>(),
+            vec![8080, 8081, 8082]
+        );
     }
 
     #[test]
