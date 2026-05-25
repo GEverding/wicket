@@ -698,18 +698,22 @@ mod tests {
     use super::*;
     use crate::reconcilers::store::SharedStore;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     const VALID_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDCTCCAfGgAwIBAgIUS504oJN00coQI7WdYXtCv4rdSEYwDQYJKoZIhvcNAQEL\nBQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDUxMDAwNDMxNloXDTI2MDUx\nMTAwNDMxNlowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF\nAAOCAQ8AMIIBCgKCAQEAt0pgc70rBq5gFqsvwMev8oM54NNWw3zBpDDPzzsD59yZ\nne8abMrGnCBsW9ywv14gCvJeZ+hwj5Oi54fvj7X5hBI2QjLnPAGQ+HX2Z/RpqG5U\neEXQSObIVWo/R6z1yd8IO9Zxv2kd3Pr/i2XdE3bzAARNa97ebxSZhW4ByiL+GISt\nvwEvjaUzkbnZSwkhzi1CRKXABEBgaX2N67OQegwo+ccgjys3Z/I9tVmF0NrZxwqF\nMLm9sB5jd8zoCfdJWv1eeHn+uOYDXFi1oETX64aWJbWvbQPH+7kbKPYgqLzD1gOc\nWHghQOahaAcbK593GFm7Lz9dqIzC4AxO4QWpg7vvrwIDAQABo1MwUTAdBgNVHQ4E\nFgQUllHGGwkfNrbyaSbNxgExi2NpiUEwHwYDVR0jBBgwFoAUllHGGwkfNrbyaSbN\nxgExi2NpiUEwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAZ3aD\n4xzoIQ+opkhAMsBYXlSJ32bdEQjE91EHEDIv/ts+0Gh4azMfMOnd9tH+Vk5ZPoA2\nTWSB292ukbY4TflNrk3jrxrYRJcWSe3XRVeMYSsJQSAWceqlNWXcWwtX2X95BD6k\nCVv0Xj/iiCHWa2W8L0mvaU/neT6ajSioKVPnK+g18yr9JZ/J2V58Vb9Yf22XSx+f\nWy13F/QUcSnrqPUmoL6gdMKuzGZq47DKHLz1akQfg1FtPLE5IsdEWnP4bp9reKB5\nHMjREOUymg6W6Uu609T6mMHgRmQcStXt/oGOjXsiJsT3Ow9boY2IPkPB5lCnzLIX\nWU6ggfhLx97rw9+tmw==\n-----END CERTIFICATE-----\n";
     const VALID_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQC3SmBzvSsGrmAW\nqy/Ax6/ygzng01bDfMGkMM/POwPn3Jmd7xpsysacIGxb3LC/XiAK8l5n6HCPk6Ln\nh++PtfmEEjZCMuc8AZD4dfZn9GmoblR4RdBI5shVaj9HrPXJ3wg71nG/aR3c+v+L\nZd0TdvMABE1r3t5vFJmFbgHKIv4YhK2/AS+NpTORudlLCSHOLUJEpcAEQGBpfY3r\ns5B6DCj5xyCPKzdn8j21WYXQ2tnHCoUwub2wHmN3zOgJ90la/V54ef645gNcWLWg\nRNfrhpYlta9tA8f7uRso9iCovMPWA5xYeCFA5qFoBxsrn3cYWbsvP12ojMLgDE7h\nBamDu++vAgMBAAECggEAQtkPgGa3sIIcbWgVzHuHwiz2CPdLJ5Tyks1ynSPq8r9U\nD3PK8W6rLPnuSzqcA89yZEus/ryZgOPZgBPl3UYDMJXr0Az8pLf1hYiQS62qc1F5\n4TulEVGKMwzC84MzSWLcf+ZgKe1OhO/OD6shDB5P1eu7yOHJwj2DGFTctjo47fun\n2HZZGo7OpcwkhPgZbSfFniqc4LjLBQ2D8RmZe4EDXoCzbablT4W9r6Y+L7STo+hX\nVS8+VG/3HqtAaaSoZrE/4og4fi7wkyeyKXFQUAj1fI77NZQeB3Hl4cot4a3x0j5S\nOwyB95uLUFkHJKWQ2f/YtGvOFQ4NEkn4mHodYERmkQKBgQDZp9pS/TL2oNQMutX1\nTYNTsUdIBsmfju+8aBJcxJNfOpQU3JiI3YtR13tEl11syEmdhfNnkxqPV0W8pd8W\nNlcP/6j3LoEPiJPM9x1s9G00yKatUk3mVlOfqBhkoP2UjazzV1673DbRKPfl4yuH\n/cww4onve5OB235pzpANsTPziwKBgQDXlKz137m/y1Etm+kTNm2J1ZQH7HAYH6xV\nGHdh4VuVCRQ4zlSze/75hKw3sV++WJ0u5XYp3IOF08X2tSkqIchx8nbQw2azafKQ\nWh3o3LzpbwEWUc/eewFj5qg6lfuYwa+SpdE37+fiHMhPjGRdz6MKB22qUOqUUdRR\nIp/fnXlo7QKBgQCAskZescZTnA8mI8dlT1rqvrUWOqU3Sk4oyiSpY7Z8JWfv2ev7\naXv6fX4utY2RR/B3Sv/8azfWL9VVUYLSYHkkRZhD5+R6Kdiy5h8pEHIONuKPM05K\ndxrlGYCq56JpF0h/blben7xt+lpyPNu9gm0dLqY+y4QR0ZYyu+fjoLbGNwKBgQCm\n9MK6rKiLS+ezndJ1Cartm1XIiSkK1cS+JnOWf1RQ6LYbhFf+pOID1ecWPq06miAp\nSJYpt1i4lRj0hrq5oW4+KRwxc5MfEcdEWjZduE4prsk1wuhskfCysNjKfotac24I\n8ZhFbOu1prrPOJgmOv82bihVRdNWSMVYjKsqICf9xQKBgQCgVouUfA1wwpwDmQKZ\nJMXEk9Rt1f2Ds87XK+OPxfzrwgcVIBitV9Ie0VyxFVsfgOY6ezFVkyZ4sCHOBmQH\nlyefYgwRhkpsr9SKUlrqi00TrSRjsA6kbZejBwb79qW6Tg35F4qkQRFfYQcLdyQM\nsOOSw9wbokU4ou6OxbsP9C5yYQ==\n-----END PRIVATE KEY-----\n";
 
     async fn write_test_tls_files(cert_pem: &str, key_pem: &str) -> (PathBuf, PathBuf) {
         let unique = format!(
-            "wicket-secret-tests-{}-{}",
+            "wicket-secret-tests-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time should move forward")
-                .as_nanos()
+                .as_nanos(),
+            TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         let dir = std::env::temp_dir().join(unique);
         tokio::fs::create_dir_all(&dir)

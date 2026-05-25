@@ -25,11 +25,11 @@ wicket-tls = { path = "crates/wicket-tls" }
 wicket-sockmap = { path = "crates/wicket-sockmap" }
 
 # Pingora framework
-pingora = { version = "0.6", features = ["lb"] }
-pingora-core = "0.6"
-pingora-proxy = "0.6"
-pingora-http = "0.6"
-pingora-load-balancing = "0.6"
+pingora = { version = "0.8", features = ["lb"] }
+pingora-core = "0.8"
+pingora-proxy = "0.8"
+pingora-http = "0.8"
+pingora-load-balancing = "0.8"
 
 # Cloudflare foundations - production-grade service infrastructure
 foundations = { version = "3", features = [
