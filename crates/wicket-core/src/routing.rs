@@ -5,7 +5,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use tracing::debug;
-use wicket_config::RouteConfig;
+use wicket_config::{PathModifier, RouteConfig, UrlRewriteFilter};
 
 /// A compiled router that matches requests to upstream names.
 #[derive(Debug, Clone)]
@@ -33,6 +33,9 @@ struct CompiledRoute {
 
     /// Required headers
     headers: HashMap<String, String>,
+
+    /// Optional URL rewrite applied before proxying upstream.
+    url_rewrite: Option<UrlRewriteFilter>,
 }
 
 /// Host matching with wildcard support.
@@ -64,6 +67,12 @@ pub struct RouteMatch {
 
     /// Target upstream name
     pub upstream: String,
+
+    /// Optional URL rewrite applied before proxying upstream.
+    pub url_rewrite: Option<UrlRewriteFilter>,
+
+    /// Prefix matched by this route, used by ReplacePrefixMatch rewrites.
+    pub matched_path_prefix: String,
 }
 
 impl Router {
@@ -103,6 +112,8 @@ impl Router {
                 return Some(RouteMatch {
                     route_name: route.name.clone(),
                     upstream: route.upstream.clone(),
+                    url_rewrite: route.url_rewrite.clone(),
+                    matched_path_prefix: route.matched_path_prefix(path).to_string(),
                 });
             }
         }
@@ -149,6 +160,10 @@ impl CompiledRoute {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            url_rewrite: config
+                .filters
+                .as_ref()
+                .and_then(|filters| filters.url_rewrite.clone()),
         })
     }
 
@@ -193,6 +208,50 @@ impl CompiledRoute {
         }
 
         true
+    }
+
+    fn matched_path_prefix<'a>(&'a self, path: &'a str) -> &'a str {
+        match self.path_matcher.as_ref() {
+            Some(PathMatcher::Exact(exact)) => exact,
+            Some(PathMatcher::Prefix(prefix)) => prefix,
+            None => path,
+        }
+    }
+}
+
+/// Rewrite a request path and query according to a route URL rewrite filter.
+pub fn rewrite_path_and_query(
+    path: &str,
+    query: Option<&str>,
+    matched_prefix: &str,
+    rewrite: &UrlRewriteFilter,
+) -> Option<String> {
+    let path_rewrite = rewrite.path.as_ref()?;
+    let rewritten_path = match path_rewrite {
+        PathModifier::ReplaceFullPath(replacement) => replacement.clone(),
+        PathModifier::ReplacePrefixMatch(replacement) => {
+            replace_path_prefix(path, matched_prefix, replacement)
+        }
+    };
+
+    Some(match query {
+        Some(query) => format!("{rewritten_path}?{query}"),
+        None => rewritten_path,
+    })
+}
+
+fn replace_path_prefix(path: &str, matched_prefix: &str, replacement: &str) -> String {
+    let suffix = path.strip_prefix(matched_prefix).unwrap_or(path);
+    if suffix.is_empty() {
+        return replacement.to_string();
+    }
+
+    if replacement.ends_with('/') && suffix.starts_with('/') {
+        format!("{}{}", replacement.trim_end_matches('/'), suffix)
+    } else if replacement.ends_with('/') || suffix.starts_with('/') {
+        format!("{replacement}{suffix}")
+    } else {
+        format!("{replacement}/{suffix}")
     }
 }
 
@@ -268,7 +327,7 @@ impl PathMatcher {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use wicket_config::RouteMatch as ConfigRouteMatch;
+    use wicket_config::{RouteFilters, RouteMatch as ConfigRouteMatch, UrlRewriteFilter};
 
     fn make_route(
         name: Option<&str>,
@@ -468,5 +527,71 @@ mod tests {
         assert!(router
             .match_request(Some("example.com:8080"), "/foo", "GET", &headers)
             .is_some());
+    }
+
+    #[test]
+    fn test_route_match_carries_url_rewrite() {
+        let mut route = make_route(
+            Some("updates"),
+            "backend",
+            Some("updates.example.com"),
+            Some("/"),
+            None,
+            vec![],
+        );
+        route.filters = Some(RouteFilters {
+            url_rewrite: Some(UrlRewriteFilter {
+                hostname: None,
+                path: Some(PathModifier::ReplacePrefixMatch(
+                    "/b/updater-prod".to_string(),
+                )),
+            }),
+            ..Default::default()
+        });
+
+        let router = Router::build(&[route]).unwrap();
+        let matched = router
+            .match_request(
+                Some("updates.example.com"),
+                "/latest.yml",
+                "GET",
+                &HashMap::new(),
+            )
+            .expect("route should match");
+
+        assert_eq!(matched.matched_path_prefix, "/");
+        assert!(matched.url_rewrite.is_some());
+    }
+
+    #[test]
+    fn test_rewrite_path_prefix_preserves_suffix_and_query() {
+        let rewrite = UrlRewriteFilter {
+            hostname: None,
+            path: Some(PathModifier::ReplacePrefixMatch(
+                "/b/updater-prod".to_string(),
+            )),
+        };
+
+        assert_eq!(
+            rewrite_path_and_query("/latest.yml", None, "/", &rewrite).as_deref(),
+            Some("/b/updater-prod/latest.yml")
+        );
+        assert_eq!(
+            rewrite_path_and_query("/packages/mac/app.zip", Some("v=1"), "/", &rewrite).as_deref(),
+            Some("/b/updater-prod/packages/mac/app.zip?v=1")
+        );
+    }
+
+    #[test]
+    fn test_rewrite_path_prefix_avoids_double_slashes() {
+        let rewrite = UrlRewriteFilter {
+            hostname: None,
+            path: Some(PathModifier::ReplacePrefixMatch("/v1/".to_string())),
+        };
+
+        assert_eq!(
+            rewrite_path_and_query("/api/users", None, "/api", &rewrite).as_deref(),
+            Some("/v1/users")
+        );
     }
 }

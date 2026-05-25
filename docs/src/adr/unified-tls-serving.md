@@ -4,11 +4,18 @@
 **Date:** 2026-03-01  
 **Issue:** `bd-xih` (parent epic: `bd-baf`)
 
+**Implementation note (2026-05-25):** The static `add_tls(first_cert)` path was
+replaced by a Wicket-owned HTTPS service that uses `tokio-rustls` with
+`CertManager` as the rustls certificate resolver. Incoming TLS handshakes now use
+`CertStore` SNI lookup for exact, wildcard, and fallback certificate selection.
+
 ---
 
-## 1. Context and Current Gaps
+## 1. Context and Original Gaps
 
-Wicket supports three TLS modes (`file`, `acme`, `mixed`) but the serving path is not unified across them. Two structural gaps create correctness risk:
+Wicket supports three TLS modes (`file`, `acme`, `mixed`). Before `wicket-qu9`,
+the serving path was not unified across them. These structural gaps created
+correctness risk:
 
 ### Gap 1 — Static `add_tls` path bypasses `CertManager`
 
@@ -83,7 +90,7 @@ ACME must check `CertStore::resolve(domain)` before inserting and skip domains a
 
 ## 4. Listener Integration Model
 
-### Current (broken) model
+### Previous broken model
 
 ```
 TlsMode::File   → add_tls(addr, first_cert_path, first_key_path)  [static, bypasses CertManager]
@@ -91,7 +98,7 @@ TlsMode::Acme   → no HTTPS listener added
 TlsMode::Mixed  → add_tls(addr, first_file_cert_path, ...)        [static, ACME certs unreachable]
 ```
 
-### Target model
+### Implemented model
 
 ```
 Any TlsMode → build rustls ServerConfig with cert_resolver = Arc<CertManager>
@@ -101,14 +108,14 @@ Any TlsMode → build rustls ServerConfig with cert_resolver = Arc<CertManager>
 Concretely, in `main.rs`:
 
 ```rust
-// Pseudocode — implementation in bd-myo
+// Simplified shape of the implemented model
 if let Some(ref cm) = cert_manager {
-    let tls_settings = TlsSettings::with_resolver(cm.clone());
-    if let Err(e) = proxy_service.add_tls_with_settings(&https_addr, &tls_settings) {
-        error!(error = %e, "Failed to configure HTTPS listener");
-    } else {
-        info!(address = %https_addr, "HTTPS proxy listening (dynamic resolver)");
-    }
+    let tls_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+        .with_no_client_auth()
+        .with_cert_resolver(cm.clone());
+    let service = DynamicTlsService::new(https_addr, proxy, cm.clone(), server_conf)?;
+    server.add_service(service);
 }
 ```
 

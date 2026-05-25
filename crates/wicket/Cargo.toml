@@ -22,6 +22,8 @@ wicket-stream = { path = "../wicket-stream" }
 pingora = { workspace = true }
 pingora-core = { workspace = true }
 pingora-proxy = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+tokio-rustls = "0.26"
 
 # Cloudflare foundations for production telemetry
 foundations = { workspace = true }
@@ -29,6 +31,7 @@ foundations = { workspace = true }
 # Async runtime
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+async-trait = { workspace = true }
 
 # Logging / Telemetry
 tracing = { workspace = true }

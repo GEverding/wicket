@@ -8,7 +8,7 @@ use crate::metrics::{
     HTTP_REQUEST_DURATION_SECONDS, ROUTE_NOT_FOUND_TOTAL, UPSTREAM_CONNECTIONS_ACTIVE,
     UPSTREAM_DURATION_SECONDS, UPSTREAM_ERRORS_TOTAL,
 };
-use crate::routing::{RouteMatch, Router};
+use crate::routing::{rewrite_path_and_query, RouteMatch, Router};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -95,6 +95,7 @@ pub struct WicketCtx {
 }
 
 /// The main Wicket proxy service.
+#[derive(Clone)]
 pub struct WicketProxy {
     /// Router for matching requests to upstreams
     router: Arc<ArcSwap<Router>>,
@@ -477,6 +478,36 @@ impl ProxyHttp for WicketProxy {
     where
         Self::CTX: Send + Sync,
     {
+        if let Some(route_match) = &ctx.route_match {
+            if let Some(rewrite) = &route_match.url_rewrite {
+                let uri = &upstream_request.uri;
+                if let Some(path_and_query) = rewrite_path_and_query(
+                    uri.path(),
+                    uri.query(),
+                    &route_match.matched_path_prefix,
+                    rewrite,
+                ) {
+                    upstream_request
+                        .set_raw_path(path_and_query.as_bytes())
+                        .map_err(|error| {
+                            warn!(
+                                request_id = %ctx.request_id,
+                                error = %error,
+                                path_and_query = %path_and_query,
+                                "Failed to rewrite upstream request path"
+                            );
+                            Error::new(ErrorType::InternalError)
+                        })?;
+                    debug!(
+                        request_id = %ctx.request_id,
+                        route = ?route_match.route_name,
+                        path_and_query = %path_and_query,
+                        "Rewrote upstream request path"
+                    );
+                }
+            }
+        }
+
         // Inject X-Request-Id header to upstream
         upstream_request
             .insert_header(HEADER_REQUEST_ID, &ctx.request_id)

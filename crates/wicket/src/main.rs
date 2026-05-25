@@ -4,23 +4,41 @@
 //! observable by default, and fast enough to replace nginx/HAProxy.
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use clap::Parser;
 use foundations::telemetry::settings::{
     Level, LogFormat, LogVerbosity, LoggingSettings, TelemetrySettings,
 };
 use foundations::telemetry::{self};
 use foundations::{service_info, BootstrapResult};
+use pingora_core::apps::ServerApp;
 use pingora_core::prelude::*;
+use pingora_core::protocols::raw_connect::ProxyDigest;
+use pingora_core::protocols::{
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
+    TimingDigest, UniqueID, UniqueIDType, ALPN,
+};
 use pingora_core::server::configuration::ServerConf;
+use pingora_core::server::ShutdownWatch;
 use pingora_core::services::listening::Service as ListeningService;
-use pingora_proxy::http_proxy_service;
+use pingora_core::services::Service;
+use pingora_proxy::{http_proxy, http_proxy_service, HttpProxy};
 use std::ffi::OsStr;
+use std::fmt;
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use wicket_config::Config;
@@ -187,6 +205,232 @@ fn init_acme(
     Ok(())
 }
 
+static NEXT_TLS_STREAM_ID: AtomicI32 = AtomicI32::new(1);
+
+struct DynamicTlsService {
+    name: String,
+    addr: SocketAddr,
+    proxy: Arc<HttpProxy<WicketProxy>>,
+    acceptor: TlsAcceptor,
+}
+
+impl DynamicTlsService {
+    fn new(
+        addr: SocketAddr,
+        proxy: WicketProxy,
+        cert_manager: Arc<CertManager>,
+        server_conf: &Arc<ServerConf>,
+    ) -> Result<Self> {
+        let proxy = Arc::new(http_proxy(server_conf, proxy));
+        let acceptor = dynamic_tls_acceptor(cert_manager)?;
+
+        Ok(Self {
+            name: "Wicket HTTPS Proxy Service".to_string(),
+            addr,
+            proxy,
+            acceptor,
+        })
+    }
+}
+
+#[async_trait]
+impl Service for DynamicTlsService {
+    async fn start_service(
+        &mut self,
+        #[cfg(unix)] _fds: Option<pingora_core::server::ListenFds>,
+        mut shutdown: ShutdownWatch,
+        _listeners_per_fd: usize,
+    ) {
+        let listener = match TcpListener::bind(self.addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                error!(address = %self.addr, error = %error, "Failed to bind HTTPS listener");
+                return;
+            }
+        };
+
+        info!(address = %self.addr, "HTTPS proxy listening with dynamic SNI resolver");
+
+        loop {
+            tokio::select! {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        info!(address = %self.addr, "HTTPS proxy listener shutting down");
+                        break;
+                    }
+                }
+                accepted = listener.accept() => {
+                    let (stream, peer_addr) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            error!(address = %self.addr, error = %error, "Failed to accept HTTPS connection");
+                            continue;
+                        }
+                    };
+
+                    let proxy = Arc::clone(&self.proxy);
+                    let acceptor = self.acceptor.clone();
+                    let connection_shutdown = shutdown.clone();
+
+                    tokio::spawn(async move {
+                        let socket_digest = Arc::new(SocketDigest::from_raw_fd(stream.as_raw_fd()));
+                        let stream_id = NEXT_TLS_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+
+                        let tls_stream = match tokio::time::timeout(
+                            Duration::from_secs(60),
+                            acceptor.accept(stream),
+                        ).await {
+                            Ok(Ok(stream)) => stream,
+                            Ok(Err(error)) => {
+                                error!(peer = %peer_addr, error = %error, "HTTPS TLS handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                error!(peer = %peer_addr, "HTTPS TLS handshake timed out");
+                                return;
+                            }
+                        };
+
+                        let mut stream = Some(Box::new(DynamicTlsStream::new(
+                            tls_stream,
+                            stream_id,
+                            socket_digest,
+                        )) as pingora_core::protocols::Stream);
+
+                        while let Some(next_stream) = stream {
+                            stream = proxy.process_new(next_stream, &connection_shutdown).await;
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+fn dynamic_tls_acceptor(cert_manager: Arc<CertManager>) -> Result<TlsAcceptor> {
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let mut config = rustls::ServerConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .context("Failed to configure TLS protocol versions")?
+        .with_no_client_auth()
+        .with_cert_resolver(cert_manager);
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+struct DynamicTlsStream {
+    inner: TlsStream<TcpStream>,
+    id: UniqueIDType,
+    timing_digest: Vec<Option<TimingDigest>>,
+    socket_digest: Arc<SocketDigest>,
+}
+
+impl DynamicTlsStream {
+    fn new(
+        inner: TlsStream<TcpStream>,
+        id: UniqueIDType,
+        socket_digest: Arc<SocketDigest>,
+    ) -> Self {
+        Self {
+            inner,
+            id,
+            timing_digest: vec![Some(TimingDigest {
+                established_ts: SystemTime::now(),
+            })],
+            socket_digest,
+        }
+    }
+}
+
+impl fmt::Debug for DynamicTlsStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DynamicTlsStream")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AsyncRead for DynamicTlsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DynamicTlsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[async_trait]
+impl Shutdown for DynamicTlsStream {
+    async fn shutdown(&mut self) {
+        if let Err(error) = AsyncWriteExt::shutdown(&mut self.inner).await {
+            warn!(error = %error, "HTTPS TLS stream shutdown failed");
+        }
+    }
+}
+
+impl UniqueID for DynamicTlsStream {
+    fn id(&self) -> UniqueIDType {
+        self.id
+    }
+}
+
+impl Ssl for DynamicTlsStream {
+    fn selected_alpn_proto(&self) -> Option<ALPN> {
+        match self.inner.get_ref().1.alpn_protocol() {
+            Some(b"h2") => Some(ALPN::H2),
+            Some(b"http/1.1") => Some(ALPN::H1),
+            _ => None,
+        }
+    }
+}
+
+impl GetTimingDigest for DynamicTlsStream {
+    fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
+        self.timing_digest.clone()
+    }
+}
+
+impl GetProxyDigest for DynamicTlsStream {
+    fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
+        None
+    }
+}
+
+impl GetSocketDigest for DynamicTlsStream {
+    fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+        Some(Arc::clone(&self.socket_digest))
+    }
+}
+
+impl Peek for DynamicTlsStream {}
+
 /// Initialize and run the Wicket proxy server.
 ///
 /// Sets up TLS (file-watch, ACME, or mixed), creates the Pingora HTTP proxy service,
@@ -272,6 +516,10 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
             "TLS initialized"
         );
 
+        if manager.is_empty() {
+            anyhow::bail!("TLS configured but certificate store is empty");
+        }
+
         Some(manager)
     } else {
         None
@@ -334,6 +582,7 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
 
     // Obtain a reload handle before the proxy is consumed by Pingora.
     let http_reload_handle = wicket_proxy.reload_handle();
+    let https_proxy = wicket_proxy.clone();
 
     // Create HTTP proxy service
     let mut proxy_service = http_proxy_service(&server.configuration, wicket_proxy);
@@ -351,48 +600,24 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         info!("HTTP listener disabled (server.disable_http = true)");
     }
 
-    // Add HTTPS listener if TLS is configured
-    if let Some(ref tls_config) = config.tls {
-        // Prefer the explicit `server.https_listen` when provided; fall
-        // back to the legacy port-mapping derivation.  The explicit form
-        // is required for Gateway API managed runtimes where the HTTPS
-        // listener port is declared by the Gateway and may equal the HTTP
-        // `listen` port (in which case `disable_http` is also set).
-        let https_addr = match config.server.https_listen {
-            Some(addr) => addr.to_string(),
-            None => compute_https_addr(config.server.listen),
-        };
-
-        match select_tls_cert(tls_config, &config) {
-            Some((cert_path, key_path, source)) => {
-                let cert_str = cert_path.to_str().ok_or_else(|| {
-                    anyhow::anyhow!("TLS cert path is not valid UTF-8: {}", cert_path.display())
-                })?;
-                let key_str = key_path.to_str().ok_or_else(|| {
-                    anyhow::anyhow!("TLS key path is not valid UTF-8: {}", key_path.display())
-                })?;
-
-                proxy_service
-                    .add_tls(&https_addr, cert_str, key_str)
-                    .context("Failed to configure TLS listener")?;
-
-                info!(
-                    address = %https_addr,
-                    source = %source,
-                    cert = %cert_path.display(),
-                    "HTTPS proxy listening"
-                );
-            }
-            None => {
-                anyhow::bail!(
-                    "TLS configured but no cert material found (no file certs, no stored ACME certs)"
-                );
-            }
-        }
-    }
-
     // Add service to server
     server.add_service(proxy_service);
+
+    // Add HTTPS listener if TLS is configured. This service uses CertManager as
+    // the rustls resolver, so SNI is evaluated at handshake time.
+    if let Some(ref cert_manager) = cert_manager {
+        let https_addr = match config.server.https_listen {
+            Some(addr) => addr,
+            None => compute_https_addr(config.server.listen),
+        };
+        let https_service = DynamicTlsService::new(
+            https_addr,
+            https_proxy,
+            Arc::clone(cert_manager),
+            &server.configuration,
+        )?;
+        server.add_service(https_service);
+    }
 
     // Optionally start stream proxy
     let shutdown_token = CancellationToken::new();
@@ -712,138 +937,13 @@ fn systemd_notify_abstract(socket: &OsStr, payload: &[u8]) -> Result<()> {
 /// Compute the HTTPS listen address from the HTTP listen address.
 ///
 /// Port mapping: 80 → 443, anything else → port + 363 (e.g. 8080 → 8443).
-fn compute_https_addr(http_addr: SocketAddr) -> String {
+fn compute_https_addr(http_addr: SocketAddr) -> SocketAddr {
     let https_port = if http_addr.port() == 80 {
         443
     } else {
         http_addr.port().saturating_add(443 - 80)
     };
-    // SocketAddr::to_string() already formats IPv6 with brackets: [::1]:port
-    SocketAddr::new(http_addr.ip(), https_port).to_string()
-}
-
-/// Select the TLS cert/key source for the HTTPS listener.
-///
-/// Precedence:
-/// 1. First file cert from `tls.file.certs` (if present)
-/// 2. First available ACME stored cert for configured domains
-///
-/// Returns `(cert_path, key_path, source_label)` or `None` if nothing is available.
-fn select_tls_cert(
-    tls_config: &wicket_core::wicket_tls::TlsConfig,
-    config: &Config,
-) -> Option<(PathBuf, PathBuf, &'static str)> {
-    // 1. File cert takes priority
-    if let Some(ref file_config) = tls_config.file {
-        if let Some(first) = file_config.certs.first() {
-            return Some((first.cert.clone(), first.key.clone(), "file"));
-        }
-    }
-
-    // 2. ACME stored cert fallback
-    if let Some(ref acme_config) = tls_config.acme {
-        let auto_tls_domains = config.collect_auto_tls_domains_with_providers();
-        let all_certs = acme_config.all_certs_with_providers(&auto_tls_domains);
-
-        for cert_cfg in &all_certs {
-            if let Some(primary_domain) = cert_cfg.domains.first() {
-                match materialize_acme_cert(acme_config, primary_domain) {
-                    Ok(Some((cert_path, key_path))) => {
-                        return Some((cert_path, key_path, "acme_storage"));
-                    }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        warn!(
-                            domain = %primary_domain,
-                            error = %e,
-                            "Failed to materialize ACME cert for listener"
-                        );
-                        continue;
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Read a stored ACME cert/key and write runtime listener files.
-///
-/// Files are written to `<storage>/runtime-listener/{domain}.cert.pem` and `.key.pem`.
-/// Returns `(cert_path, key_path)` if a stored cert exists, `None` if not yet provisioned.
-fn materialize_acme_cert(
-    acme_config: &wicket_core::wicket_tls::AcmeConfig,
-    primary_domain: &str,
-) -> Result<Option<(PathBuf, PathBuf)>> {
-    use wicket_core::wicket_tls::acme::storage::AcmeStorage;
-
-    let storage = AcmeStorage::new(acme_config.storage.clone()).with_context(|| {
-        format!(
-            "Failed to open ACME storage at {}",
-            acme_config.storage.display()
-        )
-    })?;
-
-    let stored = match storage.load_cert(primary_domain)? {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-
-    // Write runtime listener files
-    let runtime_dir = acme_config.storage.join("runtime-listener");
-    std::fs::create_dir_all(&runtime_dir).with_context(|| {
-        format!(
-            "Failed to create runtime-listener dir: {}",
-            runtime_dir.display()
-        )
-    })?;
-
-    let safe_domain = primary_domain.replace(['/', '\\', '\0'], "_");
-    let cert_path = runtime_dir.join(format!("{}.cert.pem", safe_domain));
-    let key_path = runtime_dir.join(format!("{}.key.pem", safe_domain));
-
-    write_runtime_file(&cert_path, stored.cert_pem.as_bytes(), 0o644)?;
-    write_runtime_file(&key_path, stored.key_pem.as_bytes(), 0o600)?;
-
-    Ok(Some((cert_path, key_path)))
-}
-
-/// Write data to a file with the given Unix permissions (atomic via temp file).
-fn write_runtime_file(path: &Path, data: &[u8], mode: u32) -> Result<()> {
-    use std::io::Write;
-
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "tmp".to_string());
-    let tmp_path = parent.join(format!(".{}.tmp", file_name));
-
-    {
-        let mut f = std::fs::File::create(&tmp_path)
-            .with_context(|| format!("Failed to create temp file: {}", tmp_path.display()))?;
-
-        #[cfg(unix)]
-        f.set_permissions(std::fs::Permissions::from_mode(mode))
-            .with_context(|| format!("Failed to set permissions on {}", tmp_path.display()))?;
-
-        f.write_all(data)
-            .with_context(|| format!("Failed to write to {}", tmp_path.display()))?;
-    }
-
-    std::fs::rename(&tmp_path, path).with_context(|| {
-        format!(
-            "Failed to rename {} to {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
-
-    Ok(())
+    SocketAddr::new(http_addr.ip(), https_port)
 }
 
 /// Parse log level string to foundations LogVerbosity
@@ -868,32 +968,32 @@ mod tests {
     #[test]
     fn test_https_addr_port_80_maps_to_443() {
         let addr: SocketAddr = "0.0.0.0:80".parse().unwrap();
-        assert_eq!(compute_https_addr(addr), "0.0.0.0:443");
+        assert_eq!(compute_https_addr(addr), "0.0.0.0:443".parse().unwrap());
     }
 
     #[test]
     fn test_https_addr_port_8080_maps_to_8443() {
         let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-        assert_eq!(compute_https_addr(addr), "0.0.0.0:8443");
+        assert_eq!(compute_https_addr(addr), "0.0.0.0:8443".parse().unwrap());
     }
 
     #[test]
     fn test_https_addr_ipv6_port_80() {
         let addr: SocketAddr = "[::]:80".parse().unwrap();
-        assert_eq!(compute_https_addr(addr), "[::]:443");
+        assert_eq!(compute_https_addr(addr), "[::]:443".parse().unwrap());
     }
 
     #[test]
     fn test_https_addr_ipv6_port_8080() {
         let addr: SocketAddr = "[::1]:8080".parse().unwrap();
-        assert_eq!(compute_https_addr(addr), "[::1]:8443");
+        assert_eq!(compute_https_addr(addr), "[::1]:8443".parse().unwrap());
     }
 
     #[test]
     fn test_https_addr_non_standard_port() {
         // 3000 + 363 = 3363
         let addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-        assert_eq!(compute_https_addr(addr), "127.0.0.1:3363");
+        assert_eq!(compute_https_addr(addr), "127.0.0.1:3363".parse().unwrap());
     }
 
     // ── domain candidate extraction order ────────────────────────────────────

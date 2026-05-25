@@ -197,6 +197,62 @@ path_prefix = "/static"
     drop(proxy);
 }
 
+#[tokio::test]
+async fn test_proxy_url_rewrite_prefix() {
+    let backend = HttpMockBackend::start("asset").await;
+    let proxy_port = free_port();
+
+    let config = config_with_ports(
+        r#"
+[server]
+listen = "127.0.0.1:{{PROXY_PORT}}"
+
+[upstreams.s3cache]
+backends = ["127.0.0.1:{{BACKEND_PORT}}"]
+
+[[routes]]
+name = "updates"
+upstream = "s3cache"
+[routes.match]
+host = "updates.example.com"
+path_prefix = "/"
+[routes.filters.url_rewrite]
+path = { replace_prefix_match = "/b/updater-prod" }
+"#,
+        &[
+            ("{{PROXY_PORT}}", proxy_port),
+            ("{{BACKEND_PORT}}", backend.addr.port()),
+        ],
+    );
+
+    let proxy = TestProxy::start(&config);
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!(
+            "http://127.0.0.1:{}/packages/mac/app.zip?channel=stable",
+            proxy_port
+        ))
+        .header("Host", "updates.example.com")
+        .header("Range", "bytes=0-99")
+        .send()
+        .await
+        .expect("rewrite request");
+
+    assert_eq!(resp.status(), 200);
+    let req = backend.last_request().await.expect("should have request");
+    assert_eq!(
+        req.path,
+        "/b/updater-prod/packages/mac/app.zip?channel=stable"
+    );
+    assert!(req
+        .headers
+        .iter()
+        .any(|(name, value)| name == "range" && value == "bytes=0-99"));
+
+    drop(proxy);
+}
+
 // ── Header injection: X-Request-Id ──────────────────────────────────────────
 
 #[tokio::test]

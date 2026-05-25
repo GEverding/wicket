@@ -548,12 +548,8 @@ impl Config {
                 );
             }
 
-            // Reject unsupported route fields
-            if route.filters.is_some() {
-                anyhow::bail!(
-                    "Route '{}' uses 'filters' which is not yet supported",
-                    route.name.as_deref().unwrap_or("<unnamed>")
-                );
+            if let Some(filters) = &route.filters {
+                self.validate_route_filters(route, filters)?;
             }
             if route.timeout.is_some() {
                 anyhow::bail!(
@@ -594,6 +590,45 @@ impl Config {
         // Validate stream config if present
         if let Some(ref stream) = self.stream {
             self.validate_stream(stream)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_route_filters(&self, route: &RouteConfig, filters: &RouteFilters) -> Result<()> {
+        let route_name = route.name.as_deref().unwrap_or("<unnamed>");
+
+        if filters.request_headers.is_some()
+            || filters.response_headers.is_some()
+            || filters.redirect.is_some()
+            || filters.mirror.is_some()
+        {
+            anyhow::bail!(
+                "Route '{}' uses unsupported filters; only filters.url_rewrite.path is supported",
+                route_name
+            );
+        }
+
+        if let Some(url_rewrite) = &filters.url_rewrite {
+            if url_rewrite.hostname.is_some() {
+                anyhow::bail!(
+                    "Route '{}' uses unsupported URL rewrite hostname; only URL rewrite path is supported",
+                    route_name
+                );
+            }
+
+            if let Some(path) = &url_rewrite.path {
+                let replacement = match path {
+                    PathModifier::ReplaceFullPath(path)
+                    | PathModifier::ReplacePrefixMatch(path) => path,
+                };
+                if !replacement.starts_with('/') {
+                    anyhow::bail!(
+                        "Route '{}' URL rewrite path must start with '/'",
+                        route_name
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -2112,16 +2147,49 @@ name = "api"
 upstream = "backend"
 [routes.match]
 path_prefix = "/api"
-[routes.filters]
+[routes.filters.request_headers]
 "#;
 
         let result = Config::parse(config);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("filters") && msg.contains("not yet supported"),
+            msg.contains("unsupported filters"),
             "expected unsupported filters error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_route_url_rewrite_filter_supported() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+name = "updates"
+upstream = "backend"
+[routes.match]
+host = "updates.example.com"
+path_prefix = "/"
+[routes.filters.url_rewrite]
+path = { replace_prefix_match = "/b/updater-prod" }
+"#;
+
+        let config = Config::parse(config).expect("url rewrite path filter should parse");
+        let rewrite = config.routes[0]
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.url_rewrite.as_ref())
+            .and_then(|rewrite| rewrite.path.as_ref())
+            .expect("rewrite path should be present");
+
+        assert!(matches!(
+            rewrite,
+            PathModifier::ReplacePrefixMatch(path) if path == "/b/updater-prod"
+        ));
     }
 
     #[test]

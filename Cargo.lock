@@ -4771,6 +4771,7 @@ name = "wicket"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "foundations",
  "libc",
@@ -4778,11 +4779,13 @@ dependencies = [
  "pingora-core",
  "pingora-proxy",
  "reqwest",
+ "rustls",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
