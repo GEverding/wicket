@@ -110,6 +110,12 @@ pub struct SocketMap {
     skel: SockmapSkel<'static>,
 }
 
+impl std::fmt::Debug for SocketMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocketMap").finish_non_exhaustive()
+    }
+}
+
 // Safety: The BPF skeleton's internal pointers reference kernel-managed
 // objects that are safe to access from any thread. All call sites wrap
 // SocketMap in Arc<Mutex<>>.

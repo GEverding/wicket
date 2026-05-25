@@ -5,12 +5,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 DISTRO_FILE=""
 PACKAGE_PATH=""
+SMOKE_SCRIPT="$SCRIPT_DIR/smoke.sh"
 KEEP=0
 
 usage() {
   cat <<'USAGE'
 Usage:
-  qemu-run.sh --distro <path-to-env-file> --package <path-to-deb-or-rpm> [--keep]
+  qemu-run.sh --distro <path-to-env-file> --package <path-to-deb-or-rpm> [--smoke-script <path>] [--keep]
 USAGE
 }
 
@@ -22,6 +23,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --package)
       PACKAGE_PATH="${2:-}"
+      shift 2
+      ;;
+    --smoke-script)
+      SMOKE_SCRIPT="${2:-}"
       shift 2
       ;;
     --keep)
@@ -53,6 +58,11 @@ fi
 
 if [[ ! -f "$PACKAGE_PATH" ]]; then
   echo "Package not found: $PACKAGE_PATH" >&2
+  exit 2
+fi
+
+if [[ ! -f "$SMOKE_SCRIPT" ]]; then
+  echo "Smoke script not found: $SMOKE_SCRIPT" >&2
   exit 2
 fi
 
@@ -221,7 +231,8 @@ log "Waiting for cloud-init completion"
 ssh "${SSH_OPTS[@]}" tester@127.0.0.1 cloud-init status --wait
 
 log "Copying package and smoke script"
-scp "${SCP_OPTS[@]}" "$PACKAGE_PATH" "$SCRIPT_DIR/smoke.sh" tester@127.0.0.1:/home/tester/
+scp "${SCP_OPTS[@]}" "$PACKAGE_PATH" "$SMOKE_SCRIPT" tester@127.0.0.1:/home/tester/
+ssh "${SSH_OPTS[@]}" tester@127.0.0.1 mv "/home/tester/$(basename "$SMOKE_SCRIPT")" /home/tester/smoke.sh
 
 log "Running guest smoke test"
 if ! ssh "${SSH_OPTS[@]}" tester@127.0.0.1 bash /home/tester/smoke.sh "$(shell_quote "/home/tester/$PKG_BASENAME")" "$(shell_quote "$INSTALL_CMD")"; then

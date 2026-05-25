@@ -16,7 +16,6 @@ Build release packages with the compatibility wrapper, not directly on an arbitr
 
 ```bash
 packaging/nfpm/build-compatible.sh \
-  --version 0.1.0 \
   --arch amd64 \
   --target /tmp/opencode/wicket-pkgs
 ```
@@ -32,20 +31,57 @@ The default container build installs:
 - `libssl-dev`
 - `pkg-config`
 
+The package version is read from `[workspace.package].version` in `Cargo.toml`.
+
 Defaults can be overridden when needed:
 
 ```bash
 WICKET_COMPAT_CONTAINER_IMAGE=rust:1.85-bookworm \
 WICKET_COMPAT_RUST_TOOLCHAIN=nightly-2026-04-13 \
-packaging/nfpm/build-compatible.sh --version 0.1.0 --arch amd64 --target /tmp/opencode/wicket-pkgs
+packaging/nfpm/build-compatible.sh --arch amd64 --target /tmp/opencode/wicket-pkgs
 ```
+
+## Package Variants
+
+Two package variants are produced for Linux releases:
+
+- `wicket`: default userspace stream proxy
+- `wicket-ebpf`: eBPF sockmap-enabled stream proxy binary
+
+Both variants install `/usr/bin/wicket`, so install only one variant on a host.
+
+Build both variants:
+
+```bash
+packaging/nfpm/build-compatible.sh \
+  --arch amd64 \
+  --target /tmp/opencode/wicket-pkgs \
+  --variant all
+```
+
+Build one variant:
+
+```bash
+packaging/nfpm/build-compatible.sh --arch amd64 --target /tmp/opencode/wicket-pkgs --variant normal
+packaging/nfpm/build-compatible.sh --arch amd64 --target /tmp/opencode/wicket-pkgs --variant ebpf
+```
+
+## GitHub Release
+
+Create a GitHub release and upload all package variants with `gh`:
+
+```bash
+packaging/release.sh
+```
+
+The release script reads the version from `Cargo.toml`, builds normal and eBPF `.deb`/`.rpm` artifacts, creates tag `v<version>` on the current commit, and uploads every artifact. Use `--draft` to create a draft release.
 
 ## Host Build
 
 `packaging/nfpm/build.sh` remains useful for local development, but host-built artifacts inherit the host glibc requirement. Do not use it for release artifacts unless the host is intentionally the supported compatibility baseline.
 
 ```bash
-packaging/nfpm/build.sh --version 0.1.0 --arch amd64 --target /tmp/opencode/wicket-pkgs-local
+packaging/nfpm/build.sh --arch amd64 --target /tmp/opencode/wicket-pkgs-local
 ```
 
 ## Smoke Tests

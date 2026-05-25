@@ -2,9 +2,10 @@
 set -eu
 
 usage() {
-    printf '%s\n' "Usage: $0 --version VERSION --arch ARCH --target DIR [--formats deb,rpm] [--no-build]" >&2
+    printf '%s\n' "Usage: $0 --arch ARCH --target DIR [--version VERSION] [--formats deb,rpm] [--package-name NAME] [--features FEATURES] [--no-build]" >&2
     printf '%s\n' "" >&2
     printf '%s\n' "Builds target/release/wicket and packages .deb/.rpm artifacts with nFPM." >&2
+    printf '%s\n' "Version defaults to [workspace.package].version in Cargo.toml." >&2
     printf '%s\n' "Set WICKET_RELEASE_BIN to package a prebuilt binary with --no-build." >&2
     exit 2
 }
@@ -14,6 +15,8 @@ version=
 arch=
 target=
 build=1
+package_name=wicket
+features=
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -27,6 +30,14 @@ while [ $# -gt 0 ]; do
             ;;
         --target)
             target=${2:-}
+            shift 2
+            ;;
+        --package-name)
+            package_name=${2:-}
+            shift 2
+            ;;
+        --features)
+            features=${2:-}
             shift 2
             ;;
         --formats)
@@ -46,7 +57,6 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ -n "$version" ] || usage
 [ -n "$arch" ] || usage
 [ -n "$target" ] || usage
 
@@ -59,6 +69,27 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 config="$script_dir/wicket.nfpm.yaml"
 
+workspace_version() {
+    awk '
+        /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+        /^\[/ { in_workspace_package = 0 }
+        in_workspace_package && $1 == "version" {
+            gsub(/"/, "", $3)
+            print $3
+            exit
+        }
+    ' "$repo_root/Cargo.toml"
+}
+
+if [ -z "$version" ]; then
+    version=$(workspace_version)
+fi
+
+[ -n "$version" ] || {
+    printf '%s\n' "failed to read package version from Cargo.toml" >&2
+    exit 2
+}
+
 version=${version#v}
 release_bin=${WICKET_RELEASE_BIN:-$repo_root/target/release/wicket}
 
@@ -67,7 +98,11 @@ if [ "$build" -eq 1 ]; then
         printf '%s\n' "cargo not found in PATH" >&2
         exit 127
     }
-    cargo build --release -p wicket --locked
+    if [ -n "$features" ]; then
+        cargo build --release -p wicket --locked --features "$features"
+    else
+        cargo build --release -p wicket --locked
+    fi
 fi
 
 if [ ! -x "$release_bin" ]; then
@@ -81,7 +116,13 @@ old_ifs=$IFS
 IFS=,
 for format in $formats; do
     [ -n "$format" ] || continue
+    description="Wicket standalone reverse proxy and graceful HTTP upgrade service."
+    if [ "$package_name" = "wicket-ebpf" ]; then
+        description="Wicket standalone reverse proxy with eBPF sockmap stream acceleration."
+    fi
     WICKET_NFPM_VERSION=$version \
+    WICKET_NFPM_NAME="$package_name" \
+    WICKET_NFPM_DESCRIPTION="$description" \
     WICKET_NFPM_ARCH=$arch \
     WICKET_RELEASE_BIN="$release_bin" \
     WICKET_UPGRADE_HELPER="$repo_root/packaging/systemd/wicket-upgrade" \

@@ -1,4 +1,4 @@
-name: wicket
+name: ${WICKET_NFPM_NAME}
 arch: ${WICKET_NFPM_ARCH}
 platform: linux
 version: ${WICKET_NFPM_VERSION}
@@ -7,7 +7,7 @@ section: utils
 priority: optional
 maintainer: Wicket Maintainers <wicket@geverding.com>
 description: |
-  Wicket standalone reverse proxy and graceful HTTP upgrade service.
+  ${WICKET_NFPM_DESCRIPTION}
 
   Packaged for systemd-managed Debian and RPM installs.
 homepage: https://github.com/GEverding/wicket
