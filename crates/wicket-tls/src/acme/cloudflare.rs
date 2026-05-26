@@ -108,6 +108,20 @@ impl CloudflareClient {
         Err(CloudflareError::ZoneNotFound(domain.to_string()))
     }
 
+    /// List TXT records matching the given name.
+    pub async fn list_txt_records(
+        &self,
+        zone_id: &str,
+        name: &str,
+    ) -> Result<Vec<String>, CloudflareError> {
+        let url = format!(
+            "{}/zones/{}/dns_records?type=TXT&name={}",
+            CF_API_BASE, zone_id, name
+        );
+        let resp: DnsRecordListResponse = self.get(&url).await?;
+        Ok(resp.result.into_iter().map(|r| r.id).collect())
+    }
+
     /// Create a TXT record for ACME DNS-01 challenge.
     ///
     /// Returns the record ID for later deletion.
@@ -245,6 +259,11 @@ struct CreateRecordRequest {
 #[derive(Debug, Deserialize)]
 struct CreateRecordResponse {
     result: DnsRecord,
+}
+
+#[derive(Debug, Deserialize)]
+struct DnsRecordListResponse {
+    result: Vec<DnsRecord>,
 }
 
 #[derive(Debug, Deserialize)]

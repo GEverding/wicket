@@ -445,6 +445,21 @@ async fn create_dns_challenge_records(
             .ok_or_else(|| AcmeError::NoChallenge)?;
         let txt_value = challenge.key_authorization().dns_value();
 
+        // Delete any stale challenge records from previous failed attempts.
+        match dns_client.list_txt_records(zone_id, &txt_name).await {
+            Ok(stale_ids) => {
+                for id in stale_ids {
+                    debug!(record_id = %id, "deleting stale ACME challenge record");
+                    if let Err(e) = dns_client.delete_txt_record(zone_id, &id).await {
+                        warn!(record_id = %id, error = %e, "failed to delete stale ACME challenge record");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(txt_name = %txt_name, error = %e, "failed to list existing ACME challenge records");
+            }
+        }
+
         info!(domain = %domain_str, txt_name = %txt_name, "creating ACME DNS-01 challenge record");
 
         let record_id = dns_client
