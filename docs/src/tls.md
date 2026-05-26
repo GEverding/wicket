@@ -52,6 +52,19 @@ api_token = "${CF_API_TOKEN}"
 
 Certificates are automatically obtained and renewed.
 
+`staging = true` uses Let's Encrypt's staging environment and produces untrusted test certificates. Production certificates require `staging = false` or omitting the field.
+
+Use a separate storage directory while testing staging certificates, or clear ACME storage before switching to production:
+
+```bash
+sudo systemctl stop wicket
+sudo rm -rf /var/lib/wicket/acme/account.json
+sudo rm -rf /var/lib/wicket/acme/certs/*
+sudo systemctl start wicket
+```
+
+Stored certificates are loaded by domain before new issuance. An exact staging certificate, such as `cdn.example.com`, can shadow a later production wildcard certificate, such as `*.example.com`, because exact SNI matches take precedence over wildcard matches.
+
 The `[tls.acme.certs.dns]` block belongs only to that explicit certificate entry. Routes that use `tls = "auto"` require `[tls.acme.default_dns]` or a named provider with `tls = { auto = "provider-name" }`.
 
 ```toml
@@ -105,7 +118,7 @@ api_token = "${CF_API_TOKEN}"
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `email` | string | required | Contact email for Let's Encrypt |
-| `staging` | bool | `false` | Use LE staging (for testing) |
+| `staging` | bool | `false` | Use Let's Encrypt staging; produces untrusted test certs |
 | `storage` | path | `/var/lib/wicket/acme` | Where to store certs/account |
 | `renew_before_days` | int | `30` | Days before expiry to renew |
 | `certs` | array | required | Certificate configurations |

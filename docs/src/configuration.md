@@ -357,7 +357,7 @@ mode = "acme"
 
 [tls.acme]
 email = "admin@example.com"
-staging = true
+staging = false
 storage = "/var/lib/wicket/acme"
 renew_before_days = 30
 
@@ -369,6 +369,19 @@ provider = "cloudflare"
 api_token = "${CF_API_TOKEN}"
 zone_id = "optional-zone-id"
 ```
+
+`staging = true` uses Let's Encrypt's staging environment and produces untrusted test certificates. Production certificates require `staging = false` or omitting the field.
+
+Use a separate storage directory while testing staging certificates, or clear ACME storage before switching to production:
+
+```bash
+sudo systemctl stop wicket
+sudo rm -rf /var/lib/wicket/acme/account.json
+sudo rm -rf /var/lib/wicket/acme/certs/*
+sudo systemctl start wicket
+```
+
+Stored certificates are loaded by domain before new issuance. An exact staging certificate, such as `cdn.example.com`, can shadow a later production wildcard certificate, such as `*.example.com`, because exact SNI matches take precedence over wildcard matches.
 
 For route-derived certificates with `tls = "auto"`, configure `[tls.acme.default_dns]` instead of only `[tls.acme.certs.dns]`:
 
