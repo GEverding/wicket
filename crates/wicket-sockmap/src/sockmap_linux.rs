@@ -28,7 +28,7 @@ use skel::*;
 
 /// Must match the `struct sock_key` in sockmap.bpf.c exactly.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SockKey {
     local_ip: u32,
     remote_ip: u32,
@@ -36,6 +36,147 @@ struct SockKey {
     remote_port: u16,
     family: u8,
     pad: [u8; 3],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn swapped_peer_key(key: SockKey) -> SockKey {
+        SockKey {
+            local_ip: key.remote_ip,
+            remote_ip: key.local_ip,
+            local_port: key.remote_port,
+            remote_port: key.local_port,
+            family: key.family,
+            pad: [0; 3],
+        }
+    }
+
+    #[test]
+    fn swapped_tuple_does_not_identify_proxy_backend_socket() {
+        let client_to_proxy = SockKey {
+            local_ip: u32::from_be_bytes([127, 0, 0, 1]),
+            remote_ip: u32::from_be_bytes([127, 0, 0, 1]),
+            local_port: 443u16.to_be(),
+            remote_port: 50_000u16.to_be(),
+            family: libc::AF_INET as u8,
+            pad: [0; 3],
+        };
+        let proxy_to_backend = SockKey {
+            local_ip: u32::from_be_bytes([127, 0, 0, 1]),
+            remote_ip: u32::from_be_bytes([10, 0, 0, 20]),
+            local_port: 40_000u16.to_be(),
+            remote_port: 8443u16.to_be(),
+            family: libc::AF_INET as u8,
+            pad: [0; 3],
+        };
+
+        assert_ne!(swapped_peer_key(client_to_proxy), proxy_to_backend);
+    }
+
+    #[test]
+    #[ignore = "documents current sockhash value-size bug; enable when fixing eBPF"]
+    fn sockhash_fd_value_size_must_match_bpf_map_value_size() {
+        const BPF_SOCKHASH_VALUE_SIZE: usize = std::mem::size_of::<u64>();
+        let userspace_fd_value_size = std::mem::size_of::<RawFd>();
+
+        assert_eq!(
+            userspace_fd_value_size, BPF_SOCKHASH_VALUE_SIZE,
+            "userspace must write values matching the BPF sockhash map value size"
+        );
+    }
+
+    #[test]
+    #[ignore = "documents current IPv6 sockmap gap; enable when fixing eBPF"]
+    fn ipv6_socket_key_must_not_be_encoded_as_ipv4() {
+        let listener = TcpListener::bind("[::1]:0").expect("bind IPv6 listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let accepted = listener.accept().map(|(stream, _)| stream);
+            let _ = tx.send(accepted);
+        });
+
+        let client = TcpStream::connect(addr).expect("connect IPv6 client");
+        let _server = rx
+            .recv()
+            .expect("accept thread exited")
+            .expect("accept IPv6");
+
+        let key = sock_key_from_fd(client.as_raw_fd());
+        assert!(
+            match key {
+                Ok(key) => key.family == libc::AF_INET6 as u8,
+                Err(_) => true,
+            },
+            "IPv6 sockets must be encoded as AF_INET6 or explicitly rejected"
+        );
+    }
+
+    fn ebpf_tests_enabled() -> bool {
+        std::env::var("WICKET_EBPF_TEST").as_deref() == Ok("1")
+    }
+
+    fn connected_pair() -> std::io::Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let accepted = listener.accept().map(|(stream, _)| stream);
+            let _ = tx.send(accepted);
+        });
+
+        let client = TcpStream::connect(addr)?;
+        let server = rx.recv().expect("accept thread exited")?;
+        Ok((client, server))
+    }
+
+    #[test]
+    #[ignore = "requires Linux eBPF privileges; run with WICKET_EBPF_TEST=1"]
+    fn ebpf_load_attach_and_register_ipv4_proxy_pair() {
+        if !ebpf_tests_enabled() {
+            eprintln!("skipping eBPF smoke; set WICKET_EBPF_TEST=1 to enable");
+            return;
+        }
+
+        let (_client_peer, mut client_side) = connected_pair().expect("client pair");
+        let (backend_side, mut backend_peer) = connected_pair().expect("backend pair");
+        client_side
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set timeout");
+        backend_peer
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set timeout");
+
+        let mut sockmap = SocketMap::load(SocketMapConfig {
+            bpf_object_path: None,
+            max_connections: 16,
+            verbose: true,
+        })
+        .expect("load sockmap");
+        sockmap.attach().expect("attach sockmap");
+
+        sockmap
+            .register_pair(client_side.as_raw_fd(), backend_side.as_raw_fd())
+            .expect("register proxy socket pair");
+
+        backend_peer.write_all(b"probe").expect("write probe");
+        let mut buf = [0; 5];
+        let read = client_side.read(&mut buf).expect("read redirected bytes");
+        assert_eq!(&buf[..read], b"probe");
+
+        sockmap
+            .unregister_pair(client_side.as_raw_fd(), backend_side.as_raw_fd())
+            .expect("unregister proxy socket pair");
+    }
 }
 
 impl SockKey {

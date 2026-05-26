@@ -175,6 +175,124 @@ async fn start_proxy(
     Ok((proxy, handle))
 }
 
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+async fn start_proxy_with_sockmap(
+    config: &wicket_config::StreamConfig,
+) -> Result<
+    (Arc<wicket_stream::StreamProxy>, tokio::task::JoinHandle<()>),
+    Box<dyn std::error::Error>,
+> {
+    use wicket_sockmap::{SocketMap, SocketMapConfig};
+
+    let mut sockmap = SocketMap::load(SocketMapConfig {
+        bpf_object_path: None,
+        max_connections: 16,
+        verbose: true,
+    })?;
+    sockmap.attach()?;
+
+    let proxy = Arc::new(wicket_stream::StreamProxy::from_config(config)?.with_sockmap(sockmap));
+    let listen_addr: SocketAddr = config.listen.parse()?;
+    let listener_config = wicket_stream::ListenerConfig {
+        addr: listen_addr,
+        backlog: config.backlog,
+        reuseport: config.reuseport,
+    };
+    let listener = wicket_stream::create_listener(&listener_config)?;
+    let listener = wicket_stream::into_tokio_listener(listener)?;
+
+    let proxy_clone = Arc::clone(&proxy);
+    let shutdown = CancellationToken::new();
+    let handle = tokio::spawn(async move {
+        if let Err(e) = proxy_clone.run(listener, shutdown).await {
+            eprintln!("Proxy error: {}", e);
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok((proxy, handle))
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn ebpf_tests_enabled() -> bool {
+    std::env::var("WICKET_EBPF_TEST").as_deref() == Ok("1")
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+#[tokio::test]
+#[ignore = "requires Linux eBPF privileges; run with WICKET_EBPF_TEST=1"]
+async fn test_ebpf_stream_path_moves_bytes_and_keeps_connection_open() {
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF stream smoke; set WICKET_EBPF_TEST=1 to enable");
+        return;
+    }
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_addr = backend_listener.local_addr().expect("backend addr");
+    let backend_handle = tokio::spawn(async move {
+        let (mut socket, _) = backend_listener.accept().await.expect("accept backend");
+        let mut first = [0; 4];
+        socket.read_exact(&mut first).await.expect("read first");
+        assert_eq!(&first, b"ping");
+        socket.write_all(b"pong").await.expect("write first");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut second = [0; 4];
+        socket.read_exact(&mut second).await.expect("read second");
+        assert_eq!(&second, b"next");
+        socket.write_all(b"done").await.expect("write second");
+    });
+
+    let proxy_port = common::free_port().await;
+    let upstream_name = "default".to_string();
+    let config = wicket_config::StreamConfig {
+        listen: format!("127.0.0.1:{proxy_port}"),
+        backlog: 128,
+        reuseport: false,
+        proxy_protocol: wicket_config::ProxyProtocolConfig::None,
+        source_ips: Vec::new(),
+        default_upstream: Some(upstream_name.clone()),
+        sni_routes: std::collections::HashMap::new(),
+        upstreams: vec![wicket_config::StreamUpstreamConfig {
+            name: upstream_name,
+            servers: vec![backend_addr.to_string()],
+        }],
+        health_cooldown_secs: 30,
+        connect_timeout_ms: 5000,
+        max_connections: 100,
+        drain_timeout_secs: 5,
+    };
+
+    let before = wicket_stream::metrics::STREAM_PROXY_PATH_TOTAL
+        .with_label_values(&["ebpf"])
+        .get();
+    let (_proxy, proxy_handle) = start_proxy_with_sockmap(&config)
+        .await
+        .expect("start eBPF proxy");
+
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    let mut client = TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    client.write_all(b"ping").await.expect("write first");
+    let mut response = [0; 4];
+    client.read_exact(&mut response).await.expect("read first");
+    assert_eq!(&response, b"pong");
+
+    client.write_all(b"next").await.expect("write second");
+    client.read_exact(&mut response).await.expect("read second");
+    assert_eq!(&response, b"done");
+
+    let after = wicket_stream::metrics::STREAM_PROXY_PATH_TOTAL
+        .with_label_values(&["ebpf"])
+        .get();
+    assert!(after > before, "test must exercise the eBPF stream path");
+
+    proxy_handle.abort();
+    backend_handle.await.expect("backend task");
+}
+
 #[tokio::test]
 async fn test_sni_routing_exact_match() {
     // Start two mock backends

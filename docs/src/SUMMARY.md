@@ -18,6 +18,7 @@
 - [Feature Contract Matrix](./feature-contract-matrix.md)
 - [Security Audit](./security-audit.md)
 - [eBPF Integration Plan](./ebpf-integration-plan.md)
+- [eBPF Sockmap Testing](./ebpf-testing.md)
 
 ---
 
