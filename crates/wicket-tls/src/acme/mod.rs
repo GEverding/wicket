@@ -55,7 +55,7 @@ impl AcmeProviderBuilder {
 
     /// Build the AcmeProvider.
     pub fn build(self) -> Result<AcmeProvider, AcmeError> {
-        let storage = AcmeStorage::new(self.config.storage.clone())?;
+        let storage = AcmeStorage::new(self.config.storage.clone(), self.config.staging)?;
 
         Ok(AcmeProvider {
             config: self.config,

@@ -3,12 +3,17 @@
 //! Storage layout:
 //! ```text
 //! {base_path}/
-//!   account.json       # ACME account credentials
+//!   account.staging.json       # ACME account credentials (staging)
+//!   account.production.json    # ACME account credentials (production)
 //!   certs/
-//!     {domain}/
-//!       cert.pem       # Certificate chain
-//!       key.pem        # Private key  
-//!       meta.json      # Expiry, domains, etc.
+//!     staging/{domain}/
+//!       cert.pem               # Certificate chain
+//!       key.pem                # Private key
+//!       meta.json              # Expiry, domains, etc.
+//!     production/{domain}/
+//!       cert.pem
+//!       key.pem
+//!       meta.json
 //! ```
 
 use std::fs::{self, File};
@@ -56,21 +61,35 @@ struct CertMeta {
 /// ACME storage manager.
 pub struct AcmeStorage {
     base_path: PathBuf,
+    staging: bool,
 }
 
 impl AcmeStorage {
     /// Create a new storage manager.
     ///
     /// Creates the base directory if it doesn't exist.
-    pub fn new(base_path: PathBuf) -> Result<Self, StorageError> {
+    /// `staging` determines which environment's paths are used.
+    pub fn new(base_path: PathBuf, staging: bool) -> Result<Self, StorageError> {
         fs::create_dir_all(&base_path)?;
-        fs::create_dir_all(base_path.join("certs"))?;
-        Ok(Self { base_path })
+        fs::create_dir_all(base_path.join("certs").join("staging"))?;
+        fs::create_dir_all(base_path.join("certs").join("production"))?;
+        Ok(Self { base_path, staging })
+    }
+
+    /// Returns the environment name used for path keying.
+    fn env_name(&self) -> &str {
+        if self.staging {
+            "staging"
+        } else {
+            "production"
+        }
     }
 
     /// Load ACME account credentials.
     pub fn load_account(&self) -> Result<Option<String>, StorageError> {
-        let path = self.base_path.join("account.json");
+        let path = self
+            .base_path
+            .join(format!("account.{}.json", self.env_name()));
         if !path.exists() {
             return Ok(None);
         }
@@ -81,7 +100,9 @@ impl AcmeStorage {
 
     /// Save ACME account credentials.
     pub fn save_account(&self, credentials_json: &str) -> Result<(), StorageError> {
-        let path = self.base_path.join("account.json");
+        let path = self
+            .base_path
+            .join(format!("account.{}.json", self.env_name()));
         self.atomic_write(&path, credentials_json.as_bytes(), 0o600)?;
         Ok(())
     }
@@ -155,11 +176,14 @@ impl AcmeStorage {
         }
     }
 
-    /// Get the path for a domain's certificates.
+    /// Get the path for a domain's certificates, keyed by environment.
     fn cert_path(&self, domain: &str) -> PathBuf {
         // Sanitize domain name for filesystem
         let safe_domain = domain.replace(['/', '\\', '\0'], "_");
-        self.base_path.join("certs").join(safe_domain)
+        self.base_path
+            .join("certs")
+            .join(self.env_name())
+            .join(safe_domain)
     }
 
     /// Atomic write: write to temp file, then rename.
@@ -193,7 +217,7 @@ mod tests {
     #[test]
     fn test_save_and_load_account() {
         let temp = TempDir::new().unwrap();
-        let storage = AcmeStorage::new(temp.path().to_path_buf()).unwrap();
+        let storage = AcmeStorage::new(temp.path().to_path_buf(), false).unwrap();
 
         let creds = r#"{"key": "value"}"#;
         storage.save_account(creds).unwrap();
@@ -205,7 +229,7 @@ mod tests {
     #[test]
     fn test_load_missing_account() {
         let temp = TempDir::new().unwrap();
-        let storage = AcmeStorage::new(temp.path().to_path_buf()).unwrap();
+        let storage = AcmeStorage::new(temp.path().to_path_buf(), false).unwrap();
 
         let loaded = storage.load_account().unwrap();
         assert!(loaded.is_none());
@@ -214,7 +238,7 @@ mod tests {
     #[test]
     fn test_save_and_load_cert() {
         let temp = TempDir::new().unwrap();
-        let storage = AcmeStorage::new(temp.path().to_path_buf()).unwrap();
+        let storage = AcmeStorage::new(temp.path().to_path_buf(), false).unwrap();
 
         let cert = StoredCert {
             cert_pem: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_string(),
@@ -234,7 +258,7 @@ mod tests {
     #[test]
     fn test_needs_renewal_no_cert() {
         let temp = TempDir::new().unwrap();
-        let storage = AcmeStorage::new(temp.path().to_path_buf()).unwrap();
+        let storage = AcmeStorage::new(temp.path().to_path_buf(), false).unwrap();
 
         assert!(storage.needs_renewal("missing.com", 30).unwrap());
     }
@@ -242,7 +266,7 @@ mod tests {
     #[test]
     fn test_needs_renewal_fresh_cert() {
         let temp = TempDir::new().unwrap();
-        let storage = AcmeStorage::new(temp.path().to_path_buf()).unwrap();
+        let storage = AcmeStorage::new(temp.path().to_path_buf(), false).unwrap();
 
         let cert = StoredCert {
             cert_pem: "cert".to_string(),
@@ -259,7 +283,7 @@ mod tests {
     #[test]
     fn test_needs_renewal_expiring_cert() {
         let temp = TempDir::new().unwrap();
-        let storage = AcmeStorage::new(temp.path().to_path_buf()).unwrap();
+        let storage = AcmeStorage::new(temp.path().to_path_buf(), false).unwrap();
 
         let cert = StoredCert {
             cert_pem: "cert".to_string(),
@@ -276,7 +300,7 @@ mod tests {
     #[test]
     fn test_key_file_permissions() {
         let temp = TempDir::new().unwrap();
-        let storage = AcmeStorage::new(temp.path().to_path_buf()).unwrap();
+        let storage = AcmeStorage::new(temp.path().to_path_buf(), false).unwrap();
 
         let cert = StoredCert {
             cert_pem: "cert".to_string(),
@@ -286,8 +310,53 @@ mod tests {
         };
         storage.save_cert("test.com", &cert).unwrap();
 
-        let key_path = temp.path().join("certs/test.com/key.pem");
+        let key_path = temp.path().join("certs/production/test.com/key.pem");
         let perms = fs::metadata(&key_path).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn test_staging_and_production_accounts_are_isolated() {
+        let temp = TempDir::new().unwrap();
+        let staging = AcmeStorage::new(temp.path().to_path_buf(), true).unwrap();
+        let production = AcmeStorage::new(temp.path().to_path_buf(), false).unwrap();
+
+        staging.save_account(r#"{"env":"staging"}"#).unwrap();
+        production.save_account(r#"{"env":"production"}"#).unwrap();
+
+        // Each reads back its own value
+        assert_eq!(
+            staging.load_account().unwrap(),
+            Some(r#"{"env":"staging"}"#.to_string())
+        );
+        assert_eq!(
+            production.load_account().unwrap(),
+            Some(r#"{"env":"production"}"#.to_string())
+        );
+
+        // Files are distinct on disk
+        assert!(temp.path().join("account.staging.json").exists());
+        assert!(temp.path().join("account.production.json").exists());
+    }
+
+    #[test]
+    fn test_staging_cert_not_visible_to_production() {
+        let temp = TempDir::new().unwrap();
+        let staging = AcmeStorage::new(temp.path().to_path_buf(), true).unwrap();
+        let production = AcmeStorage::new(temp.path().to_path_buf(), false).unwrap();
+
+        let cert = StoredCert {
+            cert_pem: "cert".to_string(),
+            key_pem: "key".to_string(),
+            expiry: Utc::now() + chrono::Duration::days(90),
+            domains: vec!["example.com".to_string()],
+        };
+
+        staging.save_cert("example.com", &cert).unwrap();
+
+        // Staging can load it
+        assert!(staging.load_cert("example.com").unwrap().is_some());
+        // Production cannot see it
+        assert!(production.load_cert("example.com").unwrap().is_none());
     }
 }
