@@ -73,7 +73,7 @@ The default mode. Wicket acts as an HTTP reverse proxy, routing requests based o
 ./target/release/wicket -c wicket.toml
 ```
 
-Wicket listens on the address specified in `server.listen` (default `127.0.0.1:8080`) and forwards requests to configured upstreams.
+Wicket listens for HTTP on `server.listen` (default `127.0.0.1:8080`) and forwards requests to configured upstreams. When `[tls]` is configured, HTTPS is a separate listener. Use `server.https_listen = "0.0.0.0:443"` for HTTPS on port 443; `server.listen = "0.0.0.0:443"` means HTTP on port 443.
 
 #### L4 TCP/TLS Stream Proxy
 

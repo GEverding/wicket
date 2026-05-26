@@ -35,7 +35,10 @@ shutdown_timeout = 30
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `listen` | string | **required** | Address and port to listen on (e.g., `"0.0.0.0:8080"`) |
+| `listen` | string | **required** | Primary HTTP listen address (e.g., `"0.0.0.0:8080"`) |
+| `http_listens` | list of strings | `[]` | Additional HTTP listen addresses |
+| `https_listen` | string | derived | Explicit HTTPS listen address when `[tls]` is configured |
+| `disable_http` | boolean | `false` | Disable HTTP listeners; useful for HTTPS-only deployments |
 | `workers` | integer | CPU count | Number of worker threads |
 | `json_logs` | boolean | `true` | Enable structured JSON logging |
 | `log_level` | string | `"info"` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
@@ -43,7 +46,29 @@ shutdown_timeout = 30
 
 ### HTTPS Listener
 
-When TLS is configured, Wicket automatically adds an HTTPS listener. The HTTPS port is derived from the HTTP port:
+`server.listen` is always the HTTP listener. When TLS is configured, Wicket adds a separate HTTPS listener.
+
+If `server.https_listen` is set, HTTPS binds that address directly:
+
+```toml
+[server]
+listen = "0.0.0.0:80"
+https_listen = "0.0.0.0:443"
+```
+
+For HTTPS-only deployments on port 443, keep `listen` on an unused HTTP address and disable HTTP:
+
+```toml
+[server]
+listen = "0.0.0.0:80"
+https_listen = "0.0.0.0:443"
+disable_http = true
+```
+
+Do not set `listen = "0.0.0.0:443"` expecting HTTPS on 443. That binds HTTP on 443. TLS clients will fail with `InvalidHTTPHeader` because the HTTP parser receives TLS handshake bytes.
+
+If `https_listen` is omitted, the HTTPS port is derived from the HTTP port:
+
 - Port 80 maps to 443
 - Other ports: port + 363 (e.g., 8080 maps to 8443)
 
@@ -223,6 +248,12 @@ tls = { cert = "cert-name" }
 tls = "off"
 ```
 
+`tls = "auto"` derives an ACME certificate domain from the route's `match.host`. It requires `[tls.acme.default_dns]` so Wicket knows which DNS provider to use for route-derived certificates.
+
+Cert-specific DNS config under `[tls.acme.certs.dns]` only applies to that explicit `[[tls.acme.certs]]` entry. It is not used as the default provider for route `tls = "auto"`.
+
+If you already list the certificate domains explicitly in `[[tls.acme.certs]]`, you usually do not need `tls = "auto"` on the route. The loaded certificate is selected by SNI at handshake time.
+
 ### Multi-App Auto TLS Example
 
 ```toml
@@ -255,6 +286,35 @@ api_token = "${CF_API_TOKEN}"
 [tls.acme.dns_providers.other-account]
 provider = "cloudflare"
 api_token = "${CF_API_TOKEN_OTHER}"
+```
+
+### Explicit ACME Certificate Example
+
+Use this when you want one certificate to cover explicit domains, such as an apex plus wildcard. The route does not need `tls = "auto"` because the certificate is already declared.
+
+```toml
+[[routes]]
+name = "s3cache"
+upstream = "s3cache"
+
+[routes.match]
+host = "cdn-chi-1.example.com"
+path_prefix = "/"
+methods = ["GET"]
+
+[tls]
+mode = "acme"
+
+[tls.acme]
+email = "admin@example.com"
+staging = true
+
+[[tls.acme.certs]]
+domains = ["example.com", "*.example.com"]
+
+[tls.acme.certs.dns]
+provider = "cloudflare"
+api_token_file = "/run/secrets/cloudflare-token"
 ```
 
 ---
@@ -308,6 +368,14 @@ domains = ["example.com", "*.example.com"]
 provider = "cloudflare"
 api_token = "${CF_API_TOKEN}"
 zone_id = "optional-zone-id"
+```
+
+For route-derived certificates with `tls = "auto"`, configure `[tls.acme.default_dns]` instead of only `[tls.acme.certs.dns]`:
+
+```toml
+[tls.acme.default_dns]
+provider = "cloudflare"
+api_token_file = "/run/secrets/cloudflare-token"
 ```
 
 | Field | Type | Default | Description |

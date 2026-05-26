@@ -8,7 +8,7 @@ use std::time::Duration;
 use chrono::Utc;
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
-    NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    NewAccount, NewOrder, Order, OrderStatus, RetryPolicy,
 };
 use rand::Rng;
 use tokio::task::JoinHandle;
@@ -25,6 +25,8 @@ pub mod storage;
 
 pub use cloudflare::{CloudflareClient, CloudflareError};
 pub use storage::{AcmeStorage, StorageError, StoredCert};
+
+const DNS_PROPAGATION_WAIT: Duration = Duration::from_secs(30);
 
 /// ACME certificate provider.
 ///
@@ -282,49 +284,22 @@ impl AcmeProvider {
 
         info!(domains = ?cert_config.domains, "created ACME order");
 
-        // Process authorizations
         let mut record_ids: Vec<(String, String)> = Vec::new();
 
-        // Handle challenges
         let result = async {
-            let mut authorizations = order.authorizations();
+            create_dns_challenge_records(&mut order, &dns_client, &zone_id, &mut record_ids)
+                .await?;
 
-            while let Some(authz) = authorizations.next().await {
-                let mut authz = authz?;
-                if matches!(authz.status, AuthorizationStatus::Valid) {
-                    continue;
-                }
-
-                let domain_str = match authz.identifier().identifier {
-                    Identifier::Dns(d) => d.clone(),
-                    unsupported => {
-                        return Err(AcmeError::Config(format!(
-                            "unsupported ACME identifier: {unsupported:?}"
-                        )));
-                    }
-                };
-                let txt_name = format!("_acme-challenge.{}", domain_str);
-                let mut challenge = authz
-                    .challenge(ChallengeType::Dns01)
-                    .ok_or_else(|| AcmeError::NoChallenge)?;
-                let txt_value = challenge.key_authorization().dns_value();
-
-                info!(domain = %domain_str, txt_name = %txt_name, "creating ACME DNS-01 challenge record");
-
-                // Create DNS record
-                let record_id = dns_client
-                    .create_txt_record(&zone_id, &txt_name, &txt_value)
-                    .await?;
-                record_ids.push((txt_name.clone(), record_id));
-
-                // Wait for DNS propagation
-                info!(domain = %domain_str, "waiting for DNS challenge propagation");
-                tokio::time::sleep(Duration::from_secs(10)).await;
-
-                // Validate challenge
-                info!(domain = %domain_str, "notifying ACME server that DNS challenge is ready");
-                challenge.set_ready().await?;
+            if !record_ids.is_empty() {
+                info!(
+                    records = record_ids.len(),
+                    wait_secs = DNS_PROPAGATION_WAIT.as_secs(),
+                    "waiting for DNS challenge propagation"
+                );
+                tokio::time::sleep(DNS_PROPAGATION_WAIT).await;
             }
+
+            notify_dns_challenges_ready(&mut order).await?;
 
             Ok::<_, AcmeError>(())
         }
@@ -342,8 +317,11 @@ impl AcmeProvider {
         info!(domains = ?cert_config.domains, "waiting for ACME order to become ready");
         let status = order.poll_ready(&retry_policy).await?;
         if matches!(status, OrderStatus::Invalid) {
+            let details = summarize_authorizations(&mut order)
+                .await
+                .unwrap_or_else(|e| format!("failed to fetch authorization details: {e}"));
             cleanup_dns_records(&dns_client, &zone_id, &record_ids).await;
-            return Err(AcmeError::OrderFailed(format!("{status:?}")));
+            return Err(AcmeError::OrderFailed(format!("{status:?}: {details}")));
         }
         info!(domains = ?cert_config.domains, "ACME order is ready; finalizing CSR");
 
@@ -444,6 +422,100 @@ impl AcmeProvider {
         let key = load_certified_key(cert_file.path(), key_file.path())?;
         Ok(key)
     }
+}
+
+async fn create_dns_challenge_records(
+    order: &mut Order,
+    dns_client: &CloudflareClient,
+    zone_id: &str,
+    record_ids: &mut Vec<(String, String)>,
+) -> Result<(), AcmeError> {
+    let mut authorizations = order.authorizations();
+
+    while let Some(authz) = authorizations.next().await {
+        let mut authz = authz?;
+        if matches!(authz.status, AuthorizationStatus::Valid) {
+            continue;
+        }
+
+        let domain_str = dns_identifier(&authz.identifier())?;
+        let txt_name = format!("_acme-challenge.{domain_str}");
+        let challenge = authz
+            .challenge(ChallengeType::Dns01)
+            .ok_or_else(|| AcmeError::NoChallenge)?;
+        let txt_value = challenge.key_authorization().dns_value();
+
+        info!(domain = %domain_str, txt_name = %txt_name, "creating ACME DNS-01 challenge record");
+
+        let record_id = dns_client
+            .create_txt_record(zone_id, &txt_name, &txt_value)
+            .await?;
+        record_ids.push((txt_name, record_id));
+    }
+
+    Ok(())
+}
+
+async fn notify_dns_challenges_ready(order: &mut Order) -> Result<(), AcmeError> {
+    let mut authorizations = order.authorizations();
+
+    while let Some(authz) = authorizations.next().await {
+        let mut authz = authz?;
+        if matches!(authz.status, AuthorizationStatus::Valid) {
+            continue;
+        }
+
+        let domain_str = dns_identifier(&authz.identifier())?;
+        let mut challenge = authz
+            .challenge(ChallengeType::Dns01)
+            .ok_or_else(|| AcmeError::NoChallenge)?;
+
+        info!(domain = %domain_str, "notifying ACME server that DNS challenge is ready");
+        challenge.set_ready().await?;
+    }
+
+    Ok(())
+}
+
+fn dns_identifier(
+    identifier: &instant_acme::AuthorizedIdentifier<'_>,
+) -> Result<String, AcmeError> {
+    match identifier.identifier {
+        Identifier::Dns(d) => Ok(d.clone()),
+        unsupported => Err(AcmeError::Config(format!(
+            "unsupported ACME identifier: {unsupported:?}"
+        ))),
+    }
+}
+
+async fn summarize_authorizations(order: &mut Order) -> Result<String, AcmeError> {
+    let mut authorizations = order.authorizations();
+    let mut summaries = Vec::new();
+
+    while let Some(authz) = authorizations.next().await {
+        let mut authz = authz?;
+        let state = authz.refresh().await?;
+        let identifier = state.identifier().to_string();
+        let challenges = state
+            .challenges
+            .iter()
+            .map(|challenge| {
+                let error = challenge
+                    .error
+                    .as_ref()
+                    .map_or_else(String::new, |error| format!(", error={error}"));
+                format!("{:?}:{:?}{error}", challenge.r#type, challenge.status)
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+
+        summaries.push(format!(
+            "{identifier}: authz={:?}, challenges=[{challenges}]",
+            state.status
+        ));
+    }
+
+    Ok(summaries.join("; "))
 }
 
 /// Clean up DNS challenge records, logging any failures.

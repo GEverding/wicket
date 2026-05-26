@@ -11,6 +11,7 @@ use foundations::telemetry::settings::{
 };
 use foundations::telemetry::{self};
 use foundations::{service_info, BootstrapResult};
+use pingora::prelude::ResponseHeader;
 use pingora_core::apps::ServerApp;
 use pingora_core::prelude::*;
 use pingora_core::protocols::raw_connect::ProxyDigest;
@@ -49,7 +50,7 @@ use wicket_core::{
     metrics::{TLS_HANDSHAKES_TOTAL, TLS_HANDSHAKE_DURATION_SECONDS, TLS_HANDSHAKE_ERRORS_TOTAL},
     register_metrics as register_proxy_metrics,
     wicket_tls::{AcmeConfig, AcmeProvider, CertManager, FileWatcher, TlsMode},
-    WicketProxy,
+    TlsSni, WicketProxy,
 };
 use wicket_stream::{create_listener, into_tokio_listener, ListenerConfig, StreamProxy};
 
@@ -418,17 +419,18 @@ impl Service for DynamicTlsService {
                         let stream_id = NEXT_TLS_STREAM_ID.fetch_add(1, Ordering::Relaxed);
                         let handshake_start = Instant::now();
 
-                        let tls_stream = match tokio::time::timeout(
+                        let (tls_stream, tls_sni) = match tokio::time::timeout(
                             Duration::from_secs(60),
                             acceptor.accept(stream),
                         ).await {
                             Ok(Ok(stream)) => {
+                                let tls_sni = stream.get_ref().1.server_name().map(String::from);
                                 let elapsed = handshake_start.elapsed().as_secs_f64();
                                 TLS_HANDSHAKE_DURATION_SECONDS
                                     .with_label_values(&[&listener_label])
                                     .observe(elapsed);
                                 record_tls_handshake_success(&listener_label, &stream);
-                                stream
+                                (stream, tls_sni)
                             }
                             Ok(Err(error)) => {
                                 TLS_HANDSHAKE_ERRORS_TOTAL
@@ -450,6 +452,7 @@ impl Service for DynamicTlsService {
                             tls_stream,
                             stream_id,
                             socket_digest,
+                            tls_sni,
                         )) as pingora_core::protocols::Stream);
 
                         while let Some(next_stream) = stream {
@@ -499,6 +502,7 @@ struct DynamicTlsStream {
     id: UniqueIDType,
     timing_digest: Vec<Option<TimingDigest>>,
     socket_digest: Arc<SocketDigest>,
+    proxy_digest: Option<Arc<ProxyDigest>>,
 }
 
 impl DynamicTlsStream {
@@ -506,7 +510,17 @@ impl DynamicTlsStream {
         inner: TlsStream<TcpStream>,
         id: UniqueIDType,
         socket_digest: Arc<SocketDigest>,
+        tls_sni: Option<String>,
     ) -> Self {
+        let proxy_digest = tls_sni.and_then(|sni| {
+            ResponseHeader::build(200, None).ok().map(|response| {
+                Arc::new(ProxyDigest::new(
+                    Box::new(response),
+                    Some(Box::new(TlsSni(sni))),
+                ))
+            })
+        });
+
         Self {
             inner,
             id,
@@ -514,6 +528,7 @@ impl DynamicTlsStream {
                 established_ts: SystemTime::now(),
             })],
             socket_digest,
+            proxy_digest,
         }
     }
 }
@@ -590,7 +605,7 @@ impl GetTimingDigest for DynamicTlsStream {
 
 impl GetProxyDigest for DynamicTlsStream {
     fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
-        None
+        self.proxy_digest.clone()
     }
 }
 

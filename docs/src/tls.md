@@ -52,6 +52,16 @@ api_token = "${CF_API_TOKEN}"
 
 Certificates are automatically obtained and renewed.
 
+The `[tls.acme.certs.dns]` block belongs only to that explicit certificate entry. Routes that use `tls = "auto"` require `[tls.acme.default_dns]` or a named provider with `tls = { auto = "provider-name" }`.
+
+```toml
+[tls.acme.default_dns]
+provider = "cloudflare"
+api_token_file = "/run/secrets/cloudflare-token"
+```
+
+If you explicitly list the domains in `[[tls.acme.certs]]`, route `tls = "auto"` is usually unnecessary. Wicket selects the loaded certificate by SNI.
+
 ### Mixed Mode
 
 Use both file-based and ACME certificates:
@@ -99,6 +109,8 @@ api_token = "${CF_API_TOKEN}"
 | `storage` | path | `/var/lib/wicket/acme` | Where to store certs/account |
 | `renew_before_days` | int | `30` | Days before expiry to renew |
 | `certs` | array | required | Certificate configurations |
+| `default_dns` | object | - | DNS provider for route-derived `tls = "auto"` certificates |
+| `dns_providers` | map | - | Named DNS providers for `tls = { auto = "name" }` |
 
 ### ACME Certificate Configuration
 

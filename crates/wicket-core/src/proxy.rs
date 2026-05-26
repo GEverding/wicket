@@ -43,6 +43,10 @@ const HEADER_USER_AGENT: &str = "user-agent";
 const LISTENER_DEFAULT: &str = "default";
 const ERROR_NO_HEALTHY_BACKENDS: &str = "no_healthy_backends";
 
+/// TLS SNI captured at handshake time for HTTPS requests.
+#[derive(Debug, Clone)]
+pub struct TlsSni(pub String);
+
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 use std::os::unix::io::RawFd;
 
@@ -475,13 +479,25 @@ impl ProxyHttp for WicketProxy {
         }
 
         // Extract request properties
-        let host = req_header
-            .headers
-            .get(HEADER_HOST)
-            .and_then(|v| v.to_str().ok());
+        let host = request_host(req_header);
 
         let path = req_header.uri.path();
         let method = req_header.method.as_str();
+        let tls_sni = request_tls_sni(session);
+
+        if let (Some(sni), Some(host)) = (tls_sni, host) {
+            if !same_hostname(host, sni) {
+                warn!(
+                    request_id = %ctx.request_id,
+                    method = %method,
+                    path = %path,
+                    host = %host,
+                    sni = %sni,
+                    "Rejecting HTTPS request with mismatched SNI and Host"
+                );
+                return Err(Error::new(ErrorType::HTTPStatus(421)));
+            }
+        }
 
         // Store method for metrics
         ctx.method = method.to_string();
@@ -746,11 +762,7 @@ impl ProxyHttp for WicketProxy {
                     .unwrap_or_else(|| addr.to_string())
             })
             .unwrap_or_else(|| "-".to_string());
-        let host = req_header
-            .headers
-            .get(HEADER_HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-");
+        let host = request_host(req_header).unwrap_or("-");
         let referer = req_header
             .headers
             .get(HEADER_REFERER)
@@ -907,6 +919,41 @@ fn generate_request_id() -> String {
     format!("req_{:016x}", value)
 }
 
+fn request_host(req_header: &RequestHeader) -> Option<&str> {
+    req_header
+        .headers
+        .get(HEADER_HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            req_header
+                .uri
+                .authority()
+                .map(|authority| authority.as_str())
+        })
+}
+
+fn request_tls_sni(session: &Session) -> Option<&str> {
+    session
+        .as_downstream()
+        .digest()
+        .and_then(|digest| digest.proxy_digest.as_ref())
+        .and_then(|digest| digest.user_data.as_deref())
+        .and_then(|user_data| user_data.downcast_ref::<TlsSni>())
+        .map(|sni| sni.0.as_str())
+}
+
+fn same_hostname(host: &str, sni: &str) -> bool {
+    normalize_hostname(host) == normalize_hostname(sni)
+}
+
+fn normalize_hostname(host: &str) -> String {
+    let host = host.trim_end_matches('.').to_lowercase();
+    if let Some(stripped) = host.strip_prefix('[').and_then(|h| h.split_once(']')) {
+        return stripped.0.to_string();
+    }
+    host.split(':').next().unwrap_or(&host).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +964,26 @@ mod tests {
         let id2 = generate_request_id();
         assert!(!id1.is_empty());
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_same_hostname_allows_matching_sni_and_host() {
+        assert!(same_hostname(
+            "cdn-chi-1.cooldaddypop.com:443",
+            "cdn-chi-1.cooldaddypop.com"
+        ));
+        assert!(same_hostname(
+            "CDN-CHI-1.COOLDADDYPOP.COM.",
+            "cdn-chi-1.cooldaddypop.com"
+        ));
+    }
+
+    #[test]
+    fn test_same_hostname_rejects_domain_fronting() {
+        assert!(!same_hostname(
+            "other.cooldaddypop.com",
+            "cdn-chi-1.cooldaddypop.com"
+        ));
     }
 
     #[test]
