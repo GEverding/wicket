@@ -27,7 +27,7 @@ This matrix defines the current feature contract for Wicket and maps each capabi
 |---|---|---|---|
 | Request/response header modifiers | Unsupported | `wicket-config/lib.rs`, `wicket-core/proxy.rs` | Schema exists; execution pipeline missing |
 | Redirect filter | Unsupported | `wicket-config/lib.rs`, `wicket-core/proxy.rs` | Modeled only |
-| URL rewrite filter | Unsupported | `wicket-config/lib.rs`, `wicket-core/proxy.rs` | Modeled only |
+| URL rewrite path filter | GA | `wicket-config/lib.rs`, `wicket-core/proxy.rs`, `wicket-core/routing.rs` | Supports `filters.url_rewrite.path`; hostname rewrite unsupported |
 | Request mirroring | Unsupported | `wicket-config/lib.rs`, `wicket-core/proxy.rs` | Modeled only |
 | Per-route timeout | Unsupported | `wicket-config/lib.rs`, `wicket-core/proxy.rs` | Config field exists; runtime mapping missing |
 

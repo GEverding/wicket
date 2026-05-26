@@ -116,7 +116,7 @@ Wicket validates the full configuration at startup and rejects invalid configs w
 ./target/release/wicket --dump-config
 ```
 
-Unsupported features (filters, timeouts, path regex) are rejected at validation time rather than silently ignored. See the [Feature Contract Matrix](FEATURE_CONTRACT_MATRIX.md) for details.
+Unsupported features (unsupported filter types, timeouts, path regex) are rejected at validation time rather than silently ignored. See the [Feature Contract Matrix](FEATURE_CONTRACT_MATRIX.md) for details.
 
 ## Hot Reload
 

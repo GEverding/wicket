@@ -11,6 +11,7 @@ Wicket uses TOML for configuration. The default config file is `wicket.toml` in 
 - [Upstreams](#upstreams)
 - [Routes](#routes)
 - [Route Matching](#route-matching)
+- [Route URL Rewrite](#route-url-rewrite)
 - [Per-Route TLS](#per-route-tls)
 - [TLS](#tls)
 - [Stream (L4) Proxy](#stream-l4-proxy)
@@ -109,8 +110,9 @@ methods = ["GET", "POST"]
 | `upstream` | string | **required** | Name of the upstream to proxy to (must exist in `[upstreams]`) |
 | `match` | table | **required** | Match conditions (see below) |
 | `tls` | string/table | none | Per-route TLS config (see [Per-Route TLS](#per-route-tls)) |
+| `filters` | table | none | Route filters; currently supports `url_rewrite.path` |
 
-> **Note**: The `filters` and `timeout` fields are defined in the schema but not yet supported. Using them will cause a validation error.
+> **Note**: `timeout` and filter types other than `filters.url_rewrite.path` are defined in the schema but not yet supported. Using unsupported filter types will cause a validation error.
 
 ---
 
@@ -168,6 +170,36 @@ upstream = "web-backend"
 [routes.match]
 path_prefix = "/"
 ```
+
+---
+
+## Route URL Rewrite
+
+Routes can rewrite the upstream request path before proxying. This is useful for mapping a public route to a backend path prefix, such as a bucket or application base path.
+
+```toml
+[[routes]]
+name = "updates"
+upstream = "s3cache"
+
+[routes.match]
+host = "updates.example.com"
+path_prefix = "/"
+
+[routes.filters.url_rewrite]
+path = { replace_prefix_match = "/b/updater-prod" }
+```
+
+With that route:
+
+| Incoming path | Upstream path |
+|---------------|---------------|
+| `/latest.yml` | `/b/updater-prod/latest.yml` |
+| `/packages/mac/app.zip?channel=stable` | `/b/updater-prod/packages/mac/app.zip?channel=stable` |
+
+`replace_prefix_match` replaces the portion matched by `path_prefix` with the configured path. Query strings are preserved. Request headers, including range requests, are not modified by the rewrite.
+
+The replacement path must start with `/`. URL rewrite hostname changes are not supported yet.
 
 ---
 
@@ -424,6 +456,6 @@ Wicket validates the entire config at load time:
 - Each route must have at least one match rule
 - TLS cert/provider references must exist
 - Stream SNI routes must reference defined stream upstreams
-- Unsupported features (`filters`, `timeout`) are rejected
+- Unsupported filter types and `timeout` are rejected
 
 Run `wicket --validate` to check a config file without starting the server.
