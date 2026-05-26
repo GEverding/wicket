@@ -1,0 +1,160 @@
+{
+  "annotations": { "list": [] },
+  "description": "Wicket HTTP/L7 proxy fleet and per-server metrics for standalone or Kubernetes deployments",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Fleet Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum(rate(wicket_http_requests_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "all selected" },
+        { "expr": "sum by (route) (rate(wicket_http_requests_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "route {{ route }}" }
+      ]
+    },
+    {
+      "title": "Request Rate by Server",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum by (instance) (rate(wicket_http_requests_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "{{ instance }}" }
+      ]
+    },
+    {
+      "title": "Fleet Error Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum(rate(wicket_http_errors_total{job=~\"$job\",instance=~\"$instance\",error_type=\"server_error\"}[5m])) / sum(rate(wicket_http_requests_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "5xx" },
+        { "expr": "sum(rate(wicket_http_errors_total{job=~\"$job\",instance=~\"$instance\",error_type=\"client_error\"}[5m])) / sum(rate(wicket_http_requests_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "4xx" }
+      ]
+    },
+    {
+      "title": "Request Duration Fleet p50/p95/p99",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(wicket_http_request_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(wicket_http_request_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum(rate(wicket_http_request_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "title": "Request Duration p99 by Server",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum by (le, instance) (rate(wicket_http_request_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))", "legendFormat": "{{ instance }}" }
+      ]
+    },
+    {
+      "title": "Active Work",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "sum(wicket_http_requests_active{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "active requests" },
+        { "expr": "sum(wicket_client_connections_active{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "client conns" },
+        { "expr": "sum(wicket_upstream_connections_active{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "upstream conns" }
+      ]
+    },
+    {
+      "title": "Connections by Server",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum by (instance) (wicket_client_connections_active{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "client {{ instance }}" },
+        { "expr": "sum by (instance) (wicket_upstream_connections_active{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "upstream {{ instance }}" }
+      ]
+    },
+    {
+      "title": "Config Reloads",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 } } },
+      "targets": [
+        { "expr": "sum by (result) (rate(wicket_config_reloads_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "{{ result }}" },
+        { "expr": "sum by (instance, result) (rate(wicket_config_reloads_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "{{ instance }} {{ result }}" }
+      ]
+    },
+    {
+      "title": "Upstream Healthy Backends",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum by (upstream) (wicket_upstream_healthy_backends{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "fleet {{ upstream }}" },
+        { "expr": "sum by (instance, upstream) (wicket_upstream_healthy_backends{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "{{ instance }} {{ upstream }}" }
+      ]
+    },
+    {
+      "title": "Upstream Errors",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 } } },
+      "targets": [
+        { "expr": "sum by (upstream, error_type) (rate(wicket_upstream_errors_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "fleet {{ upstream }} {{ error_type }}" },
+        { "expr": "sum by (instance, upstream, error_type) (rate(wicket_upstream_errors_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "{{ instance }} {{ upstream }} {{ error_type }}" }
+      ]
+    },
+    {
+      "title": "Upstream Duration p99",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum by (le, upstream) (rate(wicket_upstream_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))", "legendFormat": "fleet {{ upstream }}" },
+        { "expr": "histogram_quantile(0.99, sum by (le, instance, upstream) (rate(wicket_upstream_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))", "legendFormat": "{{ instance }} {{ upstream }}" }
+      ]
+    },
+    {
+      "title": "Bandwidth",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum(rate(wicket_bytes_received_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "fleet received" },
+        { "expr": "sum(rate(wicket_bytes_sent_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "fleet sent" },
+        { "expr": "sum by (instance) (rate(wicket_bytes_received_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "rx {{ instance }}" },
+        { "expr": "sum by (instance) (rate(wicket_bytes_sent_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "tx {{ instance }}" }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["wicket", "proxy", "http", "fleet"],
+  "templating": {
+    "list": [
+      { "name": "datasource", "label": "Prometheus", "type": "datasource", "query": "prometheus", "current": { "text": "Prometheus", "value": "Prometheus" } },
+      { "name": "job", "label": "Prometheus job", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values(wicket_http_requests_total, job)", "refresh": 1, "includeAll": true, "allValue": ".*", "multi": true },
+      { "name": "instance", "label": "Server instance", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values(wicket_http_requests_total{job=~\"$job\"}, instance)", "refresh": 1, "includeAll": true, "allValue": ".*", "multi": true }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Wicket Proxy - Core Fleet",
+  "uid": "wicket-proxy-core",
+  "version": 1,
+  "weekStart": ""
+}

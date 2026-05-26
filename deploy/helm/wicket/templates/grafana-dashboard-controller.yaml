@@ -35,7 +35,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum by (resource_type) (rate(wicket_reconcile_total[5m]))",
+              "expr": "sum by (resource_type) (rate(wicket_reconcile_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
               "legendFormat": "{{`{{ resource_type }}`}}"
             }
           ]
@@ -61,7 +61,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum by (resource_type) (rate(wicket_reconcile_total{result=\"error\"}[5m])) / sum by (resource_type) (rate(wicket_reconcile_total[5m]))",
+              "expr": "sum by (resource_type) (rate(wicket_reconcile_total{job=~\"$job\",instance=~\"$instance\",result=\"error\"}[5m])) / sum by (resource_type) (rate(wicket_reconcile_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
               "legendFormat": "{{`{{ resource_type }}`}}"
             }
           ]
@@ -79,7 +79,7 @@ data:
           },
           "targets": [
             {
-              "expr": "histogram_quantile(0.99, sum by (le, resource_type) (rate(wicket_reconcile_duration_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le, resource_type) (rate(wicket_reconcile_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
               "legendFormat": "{{`{{ resource_type }}`}}"
             }
           ]
@@ -97,7 +97,7 @@ data:
             }
           },
           "targets": [
-            { "expr": "wicket_controller_is_leader", "legendFormat": "Status" }
+            { "expr": "max by (instance) (wicket_controller_is_leader{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "{{`{{ instance }}`}}" }
           ]
         },
         {
@@ -119,7 +119,7 @@ data:
             }
           },
           "targets": [
-            { "expr": "wicket_config_sync_lag_seconds", "legendFormat": "Lag" }
+            { "expr": "max by (instance) (wicket_config_sync_lag_seconds{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "{{`{{ instance }}`}}" }
           ]
         },
         {
@@ -128,7 +128,7 @@ data:
           "gridPos": { "h": 4, "w": 4, "x": 8, "y": 8 },
           "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
           "targets": [
-            { "expr": "wicket_controller_config_generation", "legendFormat": "Generation" }
+            { "expr": "max by (instance) (wicket_controller_config_generation{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "{{`{{ instance }}`}}" }
           ]
         },
         {
@@ -137,7 +137,7 @@ data:
           "gridPos": { "h": 4, "w": 4, "x": 12, "y": 8 },
           "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
           "targets": [
-            { "expr": "sum by (resource_type) (wicket_reconcile_queue_depth)", "legendFormat": "{{`{{ resource_type }}`}}" }
+            { "expr": "sum by (resource_type) (wicket_reconcile_queue_depth{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "{{`{{ resource_type }}`}}" }
           ]
         },
         {
@@ -149,7 +149,7 @@ data:
             "defaults": { "unit": "s" }
           },
           "targets": [
-            { "expr": "wicket_controller_uptime_seconds", "legendFormat": "Uptime" }
+            { "expr": "max by (instance) (wicket_controller_uptime_seconds{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "{{`{{ instance }}`}}" }
           ]
         },
         {
@@ -158,7 +158,7 @@ data:
           "gridPos": { "h": 4, "w": 4, "x": 20, "y": 8 },
           "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
           "targets": [
-            { "expr": "sum by (resource_type) (wicket_resources_pending_sync)", "legendFormat": "{{`{{ resource_type }}`}}" }
+            { "expr": "sum by (resource_type) (wicket_resources_pending_sync{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "{{`{{ resource_type }}`}}" }
           ]
         },
         {
@@ -172,12 +172,12 @@ data:
             }
           },
           "targets": [
-            { "expr": "wicket_gateway_classes", "legendFormat": "GatewayClasses" },
-            { "expr": "sum(wicket_gateways)", "legendFormat": "Gateways" },
-            { "expr": "sum(wicket_httproutes)", "legendFormat": "HTTPRoutes" },
-            { "expr": "sum(wicket_tcproutes)", "legendFormat": "TCPRoutes" },
-            { "expr": "sum(wicket_tlsroutes)", "legendFormat": "TLSRoutes" },
-            { "expr": "sum(wicket_reference_grants)", "legendFormat": "ReferenceGrants" }
+            { "expr": "sum(wicket_gateway_classes{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "GatewayClasses" },
+            { "expr": "sum(wicket_gateways{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "Gateways" },
+            { "expr": "sum(wicket_httproutes{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "HTTPRoutes" },
+            { "expr": "sum(wicket_tcproutes{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "TCPRoutes" },
+            { "expr": "sum(wicket_tlsroutes{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "TLSRoutes" },
+            { "expr": "sum(wicket_reference_grants{job=~\"$job\",instance=~\"$instance\"})", "legendFormat": "ReferenceGrants" }
           ]
         },
         {
@@ -192,11 +192,11 @@ data:
           },
           "targets": [
             {
-              "expr": "sum by (service) (wicket_backend_endpoints_healthy)",
+              "expr": "sum by (service) (wicket_backend_endpoints_healthy{job=~\"$job\",instance=~\"$instance\"})",
               "legendFormat": "{{`{{ service }}`}} healthy"
             },
             {
-              "expr": "sum by (service) (wicket_backend_endpoints_unhealthy)",
+              "expr": "sum by (service) (wicket_backend_endpoints_unhealthy{job=~\"$job\",instance=~\"$instance\"})",
               "legendFormat": "{{`{{ service }}`}} unhealthy"
             }
           ]
@@ -214,7 +214,7 @@ data:
           },
           "targets": [
             {
-              "expr": "histogram_quantile(0.99, sum by (le, operation) (rate(wicket_k8s_api_duration_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le, operation) (rate(wicket_k8s_api_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))",
               "legendFormat": "{{`{{ operation }}`}}"
             }
           ]
@@ -232,7 +232,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum by (operation, error_type) (rate(wicket_k8s_api_errors_total[5m]))",
+              "expr": "sum by (operation, error_type) (rate(wicket_k8s_api_errors_total{job=~\"$job\",instance=~\"$instance\"}[5m]))",
               "legendFormat": "{{`{{ operation }}`}} - {{`{{ error_type }}`}}"
             }
           ]
@@ -240,7 +240,10 @@ data:
       ],
       "schemaVersion": 39,
       "tags": ["wicket", "controller", "kubernetes"],
-      "templating": { "list": [] },
+      "templating": { "list": [
+        { "name": "job", "label": "Prometheus job", "type": "query", "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "query": "label_values(wicket_reconcile_total, job)", "refresh": 1, "includeAll": true, "allValue": ".*", "multi": true },
+        { "name": "instance", "label": "Controller instance", "type": "query", "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "query": "label_values(wicket_reconcile_total{job=~\"$job\"}, instance)", "refresh": 1, "includeAll": true, "allValue": ".*", "multi": true }
+      ] },
       "time": { "from": "now-1h", "to": "now" },
       "timepicker": {},
       "timezone": "browser",

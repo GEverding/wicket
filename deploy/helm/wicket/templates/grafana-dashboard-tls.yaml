@@ -22,111 +22,30 @@ data:
       "graphTooltip": 1,
       "links": [],
       "panels": [
-        {
-          "title": "Certificate Expiry by Domain",
-          "type": "table",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
-          "fieldConfig": {
-            "defaults": {
-              "unit": "d",
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  { "value": null, "color": "red" },
-                  { "value": 3, "color": "red" },
-                  { "value": 14, "color": "yellow" },
-                  { "value": 30, "color": "green" }
-                ]
-              }
-            }
-          },
-          "targets": [
-            { "expr": "(wicket_tls_certificate_expiry_timestamp_seconds - time()) / 86400", "legendFormat": "{{`{{ domain }}`}}", "format": "table", "instant": true }
-          ]
-        },
-        {
-          "title": "ACME Last Success Age",
-          "type": "table",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
-          "fieldConfig": { "defaults": { "unit": "d" } },
-          "targets": [
-            { "expr": "(time() - wicket_acme_last_renewal_success_timestamp_seconds) / 86400", "legendFormat": "{{`{{ domain }}`}}", "format": "table", "instant": true }
-          ]
-        },
-        {
-          "title": "TLS Handshake Rate",
-          "type": "timeseries",
-          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
-          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
-          "targets": [
-            { "expr": "sum by (tls_version, cipher) (rate(wicket_tls_handshakes_total[5m]))", "legendFormat": "{{`{{ tls_version }}`}} {{`{{ cipher }}`}}" }
-          ]
-        },
-        {
-          "title": "TLS Handshake Errors",
-          "type": "timeseries",
-          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
-          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 } } },
-          "targets": [
-            { "expr": "sum by (error_type) (rate(wicket_tls_handshake_errors_total[5m]))", "legendFormat": "{{`{{ error_type }}`}}" }
-          ]
-        },
-        {
-          "title": "TLS Handshake Duration",
-          "type": "timeseries",
-          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
-          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
-          "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
-          "targets": [
-            { "expr": "histogram_quantile(0.95, sum(rate(wicket_tls_handshake_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
-            { "expr": "histogram_quantile(0.99, sum(rate(wicket_tls_handshake_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
-          ]
-        },
-        {
-          "title": "Certificate Resolver Outcomes",
-          "type": "timeseries",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
-          "targets": [
-            { "expr": "sum by (outcome) (rate(wicket_tls_cert_resolution_total[5m]))", "legendFormat": "{{`{{ outcome }}`}}" }
-          ]
-        },
-        {
-          "title": "ACME Renewal Results",
-          "type": "timeseries",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 } } },
-          "targets": [
-            { "expr": "sum by (status) (rate(wicket_acme_renewal_total[1h]))", "legendFormat": "{{`{{ status }}`}}" }
-          ]
-        },
-        {
-          "title": "ACME Renewal Failures by Domain/Reason",
-          "type": "timeseries",
-          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
-          "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" },
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 } } },
-          "targets": [
-            { "expr": "sum by (domain, reason) (rate(wicket_acme_renewal_failures_total[1h]))", "legendFormat": "{{`{{ domain }}`}} {{`{{ reason }}`}}" }
-          ]
-        }
+        { "title": "Certificate Expiry by Domain/Server", "type": "table", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }, "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "fieldConfig": { "defaults": { "unit": "d" } }, "targets": [ { "expr": "min by (instance, domain) ((wicket_tls_certificate_expiry_timestamp_seconds{job=~\"$job\",instance=~\"$instance\"} - time()) / 86400)", "legendFormat": "{{`{{ instance }}`}} {{`{{ domain }}`}}", "format": "table", "instant": true } ] },
+        { "title": "Earliest Cert Expiry Fleet", "type": "stat", "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 }, "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "fieldConfig": { "defaults": { "unit": "d" } }, "targets": [ { "expr": "min((wicket_tls_certificate_expiry_timestamp_seconds{job=~\"$job\",instance=~\"$instance\"} - time()) / 86400)", "legendFormat": "days" } ] },
+        { "title": "ACME Last Success Age", "type": "table", "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 }, "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "fieldConfig": { "defaults": { "unit": "d" } }, "targets": [ { "expr": "max by (instance, domain) ((time() - wicket_acme_last_renewal_success_timestamp_seconds{job=~\"$job\",instance=~\"$instance\"}) / 86400)", "legendFormat": "{{`{{ instance }}`}} {{`{{ domain }}`}}", "format": "table", "instant": true } ] },
+        { "title": "TLS Handshake Rate Fleet", "type": "timeseries", "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 }, "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }, "targets": [ { "expr": "sum by (tls_version, cipher) (rate(wicket_tls_handshakes_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "{{`{{ tls_version }}`}} {{`{{ cipher }}`}}" } ] },
+        { "title": "TLS Handshake Rate by Server", "type": "timeseries", "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 }, "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }, "targets": [ { "expr": "sum by (instance) (rate(wicket_tls_handshakes_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "{{`{{ instance }}`}}" } ] },
+        { "title": "TLS Handshake Errors", "type": "timeseries", "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 }, "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 } } }, "targets": [ { "expr": "sum by (error_type) (rate(wicket_tls_handshake_errors_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "fleet {{`{{ error_type }}`}}" }, { "expr": "sum by (instance, error_type) (rate(wicket_tls_handshake_errors_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "{{`{{ instance }}`}} {{`{{ error_type }}`}}" } ] },
+        { "title": "TLS Handshake Duration", "type": "timeseries", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 }, "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }, "targets": [ { "expr": "histogram_quantile(0.95, sum(rate(wicket_tls_handshake_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "fleet p95" }, { "expr": "histogram_quantile(0.99, sum(rate(wicket_tls_handshake_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])) by (le))", "legendFormat": "fleet p99" }, { "expr": "histogram_quantile(0.99, sum by (le, instance) (rate(wicket_tls_handshake_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[5m])))", "legendFormat": "{{`{{ instance }}`}} p99" } ] },
+        { "title": "Certificate Resolver Outcomes", "type": "timeseries", "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 }, "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }, "targets": [ { "expr": "sum by (outcome) (rate(wicket_tls_cert_resolution_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "fleet {{`{{ outcome }}`}}" }, { "expr": "sum by (instance, outcome) (rate(wicket_tls_cert_resolution_total{job=~\"$job\",instance=~\"$instance\"}[5m]))", "legendFormat": "{{`{{ instance }}`}} {{`{{ outcome }}`}}" } ] },
+        { "title": "ACME Renewal Results", "type": "timeseries", "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 }, "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 } } }, "targets": [ { "expr": "sum by (status) (rate(wicket_acme_renewal_total{job=~\"$job\",instance=~\"$instance\"}[1h]))", "legendFormat": "fleet {{`{{ status }}`}}" }, { "expr": "sum by (instance, status) (rate(wicket_acme_renewal_total{job=~\"$job\",instance=~\"$instance\"}[1h]))", "legendFormat": "{{`{{ instance }}`}} {{`{{ status }}`}}" } ] },
+        { "title": "ACME Renewal Failures by Domain/Reason", "type": "timeseries", "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 }, "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 } } }, "targets": [ { "expr": "sum by (instance, domain, reason) (rate(wicket_acme_renewal_failures_total{job=~\"$job\",instance=~\"$instance\"}[1h]))", "legendFormat": "{{`{{ instance }}`}} {{`{{ domain }}`}} {{`{{ reason }}`}}" } ] }
       ],
       "refresh": "30s",
       "schemaVersion": 39,
       "style": "dark",
-      "tags": ["wicket", "tls", "acme"],
-      "templating": { "list": [] },
+      "tags": ["wicket", "tls", "acme", "fleet"],
+      "templating": { "list": [
+        { "name": "job", "label": "Prometheus job", "type": "query", "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "query": "label_values(wicket_tls_handshakes_total, job)", "refresh": 1, "includeAll": true, "allValue": ".*", "multi": true },
+        { "name": "instance", "label": "Server instance", "type": "query", "datasource": { "type": "prometheus", "uid": "{{ .Values.monitoring.grafanaDashboards.datasource }}" }, "query": "label_values(wicket_tls_handshakes_total{job=~\"$job\"}, instance)", "refresh": 1, "includeAll": true, "allValue": ".*", "multi": true }
+      ] },
       "time": { "from": "now-6h", "to": "now" },
       "timepicker": {},
       "timezone": "browser",
-      "title": "Wicket TLS",
-      "uid": "wicket-tls",
+      "title": "Wicket TLS - Fleet",
+      "uid": "wicket-tls-fleet",
       "version": 1,
       "weekStart": ""
     }
