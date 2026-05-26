@@ -8,6 +8,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::PathBuf;
 use tracing::warn;
 
@@ -146,7 +147,7 @@ pub struct AcmeCertConfig {
 }
 
 /// DNS provider configuration for ACME DNS-01 validation.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct DnsProviderConfig {
     /// Provider name: "cloudflare"
     pub provider: String,
@@ -162,6 +163,24 @@ pub struct DnsProviderConfig {
     /// Zone ID (optional, auto-detected if not specified)
     #[serde(default)]
     pub zone_id: Option<String>,
+}
+
+impl fmt::Debug for DnsProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DnsProviderConfig")
+            .field("provider", &self.provider)
+            .field(
+                "api_token",
+                &if self.api_token.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("api_token_file", &self.api_token_file)
+            .field("zone_id", &self.zone_id)
+            .finish()
+    }
 }
 
 impl DnsProviderConfig {
@@ -373,6 +392,20 @@ mod tests {
         let config: TlsConfig = toml::from_str(toml).unwrap();
         let dns = &config.acme.unwrap().certs[0].dns;
         assert_eq!(dns.zone_id, Some("zone123".to_string()));
+    }
+
+    #[test]
+    fn test_dns_provider_debug_redacts_api_token() {
+        let dns = DnsProviderConfig {
+            provider: "cloudflare".to_string(),
+            api_token: "secret-token".to_string(),
+            api_token_file: Some(PathBuf::from("/run/secrets/cloudflare-token")),
+            zone_id: Some("zone123".to_string()),
+        };
+
+        let debug = format!("{dns:?}");
+        assert!(!debug.contains("secret-token"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

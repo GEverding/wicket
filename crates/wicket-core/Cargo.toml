@@ -30,6 +30,7 @@ arc-swap = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }
 
 # Metrics
 prometheus = "0.13"

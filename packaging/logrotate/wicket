@@ -1,0 +1,8 @@
+/var/log/wicket/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

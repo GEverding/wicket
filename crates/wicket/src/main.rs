@@ -25,6 +25,7 @@ use pingora_core::services::Service;
 use pingora_proxy::{http_proxy, http_proxy_service, HttpProxy};
 use std::ffi::OsStr;
 use std::fmt;
+use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
@@ -34,15 +35,18 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use wicket_config::Config;
 use wicket_core::{
+    metrics::{TLS_HANDSHAKES_TOTAL, TLS_HANDSHAKE_DURATION_SECONDS, TLS_HANDSHAKE_ERRORS_TOTAL},
     register_metrics as register_proxy_metrics,
     wicket_tls::{AcmeConfig, AcmeProvider, CertManager, FileWatcher, TlsMode},
     WicketProxy,
@@ -104,6 +108,8 @@ fn main() {
 }
 
 fn bootstrap() -> BootstrapResult<()> {
+    install_rustls_crypto_provider()?;
+
     let args = Args::parse();
 
     // Handle --dump-schema (does not require a config file)
@@ -121,8 +127,15 @@ fn bootstrap() -> BootstrapResult<()> {
     let log_level = args
         .log_level
         .as_deref()
+        .or(config.logging.level.as_deref())
         .unwrap_or(&config.server.log_level);
-    let json_logs = args.json_logs || config.server.json_logs;
+    let json_logs = args.json_logs
+        || config
+            .logging
+            .format
+            .as_ref()
+            .map(|format| matches!(format, wicket_config::LogFormat::Json))
+            .unwrap_or(config.server.json_logs);
 
     // Set up telemetry with foundations
     let telemetry_settings = TelemetrySettings {
@@ -141,8 +154,19 @@ fn bootstrap() -> BootstrapResult<()> {
     // Create service info using the macro
     let service_info = service_info!();
 
+    // Initialize tracing before foundations so Wicket's tracing macros always have a subscriber.
+    let _log_guards =
+        init_logging(&config, log_level, json_logs).context("Failed to initialize logging")?;
+
     // Initialize telemetry
     telemetry::init(&service_info, &telemetry_settings)?;
+
+    info!(
+        config_path = %args.config.display(),
+        log_level = %log_level,
+        json_logs,
+        "Wicket logging initialized"
+    );
 
     // Handle --dump-config
     if args.dump_config {
@@ -158,6 +182,122 @@ fn bootstrap() -> BootstrapResult<()> {
     }
 
     run_server(config, &args)
+}
+
+fn init_logging(config: &Config, level: &str, json: bool) -> Result<Vec<WorkerGuard>> {
+    let mut guards = Vec::new();
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| default_tracing_filter(level));
+    let mut layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync + 'static>> =
+        Vec::new();
+
+    if json {
+        layers.push(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(std::io::stderr)
+                .with_filter(EnvFilter::new(filter.clone()))
+                .boxed(),
+        );
+    } else {
+        layers.push(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(EnvFilter::new(filter.clone()))
+                .boxed(),
+        );
+    }
+
+    if config.logging.files.enabled {
+        let directory = &config.logging.files.directory;
+        fs::create_dir_all(directory)?;
+
+        let error_appender =
+            tracing_appender::rolling::never(directory, &config.logging.files.error);
+        let (error_writer, error_guard) = tracing_appender::non_blocking(error_appender);
+        guards.push(error_guard);
+
+        if json {
+            layers.push(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(error_writer)
+                    .with_filter(EnvFilter::new(filter.clone()))
+                    .boxed(),
+            );
+        } else {
+            layers.push(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(error_writer)
+                    .with_filter(EnvFilter::new(filter.clone()))
+                    .boxed(),
+            );
+        }
+
+        let acme_appender = tracing_appender::rolling::never(directory, &config.logging.files.acme);
+        let (acme_writer, acme_guard) = tracing_appender::non_blocking(acme_appender);
+        guards.push(acme_guard);
+        let acme_filter = acme_tracing_filter(level);
+
+        if json {
+            layers.push(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(acme_writer)
+                    .with_filter(EnvFilter::new(acme_filter))
+                    .boxed(),
+            );
+        } else {
+            layers.push(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(acme_writer)
+                    .with_filter(EnvFilter::new(acme_filter))
+                    .boxed(),
+            );
+        }
+    }
+
+    tracing_subscriber::registry()
+        .with(layers)
+        .try_init()
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+    Ok(guards)
+}
+
+fn tracing_filter_level(level: &str) -> &'static str {
+    match level.to_lowercase().as_str() {
+        "trace" => "trace",
+        "debug" => "debug",
+        "info" => "info",
+        "warn" | "warning" => "warn",
+        "error" => "error",
+        _ => "info",
+    }
+}
+
+fn default_tracing_filter(level: &str) -> String {
+    let level = tracing_filter_level(level);
+    match level {
+        "trace" | "debug" => format!(
+            "info,wicket={level},wicket_tls={level},wicket_core={level},wicket_config={level},wicket_stream={level}"
+        ),
+        _ => level.to_string(),
+    }
+}
+
+fn acme_tracing_filter(level: &str) -> String {
+    let level = tracing_filter_level(level);
+    format!("wicket_tls::acme={level},wicket_tls::acme::cloudflare={level}")
+}
+
+fn install_rustls_crypto_provider() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install aws-lc-rs rustls crypto provider"))
 }
 
 /// Initialize ACME provider with auto-TLS domains and start renewal loop.
@@ -271,21 +411,36 @@ impl Service for DynamicTlsService {
                     let proxy = Arc::clone(&self.proxy);
                     let acceptor = self.acceptor.clone();
                     let connection_shutdown = shutdown.clone();
+                    let listener_label = self.addr.to_string();
 
                     tokio::spawn(async move {
                         let socket_digest = Arc::new(SocketDigest::from_raw_fd(stream.as_raw_fd()));
                         let stream_id = NEXT_TLS_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+                        let handshake_start = Instant::now();
 
                         let tls_stream = match tokio::time::timeout(
                             Duration::from_secs(60),
                             acceptor.accept(stream),
                         ).await {
-                            Ok(Ok(stream)) => stream,
+                            Ok(Ok(stream)) => {
+                                let elapsed = handshake_start.elapsed().as_secs_f64();
+                                TLS_HANDSHAKE_DURATION_SECONDS
+                                    .with_label_values(&[&listener_label])
+                                    .observe(elapsed);
+                                record_tls_handshake_success(&listener_label, &stream);
+                                stream
+                            }
                             Ok(Err(error)) => {
+                                TLS_HANDSHAKE_ERRORS_TOTAL
+                                    .with_label_values(&[&listener_label, "failure"])
+                                    .inc();
                                 error!(peer = %peer_addr, error = %error, "HTTPS TLS handshake failed");
                                 return;
                             }
                             Err(_) => {
+                                TLS_HANDSHAKE_ERRORS_TOTAL
+                                    .with_label_values(&[&listener_label, "timeout"])
+                                    .inc();
                                 error!(peer = %peer_addr, "HTTPS TLS handshake timed out");
                                 return;
                             }
@@ -321,6 +476,22 @@ fn dynamic_tls_acceptor(cert_manager: Arc<CertManager>) -> Result<TlsAcceptor> {
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn record_tls_handshake_success(listener: &str, stream: &TlsStream<TcpStream>) {
+    let (_, connection) = stream.get_ref();
+    let tls_version = connection
+        .protocol_version()
+        .map(|version| format!("{version:?}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let cipher = connection
+        .negotiated_cipher_suite()
+        .map(|suite| format!("{:?}", suite.suite()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    TLS_HANDSHAKES_TOTAL
+        .with_label_values(&[listener, &tls_version, &cipher])
+        .inc();
 }
 
 struct DynamicTlsStream {
@@ -565,6 +736,9 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     // Register stream proxy metrics (always safe to call; no-op if stream not configured)
     wicket_stream::metrics::register_stream_metrics();
 
+    // Register TLS/ACME metrics with the Prometheus default registry.
+    wicket_core::wicket_tls::metrics::register_metrics();
+
     // Add Pingora's built-in Prometheus metrics server
     let mut prometheus_service = ListeningService::prometheus_http_service();
     prometheus_service.add_tcp(&args.metrics_addr);
@@ -768,6 +942,7 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     };
 
     systemd_notify_ready(startup_status)?;
+    info!(status = startup_status, "Wicket service ready");
 
     // Run the server (blocks until shutdown)
     server.run_forever();

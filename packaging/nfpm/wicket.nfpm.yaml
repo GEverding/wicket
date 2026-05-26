@@ -96,6 +96,19 @@ contents:
       mode: 0750
       owner: wicket
       group: wicket
+  - dst: /var/log/wicket
+    type: dir
+    file_info:
+      mode: 0750
+      owner: wicket
+      group: wicket
+  - src: packaging/logrotate/wicket
+    dst: /etc/logrotate.d/wicket
+    type: config|noreplace
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
 scripts:
   preinstall: packaging/nfpm/deb/preinstall.sh
   postinstall: packaging/nfpm/deb/postinstall.sh

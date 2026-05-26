@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use wicket_tls::TlsConfig;
 
@@ -33,6 +33,10 @@ pub struct Config {
     /// Stream (L4) proxy configuration (optional)
     #[serde(default)]
     pub stream: Option<StreamConfig>,
+
+    /// Logging configuration
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 impl Default for Config {
@@ -52,8 +56,108 @@ impl Default for Config {
             routes: Vec::new(),
             tls: None,
             stream: None,
+            logging: LoggingConfig::default(),
         }
     }
+}
+
+/// Logging configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct LoggingConfig {
+    /// Log level (trace, debug, info, warn, error). Defaults to `server.log_level` if empty.
+    #[serde(default)]
+    pub level: Option<String>,
+
+    /// Log format for application logs.
+    #[serde(default)]
+    pub format: Option<LogFormat>,
+
+    /// File logging configuration.
+    #[serde(default)]
+    pub files: LogFilesConfig,
+
+    /// Access log configuration.
+    #[serde(default)]
+    pub access: AccessLogConfig,
+}
+
+/// Application log format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable text logs.
+    #[default]
+    Text,
+    /// Structured JSON logs.
+    Json,
+}
+
+/// File logging configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LogFilesConfig {
+    /// Enable file logging.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Directory for log files.
+    #[serde(default = "default_log_directory")]
+    pub directory: PathBuf,
+
+    /// General application/error log file name.
+    #[serde(default = "default_error_log_file")]
+    pub error: String,
+
+    /// Access log file name.
+    #[serde(default = "default_access_log_file")]
+    pub access: String,
+
+    /// ACME log file name.
+    #[serde(default = "default_acme_log_file")]
+    pub acme: String,
+}
+
+impl Default for LogFilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: default_log_directory(),
+            error: default_error_log_file(),
+            access: default_access_log_file(),
+            acme: default_acme_log_file(),
+        }
+    }
+}
+
+/// Access log configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AccessLogConfig {
+    /// Enable access logging.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Access log format.
+    #[serde(default)]
+    pub format: AccessLogFormat,
+}
+
+impl Default for AccessLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            format: AccessLogFormat::Combined,
+        }
+    }
+}
+
+/// Access log format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessLogFormat {
+    /// Apache/Nginx combined-style text log.
+    #[default]
+    Combined,
+    /// JSON access log.
+    Json,
 }
 
 /// Server-level configuration.
@@ -481,6 +585,22 @@ fn default_shutdown_timeout() -> u64 {
     30
 }
 
+fn default_log_directory() -> PathBuf {
+    PathBuf::from("/var/log/wicket")
+}
+
+fn default_error_log_file() -> String {
+    "error.log".to_string()
+}
+
+fn default_access_log_file() -> String {
+    "access.log".to_string()
+}
+
+fn default_acme_log_file() -> String {
+    "acme.log".to_string()
+}
+
 fn default_lb_strategy() -> LoadBalanceStrategy {
     LoadBalanceStrategy::RoundRobin
 }
@@ -538,6 +658,22 @@ impl Config {
 
     /// Validate the configuration for consistency.
     pub fn validate(&self) -> Result<()> {
+        if self.logging.access.enabled && !self.logging.files.enabled {
+            anyhow::bail!("logging.access.enabled requires logging.files.enabled");
+        }
+
+        if self.logging.files.enabled {
+            if self.logging.files.error.is_empty() {
+                anyhow::bail!("logging.files.error must not be empty");
+            }
+            if self.logging.files.access.is_empty() {
+                anyhow::bail!("logging.files.access must not be empty");
+            }
+            if self.logging.files.acme.is_empty() {
+                anyhow::bail!("logging.files.acme must not be empty");
+            }
+        }
+
         // Check that all routes reference defined upstreams
         for route in &self.routes {
             if !self.upstreams.contains_key(&route.upstream) {
@@ -898,6 +1034,73 @@ path_prefix = "/"
                 .collect::<Vec<_>>(),
             vec![8080, 8081, 8082]
         );
+    }
+
+    #[test]
+    fn test_parse_logging_config() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[logging]
+level = "debug"
+format = "text"
+
+[logging.files]
+enabled = true
+directory = "/var/log/wicket"
+error = "error.log"
+access = "access.log"
+acme = "acme.log"
+
+[logging.access]
+enabled = true
+format = "combined"
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        assert_eq!(config.logging.level.as_deref(), Some("debug"));
+        assert_eq!(config.logging.format, Some(LogFormat::Text));
+        assert!(config.logging.files.enabled);
+        assert_eq!(
+            config.logging.files.directory,
+            PathBuf::from("/var/log/wicket")
+        );
+        assert_eq!(config.logging.files.access, "access.log");
+        assert!(config.logging.access.enabled);
+        assert_eq!(config.logging.access.format, AccessLogFormat::Combined);
+    }
+
+    #[test]
+    fn test_access_logging_requires_file_logging() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[logging.access]
+enabled = true
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let err = Config::parse(config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("logging.access.enabled requires logging.files.enabled"));
     }
 
     #[test]

@@ -7,14 +7,16 @@ use std::time::Duration;
 
 use chrono::Utc;
 use instant_acme::{
-    Account, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    OrderStatus,
+    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
+    NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
+use rand::Rng;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{AcmeCertConfig, AcmeConfig, AutoTlsDomain};
-use crate::metrics::{tls_metrics, AcmeRenewalStatus};
+use crate::metrics;
+use crate::metrics::AcmeRenewalStatus;
 use crate::pem::load_certified_key;
 use crate::{CertManager, CertStore};
 
@@ -96,6 +98,11 @@ impl AcmeProvider {
             return Ok(());
         }
 
+        info!(
+            certificate_groups = all_certs.len(),
+            "initializing configured ACME certificate groups"
+        );
+
         for cert_config in &all_certs {
             let primary_domain = cert_config
                 .domains
@@ -103,10 +110,11 @@ impl AcmeProvider {
                 .ok_or_else(|| AcmeError::Config("cert config has no domains".into()))?;
 
             // Check if we have a valid cert
-            if !self
+            info!(domain = %primary_domain, "checking stored ACME certificate");
+            let needs_renewal = self
                 .storage
-                .needs_renewal(primary_domain, self.config.renew_before_days)?
-            {
+                .needs_renewal(primary_domain, self.config.renew_before_days)?;
+            if !needs_renewal {
                 // Load existing cert
                 if let Some(stored) = self.storage.load_cert(primary_domain)? {
                     info!(
@@ -126,6 +134,9 @@ impl AcmeProvider {
 
             match self.obtain_cert(cert_config).await {
                 Ok(stored) => {
+                    info!(domain = %primary_domain, expiry = %stored.expiry, "obtained ACME certificate");
+                    emit_acme_cert_metrics(&stored);
+                    metrics::set_acme_last_success(primary_domain, Utc::now().timestamp());
                     let key = self.load_stored_cert(&stored)?;
                     store.insert(&cert_config.domains, key);
                 }
@@ -133,9 +144,12 @@ impl AcmeProvider {
                     error!(domain = %primary_domain, error = %e, "failed to obtain certificate");
                     // Try to use existing cert if available
                     if let Ok(Some(stored)) = self.storage.load_cert(primary_domain) {
-                        warn!(domain = %primary_domain, "using expired certificate as fallback");
+                        warn!(domain = %primary_domain, expiry = %stored.expiry, "using stored certificate as fallback");
+                        emit_acme_cert_metrics(&stored);
                         let key = self.load_stored_cert(&stored)?;
                         store.insert(&cert_config.domains, key);
+                    } else {
+                        return Err(e);
                     }
                 }
             }
@@ -159,13 +173,14 @@ impl AcmeProvider {
             let check_interval = Duration::from_secs(24 * 60 * 60); // Daily
 
             loop {
-                tokio::time::sleep(check_interval).await;
-
                 info!("checking certificates for renewal");
 
                 if let Err(e) = self.check_and_renew().await {
                     error!(error = %e, "renewal check failed");
                 }
+
+                let jitter = rand::thread_rng().gen_range(0..3600);
+                tokio::time::sleep(check_interval + Duration::from_secs(jitter)).await;
             }
         })
     }
@@ -186,20 +201,25 @@ impl AcmeProvider {
                 .storage
                 .needs_renewal(primary_domain, self.config.renew_before_days)?
             {
+                metrics::set_acme_last_attempt(primary_domain, Utc::now().timestamp());
                 info!(domain = %primary_domain, "certificate needs renewal");
 
                 match self.obtain_cert(cert_config).await {
                     Ok(stored) => {
+                        emit_acme_cert_metrics(&stored);
+                        metrics::set_acme_last_success(primary_domain, Utc::now().timestamp());
                         let key = self.load_stored_cert(&stored)?;
                         store.insert(&cert_config.domains, key);
-                        tls_metrics::wicket_acme_renewal_total(AcmeRenewalStatus::Success).inc();
+                        metrics::inc_acme_renewal(AcmeRenewalStatus::Success);
                         any_renewed = true;
                     }
                     Err(e) => {
-                        tls_metrics::wicket_acme_renewal_total(AcmeRenewalStatus::Failure).inc();
+                        metrics::inc_acme_renewal(AcmeRenewalStatus::Failure);
+                        metrics::inc_acme_renewal_failure(primary_domain, acme_failure_reason(&e));
                         error!(domain = %primary_domain, error = %e, "renewal failed");
                         // Keep using existing cert
                         if let Ok(Some(stored)) = self.storage.load_cert(primary_domain) {
+                            emit_acme_cert_metrics(&stored);
                             let key = self.load_stored_cert(&stored)?;
                             store.insert(&cert_config.domains, key);
                         }
@@ -208,7 +228,8 @@ impl AcmeProvider {
             } else {
                 // Load existing cert
                 if let Some(stored) = self.storage.load_cert(primary_domain)? {
-                    tls_metrics::wicket_acme_renewal_total(AcmeRenewalStatus::Skipped).inc();
+                    emit_acme_cert_metrics(&stored);
+                    metrics::inc_acme_renewal(AcmeRenewalStatus::Skipped);
                     let key = self.load_stored_cert(&stored)?;
                     store.insert(&cert_config.domains, key);
                 }
@@ -230,7 +251,9 @@ impl AcmeProvider {
             .ok_or_else(|| AcmeError::Config("no domains specified".into()))?;
 
         // Get or create ACME account
+        info!(domain = %primary_domain, "preparing ACME account");
         let account = self.get_or_create_account().await?;
+        info!(domain = %primary_domain, "ACME account ready");
 
         // Create DNS client for challenges using resolved token (supports file-based secrets)
         let api_token = cert_config
@@ -240,10 +263,12 @@ impl AcmeProvider {
         let dns_client = CloudflareClient::new(api_token)?;
 
         // Get zone ID
+        info!(domain = %primary_domain, "resolving Cloudflare zone for ACME DNS-01");
         let zone_id = match &cert_config.dns.zone_id {
             Some(id) => id.clone(),
             None => dns_client.get_zone_id(primary_domain).await?,
         };
+        info!(domain = %primary_domain, zone_id = %zone_id, "Cloudflare zone resolved for ACME DNS-01");
 
         // Create order
         let identifiers: Vec<_> = cert_config
@@ -252,39 +277,39 @@ impl AcmeProvider {
             .map(|d| Identifier::Dns(d.clone()))
             .collect();
 
-        let mut order = account
-            .new_order(&NewOrder {
-                identifiers: &identifiers,
-            })
-            .await?;
+        info!(domains = ?cert_config.domains, "creating ACME order");
+        let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
 
-        debug!(domains = ?cert_config.domains, "created ACME order");
+        info!(domains = ?cert_config.domains, "created ACME order");
 
         // Process authorizations
         let mut record_ids: Vec<(String, String)> = Vec::new();
 
         // Handle challenges
         let result = async {
-            let authorizations = order.authorizations().await?;
+            let mut authorizations = order.authorizations();
 
-            for authz in authorizations {
+            while let Some(authz) = authorizations.next().await {
+                let mut authz = authz?;
                 if matches!(authz.status, AuthorizationStatus::Valid) {
                     continue;
                 }
 
-                let challenge = authz
-                    .challenges
-                    .iter()
-                    .find(|c| matches!(c.r#type, ChallengeType::Dns01))
-                    .ok_or_else(|| AcmeError::NoChallenge)?;
-
-                let domain_str = match &authz.identifier {
+                let domain_str = match authz.identifier().identifier {
                     Identifier::Dns(d) => d.clone(),
+                    unsupported => {
+                        return Err(AcmeError::Config(format!(
+                            "unsupported ACME identifier: {unsupported:?}"
+                        )));
+                    }
                 };
                 let txt_name = format!("_acme-challenge.{}", domain_str);
-                let txt_value = order.key_authorization(challenge).dns_value();
+                let mut challenge = authz
+                    .challenge(ChallengeType::Dns01)
+                    .ok_or_else(|| AcmeError::NoChallenge)?;
+                let txt_value = challenge.key_authorization().dns_value();
 
-                debug!(domain = %domain_str, "setting DNS challenge");
+                info!(domain = %domain_str, txt_name = %txt_name, "creating ACME DNS-01 challenge record");
 
                 // Create DNS record
                 let record_id = dns_client
@@ -293,10 +318,12 @@ impl AcmeProvider {
                 record_ids.push((txt_name.clone(), record_id));
 
                 // Wait for DNS propagation
+                info!(domain = %domain_str, "waiting for DNS challenge propagation");
                 tokio::time::sleep(Duration::from_secs(10)).await;
 
                 // Validate challenge
-                order.set_challenge_ready(&challenge.url).await?;
+                info!(domain = %domain_str, "notifying ACME server that DNS challenge is ready");
+                challenge.set_ready().await?;
             }
 
             Ok::<_, AcmeError>(())
@@ -309,34 +336,26 @@ impl AcmeProvider {
         }
 
         // Wait for order to be ready
-        loop {
-            order.refresh().await?;
-            if matches!(order.state().status, OrderStatus::Ready) {
-                break;
-            }
-            if matches!(order.state().status, OrderStatus::Invalid) {
-                cleanup_dns_records(&dns_client, &zone_id, &record_ids).await;
-                return Err(AcmeError::OrderFailed(format!(
-                    "{:?}",
-                    order.state().status
-                )));
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        let retry_policy = RetryPolicy::new()
+            .initial_delay(Duration::from_secs(1))
+            .timeout(Duration::from_secs(120));
+        info!(domains = ?cert_config.domains, "waiting for ACME order to become ready");
+        let status = order.poll_ready(&retry_policy).await?;
+        if matches!(status, OrderStatus::Invalid) {
+            cleanup_dns_records(&dns_client, &zone_id, &record_ids).await;
+            return Err(AcmeError::OrderFailed(format!("{status:?}")));
         }
+        info!(domains = ?cert_config.domains, "ACME order is ready; finalizing CSR");
 
         // Generate CSR
         let (private_key_pem, csr_der) = generate_csr(&cert_config.domains)?;
 
         // Finalize order
-        order.finalize(&csr_der).await?;
+        order.finalize_csr(&csr_der).await?;
 
         // Poll for certificate
-        let cert_pem = loop {
-            if let Some(cert) = order.certificate().await? {
-                break cert;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        };
+        info!(domains = ?cert_config.domains, "waiting for ACME certificate issuance");
+        let cert_pem = order.poll_certificate(&retry_policy).await?;
 
         // Cleanup DNS records
         cleanup_dns_records(&dns_client, &zone_id, &record_ids).await;
@@ -372,8 +391,8 @@ impl AcmeProvider {
 
         // Try to load existing account
         if let Some(creds_json) = self.storage.load_account()? {
-            let creds = serde_json::from_str(&creds_json)?;
-            let account = Account::from_credentials(creds).await?;
+            let creds: AccountCredentials = serde_json::from_str(&creds_json)?;
+            let account = Account::builder()?.from_credentials(creds).await?;
             debug!("loaded existing ACME account");
             return Ok(account);
         }
@@ -385,16 +404,18 @@ impl AcmeProvider {
             vec![format!("mailto:{}", self.config.email)]
         };
 
-        let (account, creds) = Account::create(
-            &NewAccount {
-                contact: &contact.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            server_url,
-            None,
-        )
-        .await?;
+        let contact_refs = contact.iter().map(String::as_str).collect::<Vec<_>>();
+        let (account, creds) = Account::builder()?
+            .create(
+                &NewAccount {
+                    contact: &contact_refs,
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                server_url.to_string(),
+                None,
+            )
+            .await?;
 
         // Save account credentials
         let creds_json = serde_json::to_string(&creds)?;
@@ -438,9 +459,33 @@ async fn cleanup_dns_records(
     }
 }
 
+fn emit_acme_cert_metrics(stored: &StoredCert) {
+    let expiry = stored.expiry.timestamp();
+    for domain in &stored.domains {
+        metrics::set_cert_expiry(domain, expiry);
+    }
+}
+
+fn acme_failure_reason(error: &AcmeError) -> &'static str {
+    match error {
+        AcmeError::Storage(_) => "storage",
+        AcmeError::Cloudflare(_) => "dns",
+        AcmeError::Acme(_) => "acme_api",
+        AcmeError::Json(_) => "json",
+        AcmeError::Io(_) => "io",
+        AcmeError::Pem(_) => "pem",
+        AcmeError::Rcgen(_) => "csr",
+        AcmeError::Base64(_) => "base64",
+        AcmeError::Config(_) => "config",
+        AcmeError::NoChallenge => "no_challenge",
+        AcmeError::OrderFailed(_) => "order_failed",
+        AcmeError::NoCertificates => "no_certificates",
+    }
+}
+
 /// Generate a CSR and private key for the given domains.
 fn generate_csr(domains: &[String]) -> Result<(String, Vec<u8>), AcmeError> {
-    use rcgen::{generate_simple_self_signed, CertificateParams};
+    use rcgen::{generate_simple_self_signed, CertificateParams, DistinguishedName};
 
     // Generate a simple self-signed cert to get a key pair
     let rcgen::CertifiedKey { cert: _, key_pair } = generate_simple_self_signed(domains.to_vec())?;
@@ -448,7 +493,8 @@ fn generate_csr(domains: &[String]) -> Result<(String, Vec<u8>), AcmeError> {
     let key_pem = key_pair.serialize_pem();
 
     // Generate CSR from certificate params
-    let params = CertificateParams::new(domains)?;
+    let mut params = CertificateParams::new(domains)?;
+    params.distinguished_name = DistinguishedName::new();
     let csr = params.serialize_request(&key_pair)?;
     let csr_pem = csr.pem()?;
 

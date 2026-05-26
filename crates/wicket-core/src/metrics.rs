@@ -7,9 +7,8 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    register_gauge_vec, register_histogram_vec, register_int_counter, register_int_counter_vec,
-    register_int_gauge, register_int_gauge_vec, GaugeVec, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, IntGaugeVec,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
+    register_int_gauge_vec, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
 };
 
 lazy_static! {
@@ -148,13 +147,6 @@ lazy_static! {
         vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]
     ).expect("metric can be created");
 
-    /// Certificate expiry (Unix timestamp in seconds).
-    pub static ref TLS_CERTIFICATE_EXPIRY_TIMESTAMP_SECONDS: GaugeVec = register_gauge_vec!(
-        "wicket_tls_certificate_expiry_timestamp_seconds",
-        "Certificate expiration Unix timestamp in seconds",
-        &["domain"]
-    ).expect("metric can be created");
-
     // ============================================================
     // Bandwidth Metrics
     // ============================================================
@@ -251,7 +243,6 @@ pub fn register_metrics() -> Result<(), prometheus::Error> {
     let _ = &*HEALTH_CHECK_TOTAL;
     let _ = &*TLS_HANDSHAKES_TOTAL;
     let _ = &*TLS_HANDSHAKE_DURATION_SECONDS;
-    let _ = &*TLS_CERTIFICATE_EXPIRY_TIMESTAMP_SECONDS;
     let _ = &*BYTES_RECEIVED_TOTAL;
     let _ = &*BYTES_SENT_TOTAL;
     let _ = &*ROUTE_MATCH_DURATION_SECONDS;

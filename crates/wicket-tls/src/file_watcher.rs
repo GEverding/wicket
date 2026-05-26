@@ -13,7 +13,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::config::FileConfig;
-use crate::metrics::{tls_metrics, CertReloadStatus};
+use crate::metrics;
+use crate::metrics::CertReloadStatus;
 use crate::pem::{extract_cert_expiry, load_certified_key};
 use crate::{CertManager, CertStore};
 
@@ -59,11 +60,7 @@ impl FileWatcher {
                         if let Some(expiry_timestamp) = extract_cert_expiry(cert_der) {
                             // Emit metric for each domain
                             for domain in &cert_config.domains {
-                                tls_metrics::wicket_tls_certificate_expiry_timestamp_seconds(
-                                    cert_config.name.clone(),
-                                    domain.clone(),
-                                )
-                                .set(expiry_timestamp as u64);
+                                metrics::set_cert_expiry(domain, expiry_timestamp);
                             }
                             debug!(
                                 name = %cert_config.name,
@@ -205,11 +202,11 @@ impl FileWatcher {
         match self.build_store() {
             Ok(store) => {
                 self.manager.reload(store);
-                tls_metrics::wicket_cert_reload_total(CertReloadStatus::Success).inc();
+                metrics::inc_cert_reload(CertReloadStatus::Success);
                 info!("certificates reloaded successfully");
             }
             Err(e) => {
-                tls_metrics::wicket_cert_reload_total(CertReloadStatus::Failure).inc();
+                metrics::inc_cert_reload(CertReloadStatus::Failure);
                 error!(error = %e, "failed to reload certificates, keeping old");
             }
         }

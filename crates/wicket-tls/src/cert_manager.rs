@@ -9,6 +9,8 @@ use arc_swap::ArcSwap;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
+use crate::metrics;
+use crate::metrics::CertResolutionOutcome;
 use crate::CertStore;
 
 /// Hot-reloadable certificate manager.
@@ -85,8 +87,14 @@ impl Default for CertManager {
 
 impl ResolvesServerCert for CertManager {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let sni = client_hello.server_name()?;
-        CertManager::resolve(self, sni)
+        let Some(sni) = client_hello.server_name() else {
+            metrics::inc_cert_resolution(CertResolutionOutcome::NoSni);
+            return None;
+        };
+
+        let (cert, outcome) = self.store.load().resolve_with_outcome(sni);
+        metrics::inc_cert_resolution(outcome);
+        cert
     }
 }
 

@@ -7,6 +7,8 @@ use rustls::server::ClientHello;
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 
+use crate::metrics::CertResolutionOutcome;
+
 /// Certificate store with SNI-based resolution.
 ///
 /// Supports exact domain matches and wildcard certificates.
@@ -58,23 +60,34 @@ impl CertStore {
     ///
     /// Returns None if no matching certificate is found.
     pub fn resolve(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
+        self.resolve_with_outcome(sni).0
+    }
+
+    /// Resolve a certificate and report how it matched.
+    pub fn resolve_with_outcome(
+        &self,
+        sni: &str,
+    ) -> (Option<Arc<CertifiedKey>>, CertResolutionOutcome) {
         let sni_lower = sni.to_lowercase();
 
         // 1. Try exact match
         if let Some(cert) = self.exact.get(&sni_lower) {
-            return Some(cert.clone());
+            return (Some(cert.clone()), CertResolutionOutcome::Exact);
         }
 
         // 2. Try wildcard match
         // "api.example.com" -> check for "*.example.com" (stored as "example.com")
         if let Some(parent) = sni_lower.split_once('.').map(|(_, rest)| rest) {
             if let Some(cert) = self.wildcard.get(parent) {
-                return Some(cert.clone());
+                return (Some(cert.clone()), CertResolutionOutcome::Wildcard);
             }
         }
 
         // 3. Return default if set
-        self.default.clone()
+        match self.default.clone() {
+            Some(cert) => (Some(cert), CertResolutionOutcome::Default),
+            None => (None, CertResolutionOutcome::Miss),
+        }
     }
 
     /// Check if the store is empty.
@@ -132,6 +145,16 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_with_outcome_exact() {
+        let mut store = CertStore::new();
+        store.insert(&["api.example.com".to_string()], dummy_cert());
+
+        let (cert, outcome) = store.resolve_with_outcome("api.example.com");
+        assert!(cert.is_some());
+        assert_eq!(outcome, CertResolutionOutcome::Exact);
+    }
+
+    #[test]
     fn test_wildcard_match() {
         let mut store = CertStore::new();
         let cert = dummy_cert();
@@ -147,6 +170,25 @@ mod tests {
 
         // Or nested subdomains
         assert!(store.resolve("a.b.example.com").is_none());
+    }
+
+    #[test]
+    fn test_resolve_with_outcome_wildcard_default_and_miss() {
+        let mut store = CertStore::new();
+        store.insert(&["*.example.com".to_string()], dummy_cert());
+
+        let (cert, outcome) = store.resolve_with_outcome("api.example.com");
+        assert!(cert.is_some());
+        assert_eq!(outcome, CertResolutionOutcome::Wildcard);
+
+        let (cert, outcome) = store.resolve_with_outcome("unknown.test");
+        assert!(cert.is_none());
+        assert_eq!(outcome, CertResolutionOutcome::Miss);
+
+        store.set_default(dummy_cert());
+        let (cert, outcome) = store.resolve_with_outcome("unknown.test");
+        assert!(cert.is_some());
+        assert_eq!(outcome, CertResolutionOutcome::Default);
     }
 
     #[test]

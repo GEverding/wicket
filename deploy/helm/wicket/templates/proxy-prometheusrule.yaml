@@ -149,6 +149,69 @@ spec:
           annotations:
             summary: "TLS certificate expired for {{`{{ $labels.domain }}`}}"
 
+        - alert: WicketCertificateExpiringCritical
+          expr: |
+            (wicket_tls_certificate_expiry_timestamp_seconds - time())
+            < {{ int .Values.monitoring.prometheusRules.proxy.certExpiryCriticalSeconds }}
+          for: 15m
+          labels:
+            severity: critical
+            component: proxy
+          annotations:
+            summary: "TLS certificate critically close to expiry for {{`{{ $labels.domain }}`}}"
+            description: >-
+              Certificate expires in {{`{{ $value | humanizeDuration }}`}}.
+
+        - alert: WicketAcmeRenewalFailing
+          expr: rate(wicket_acme_renewal_failures_total[1h]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "ACME renewal failures for {{`{{ $labels.domain }}`}}"
+            description: >-
+              Renewal failures are occurring for {{`{{ $labels.domain }}`}} with reason {{`{{ $labels.reason }}`}}.
+
+        - alert: WicketAcmeSuccessStale
+          expr: |
+            (time() - wicket_acme_last_renewal_success_timestamp_seconds)
+            > {{ int .Values.monitoring.prometheusRules.proxy.acmeSuccessStaleSeconds }}
+          for: 1h
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "ACME success timestamp is stale for {{`{{ $labels.domain }}`}}"
+            description: >-
+              Last successful ACME issuance/renewal was {{`{{ $value | humanizeDuration }}`}} ago.
+
+        - alert: WicketTlsHandshakeErrorsHigh
+          expr: |
+            sum(rate(wicket_tls_handshake_errors_total[5m]))
+            > {{ .Values.monitoring.prometheusRules.proxy.tlsHandshakeErrorRateThreshold }}
+          for: 5m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "TLS handshake errors are elevated"
+            description: >-
+              TLS handshake error rate is {{`{{ $value | humanize }}`}} errors/sec.
+
+        - alert: WicketTlsCertResolverMissesHigh
+          expr: |
+            sum(rate(wicket_tls_cert_resolution_total{outcome=~"miss|no_sni"}[5m]))
+            > {{ .Values.monitoring.prometheusRules.proxy.tlsResolverMissRateThreshold }}
+          for: 5m
+          labels:
+            severity: warning
+            component: proxy
+          annotations:
+            summary: "TLS cert resolver misses/no-SNI traffic are elevated"
+            description: >-
+              Resolver miss/no-SNI rate is {{`{{ $value | humanize }}`}}/sec. Check SNI hostnames and certificate coverage.
+
     # ================================================================
     # Config reload alerts
     # ================================================================

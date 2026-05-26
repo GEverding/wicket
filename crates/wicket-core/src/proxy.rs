@@ -22,10 +22,13 @@ use pingora_load_balancing::{health_check::TcpHealthCheck, LoadBalancer};
 use pingora_proxy::{ProxyHttp, Session};
 use rand::Rng;
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
-use wicket_config::{Config, LoadBalanceStrategy, UpstreamConfig};
+use wicket_config::{AccessLogFormat, Config, LoadBalanceStrategy, UpstreamConfig};
 use wicket_tls::CertManager;
 
 // Header name constants
@@ -33,6 +36,8 @@ const HEADER_REQUEST_ID: &str = "x-request-id";
 const HEADER_HOST: &str = "host";
 const HEADER_X_FORWARDED_FOR: &str = "x-forwarded-for";
 const HEADER_CONTENT_LENGTH: &str = "content-length";
+const HEADER_REFERER: &str = "referer";
+const HEADER_USER_AGENT: &str = "user-agent";
 
 // Metric label constants
 const LISTENER_DEFAULT: &str = "default";
@@ -40,9 +45,6 @@ const ERROR_NO_HEALTHY_BACKENDS: &str = "no_healthy_backends";
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 use std::os::unix::io::RawFd;
-
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
-use std::sync::Mutex;
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 use wicket_sockmap::SocketMap;
@@ -105,6 +107,9 @@ pub struct WicketProxy {
 
     /// TLS certificate manager (if TLS is enabled)
     cert_manager: Option<Arc<CertManager>>,
+
+    /// Optional Apache/Nginx-style access log writer.
+    access_logger: Option<Arc<AccessLogger>>,
 
     /// eBPF sockmap for kernel-level proxying (Linux only)
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -179,11 +184,13 @@ impl WicketProxy {
     pub fn new(config: &Config) -> Result<Self> {
         let router = Router::build(&config.routes)?;
         let upstreams = Self::build_upstreams(&config.upstreams)?;
+        let access_logger = AccessLogger::from_config(config)?;
 
         Ok(WicketProxy {
             router: Arc::new(ArcSwap::new(Arc::new(router))),
             upstreams: Arc::new(ArcSwap::new(Arc::new(upstreams))),
             cert_manager: None,
+            access_logger,
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             sockmap: None,
         })
@@ -250,6 +257,114 @@ impl WicketProxy {
         let cluster = upstreams.get(upstream_name)?;
         cluster.select_peer(key)
     }
+}
+
+struct AccessLogger {
+    writer: Mutex<std::fs::File>,
+    format: AccessLogFormat,
+}
+
+struct AccessLogEntry<'a> {
+    remote_addr: &'a str,
+    time_local: String,
+    method: &'a str,
+    request_uri: &'a str,
+    protocol: String,
+    status: u16,
+    bytes_sent: u64,
+    referer: &'a str,
+    user_agent: &'a str,
+    request_id: &'a str,
+    route: &'a str,
+    upstream: &'a str,
+    duration_ms: u64,
+}
+
+impl AccessLogger {
+    fn from_config(config: &Config) -> Result<Option<Arc<Self>>> {
+        if !config.logging.access.enabled || !config.logging.files.enabled {
+            return Ok(None);
+        }
+
+        let directory = &config.logging.files.directory;
+        fs::create_dir_all(directory)?;
+        let path = directory.join(&config.logging.files.access);
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+
+        Ok(Some(Arc::new(Self {
+            writer: Mutex::new(file),
+            format: config.logging.access.format.clone(),
+        })))
+    }
+
+    fn write(&self, entry: &AccessLogEntry<'_>) -> std::io::Result<()> {
+        let line = match self.format {
+            AccessLogFormat::Combined => format_combined_access_log(entry),
+            AccessLogFormat::Json => format_json_access_log(entry),
+        };
+
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("access log lock poisoned"))?;
+        writeln!(writer, "{line}")
+    }
+}
+
+fn format_combined_access_log(entry: &AccessLogEntry<'_>) -> String {
+    format!(
+        r#"{} - - [{}] "{} {} {}" {} {} "{}" "{}" "{}" "{}" "{}" {}"#,
+        escape_access_field(entry.remote_addr),
+        entry.time_local,
+        escape_access_field(entry.method),
+        escape_access_field(entry.request_uri),
+        escape_access_field(&entry.protocol),
+        entry.status,
+        entry.bytes_sent,
+        escape_access_field(entry.referer),
+        escape_access_field(entry.user_agent),
+        escape_access_field(entry.request_id),
+        escape_access_field(entry.route),
+        escape_access_field(entry.upstream),
+        entry.duration_ms,
+    )
+}
+
+fn format_json_access_log(entry: &AccessLogEntry<'_>) -> String {
+    format!(
+        r#"{{"remote_addr":"{}","time_local":"{}","method":"{}","request_uri":"{}","protocol":"{}","status":{},"bytes_sent":{},"referer":"{}","user_agent":"{}","request_id":"{}","route":"{}","upstream":"{}","duration_ms":{}}}"#,
+        escape_json(entry.remote_addr),
+        escape_json(&entry.time_local),
+        escape_json(entry.method),
+        escape_json(entry.request_uri),
+        escape_json(&entry.protocol),
+        entry.status,
+        entry.bytes_sent,
+        escape_json(entry.referer),
+        escape_json(entry.user_agent),
+        escape_json(entry.request_id),
+        escape_json(entry.route),
+        escape_json(entry.upstream),
+        entry.duration_ms,
+    )
+}
+
+fn escape_access_field(value: &str) -> String {
+    value
+        .replace('\\', r#"\\"#)
+        .replace('"', r#"\""#)
+        .replace('\n', r#"\n"#)
+        .replace('\r', r#"\r"#)
+        .replace('\t', r#"\t"#)
+}
+
+fn escape_json(value: &str) -> String {
+    value
+        .replace('\\', r#"\\"#)
+        .replace('"', r#"\""#)
+        .replace('\n', r#"\n"#)
+        .replace('\r', r#"\r"#)
+        .replace('\t', r#"\t"#)
 }
 
 impl UpstreamCluster {
@@ -620,9 +735,30 @@ impl ProxyHttp for WicketProxy {
             &ctx.method
         };
         let path = req_header.uri.path();
+        let request_uri = req_header.uri.to_string();
+        let protocol = format!("{:?}", req_header.version);
+        let remote_addr = session
+            .as_downstream()
+            .client_addr()
+            .map(|addr| {
+                addr.as_inet()
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_else(|| addr.to_string())
+            })
+            .unwrap_or_else(|| "-".to_string());
         let host = req_header
             .headers
             .get(HEADER_HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        let referer = req_header
+            .headers
+            .get(HEADER_REFERER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        let user_agent = req_header
+            .headers
+            .get(HEADER_USER_AGENT)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("-");
 
@@ -694,18 +830,21 @@ impl ProxyHttp for WicketProxy {
         // Record bytes (approximate from content-length headers if available)
         // Note: For accurate byte counting, we'd need to track actual bytes in
         // upstream_request_filter and upstream_response_filter
-        if let Some(resp) = session.response_written() {
-            if let Some(bytes) = resp
+        let bytes_sent = if let Some(resp) = session.response_written() {
+            let bytes = resp
                 .headers
                 .get(HEADER_CONTENT_LENGTH)
                 .and_then(|cl| cl.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-            {
+                .and_then(|s| s.parse::<u64>().ok());
+            if let Some(bytes) = bytes {
                 BYTES_SENT_TOTAL
                     .with_label_values(&[route_label])
                     .inc_by(bytes);
             }
-        }
+            bytes.unwrap_or(0)
+        } else {
+            0
+        };
         if let Some(bytes) = req_header
             .headers
             .get(HEADER_CONTENT_LENGTH)
@@ -733,6 +872,30 @@ impl ProxyHttp for WicketProxy {
             upstream = %upstream,
             "Request completed"
         );
+
+        if let Some(access_logger) = &self.access_logger {
+            let entry = AccessLogEntry {
+                remote_addr: &remote_addr,
+                time_local: chrono::Local::now()
+                    .format("%d/%b/%Y:%H:%M:%S %z")
+                    .to_string(),
+                method,
+                request_uri: &request_uri,
+                protocol,
+                status,
+                bytes_sent,
+                referer,
+                user_agent,
+                request_id: &ctx.request_id,
+                route: route_label,
+                upstream,
+                duration_ms: duration.as_millis() as u64,
+            };
+
+            if let Err(error) = access_logger.write(&entry) {
+                warn!(error = %error, "failed to write access log");
+            }
+        }
     }
 }
 
@@ -767,5 +930,52 @@ mod tests {
         let cluster = UpstreamCluster::new(&config).unwrap();
         assert!(cluster.lb_round_robin.is_some());
         assert!(cluster.lb_ketama.is_none());
+    }
+
+    #[test]
+    fn test_combined_access_log_format_escapes_quoted_fields() {
+        let entry = AccessLogEntry {
+            remote_addr: "127.0.0.1:12345",
+            time_local: "26/May/2026:03:00:00 +0000".to_string(),
+            method: "GET",
+            request_uri: "/path?q=1",
+            protocol: "HTTP/1.1".to_string(),
+            status: 200,
+            bytes_sent: 123,
+            referer: "https://example.com/a\"b",
+            user_agent: "curl\n8",
+            request_id: "req_abc",
+            route: "updates",
+            upstream: "s3cache",
+            duration_ms: 42,
+        };
+
+        assert_eq!(
+            format_combined_access_log(&entry),
+            r#"127.0.0.1:12345 - - [26/May/2026:03:00:00 +0000] "GET /path?q=1 HTTP/1.1" 200 123 "https://example.com/a\"b" "curl\n8" "req_abc" "updates" "s3cache" 42"#
+        );
+    }
+
+    #[test]
+    fn test_json_access_log_format_escapes_control_characters() {
+        let entry = AccessLogEntry {
+            remote_addr: "127.0.0.1:12345",
+            time_local: "26/May/2026:03:00:00 +0000".to_string(),
+            method: "GET",
+            request_uri: "/path?q=1",
+            protocol: "HTTP/1.1".to_string(),
+            status: 200,
+            bytes_sent: 123,
+            referer: "-",
+            user_agent: "agent\nwith\"quote",
+            request_id: "req_abc",
+            route: "updates",
+            upstream: "s3cache",
+            duration_ms: 42,
+        };
+
+        let line = format_json_access_log(&entry);
+        assert!(line.contains(r#""user_agent":"agent\nwith\"quote""#));
+        assert!(line.contains(r#""status":200"#));
     }
 }

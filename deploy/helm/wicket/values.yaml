@@ -258,6 +258,14 @@ monitoring:
       latencyP99Threshold: 1.0
       # -- Certificate expiry warning threshold in seconds (default: 7 days)
       certExpiryWarningSeconds: 604800
+      # -- Certificate expiry critical threshold in seconds (default: 3 days)
+      certExpiryCriticalSeconds: 259200
+      # -- ACME renewal success staleness threshold in seconds (default: 60 days)
+      acmeSuccessStaleSeconds: 5184000
+      # -- TLS handshake error rate threshold in errors/sec
+      tlsHandshakeErrorRateThreshold: 1
+      # -- TLS resolver miss/no-SNI rate threshold in misses/sec
+      tlsResolverMissRateThreshold: 1
     # -- Controller alert thresholds
     controller:
       # -- Reconciliation error rate threshold (fraction)

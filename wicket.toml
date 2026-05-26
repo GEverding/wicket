@@ -19,6 +19,23 @@ log_level = "info"
 # Graceful shutdown timeout in seconds
 shutdown_timeout = 30
 
+# Optional file logging, useful for packaged installs and tailing like nginx.
+# Defaults stay on stderr/journald unless enabled here.
+# [logging]
+# level = "info"
+# format = "text" # text or json
+#
+# [logging.files]
+# enabled = true
+# directory = "/var/log/wicket"
+# error = "error.log"
+# access = "access.log"
+# acme = "acme.log"
+#
+# [logging.access]
+# enabled = true
+# format = "combined" # combined or json
+
 # ============================================================================
 # Upstreams - Define your backend servers
 # ============================================================================

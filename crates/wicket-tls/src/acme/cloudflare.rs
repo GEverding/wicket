@@ -285,4 +285,70 @@ mod tests {
         let zone_id = client.get_zone_id("example.com").await.unwrap();
         println!("Zone ID: {}", zone_id);
     }
+
+    #[tokio::test]
+    #[ignore]
+    async fn cloudflare_smoke_get_zone_id_from_token_file() {
+        let Ok(token_file) = std::env::var("CF_API_TOKEN_FILE") else {
+            eprintln!("skipping Cloudflare smoke; CF_API_TOKEN_FILE not set");
+            return;
+        };
+        let Ok(zone_name) = std::env::var("CF_ZONE_NAME") else {
+            eprintln!("skipping Cloudflare smoke; CF_ZONE_NAME not set");
+            return;
+        };
+        let client = CloudflareClient::from_token_file(std::path::Path::new(&token_file))
+            .expect("failed to create Cloudflare client from token file");
+
+        let zone_id = client
+            .get_zone_id(&zone_name)
+            .await
+            .expect("failed to resolve Cloudflare zone ID");
+        assert!(!zone_id.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn cloudflare_smoke_txt_create_delete_from_token_file() {
+        if std::env::var("CF_SMOKE_WRITE").as_deref() != Ok("1") {
+            eprintln!("skipping DNS write smoke; set CF_SMOKE_WRITE=1 to enable");
+            return;
+        }
+
+        let Ok(token_file) = std::env::var("CF_API_TOKEN_FILE") else {
+            eprintln!("skipping Cloudflare smoke; CF_API_TOKEN_FILE not set");
+            return;
+        };
+        let Ok(zone_name) = std::env::var("CF_ZONE_NAME") else {
+            eprintln!("skipping Cloudflare smoke; CF_ZONE_NAME not set");
+            return;
+        };
+        let client = CloudflareClient::from_token_file(std::path::Path::new(&token_file))
+            .expect("failed to create Cloudflare client from token file");
+
+        let zone_id = match std::env::var("CF_ZONE_ID") {
+            Ok(zone_id) => zone_id,
+            Err(_) => client
+                .get_zone_id(&zone_name)
+                .await
+                .expect("failed to resolve Cloudflare zone ID"),
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_secs();
+        let record_name = format!("_wicket-smoke.{}", zone_name);
+        let record_content = format!("wicket-smoke-{}-{now}", std::process::id());
+
+        let record_id = client
+            .create_txt_record(&zone_id, &record_name, &record_content)
+            .await
+            .expect("failed to create Cloudflare TXT smoke record");
+
+        client
+            .delete_txt_record(&zone_id, &record_id)
+            .await
+            .expect("failed to delete Cloudflare TXT smoke record");
+    }
 }
