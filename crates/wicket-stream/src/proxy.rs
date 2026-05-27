@@ -7,13 +7,18 @@
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
+use crate::endpoint::StreamBackendAddr;
 use crate::health::BackendHealth;
 use crate::metrics::{
     STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL, STREAM_BYTES_TOTAL, STREAM_CONFIG_RELOADS_TOTAL,
@@ -27,6 +32,56 @@ use crate::protocol::{ProxyProtocolEncoder, ProxyProtocolVersion};
 use crate::router::SniRouter;
 use crate::sni::extract_sni;
 use crate::StreamError;
+
+enum BackendConnection {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl AsyncRead for BackendConnection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for BackendConnection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(unix)]
+            Self::Unix(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(unix)]
+            Self::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
 
 /// RAII guard that decrements the active-connections gauge and records duration on drop.
 struct ConnectionGuard {
@@ -69,7 +124,7 @@ use wicket_sockmap::SocketMap;
 #[derive(Debug)]
 pub struct Upstream {
     pub name: String,
-    pub servers: Vec<SocketAddr>,
+    pub servers: Vec<StreamBackendAddr>,
     pub(crate) health: Vec<BackendHealth>,
     counter: AtomicUsize,
     cooldown: Duration,
@@ -78,13 +133,20 @@ pub struct Upstream {
 impl Upstream {
     /// Create a new upstream with the given name and servers.
     /// Uses a default 30-second cooldown for unhealthy backends.
-    pub fn new(name: String, servers: Vec<SocketAddr>) -> Self {
+    pub fn new(name: String, servers: Vec<StreamBackendAddr>) -> Self {
         Self::with_cooldown(name, servers, Duration::from_secs(30))
     }
 
     /// Create a new upstream with a custom cooldown duration.
-    pub fn with_cooldown(name: String, servers: Vec<SocketAddr>, cooldown: Duration) -> Self {
-        let health = servers.iter().map(|&a| BackendHealth::new(a)).collect();
+    pub fn with_cooldown(
+        name: String,
+        servers: Vec<StreamBackendAddr>,
+        cooldown: Duration,
+    ) -> Self {
+        let health = servers
+            .iter()
+            .map(|endpoint| BackendHealth::new(endpoint.to_string()))
+            .collect();
         Self {
             name,
             servers,
@@ -99,7 +161,7 @@ impl Upstream {
     /// Tries up to `servers.len()` slots starting from the current counter position.
     /// If all backends are unhealthy and within cooldown, fails open — returns the
     /// next round-robin server anyway to avoid refusing all traffic.
-    pub fn next_server(&self) -> SocketAddr {
+    pub fn next_server(&self) -> StreamBackendAddr {
         let len = self.servers.len();
         let start = self.counter.fetch_add(1, Ordering::Relaxed);
 
@@ -107,7 +169,7 @@ impl Upstream {
         for i in 0..len {
             let idx = (start + i) % len;
             if self.health[idx].is_eligible(self.cooldown) {
-                return self.servers[idx];
+                return self.servers[idx].clone();
             }
         }
 
@@ -116,36 +178,38 @@ impl Upstream {
             upstream = %self.name,
             "All backends unhealthy; routing to next backend anyway (fail-open)"
         );
-        self.servers[start % len]
+        self.servers[start % len].clone()
     }
 
     /// Report a successful connect for a specific backend address.
-    pub fn report_success(&self, addr: SocketAddr) {
-        if let Some(h) = self.health.iter().find(|h| h.addr() == addr) {
+    pub fn report_success(&self, endpoint: &StreamBackendAddr) {
+        let label = endpoint.to_string();
+        if let Some(h) = self.health.iter().find(|h| h.label() == label) {
             let was_healthy = h.is_healthy();
             h.record_success();
             if !was_healthy {
                 STREAM_UPSTREAM_HEALTH
-                    .with_label_values(&[&self.name, &addr.to_string()])
+                    .with_label_values(&[&self.name, &label])
                     .set(1);
                 STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL
-                    .with_label_values(&[&self.name, &addr.to_string(), "unhealthy_to_healthy"])
+                    .with_label_values(&[&self.name, &label, "unhealthy_to_healthy"])
                     .inc();
             }
         }
     }
 
     /// Report a failed connect for a specific backend address.
-    pub fn report_failure(&self, addr: SocketAddr) {
-        if let Some(h) = self.health.iter().find(|h| h.addr() == addr) {
+    pub fn report_failure(&self, endpoint: &StreamBackendAddr) {
+        let label = endpoint.to_string();
+        if let Some(h) = self.health.iter().find(|h| h.label() == label) {
             let was_healthy = h.is_healthy();
             h.record_failure();
             if was_healthy {
                 STREAM_UPSTREAM_HEALTH
-                    .with_label_values(&[&self.name, &addr.to_string()])
+                    .with_label_values(&[&self.name, &label])
                     .set(0);
                 STREAM_BACKEND_HEALTH_TRANSITIONS_TOTAL
-                    .with_label_values(&[&self.name, &addr.to_string(), "healthy_to_unhealthy"])
+                    .with_label_values(&[&self.name, &label, "healthy_to_unhealthy"])
                     .inc();
             }
         }
@@ -220,12 +284,7 @@ impl StreamProxy {
         // Build upstreams
         let mut upstreams = HashMap::new();
         for upstream_config in &config.upstreams {
-            let servers: Vec<SocketAddr> = upstream_config
-                .servers
-                .iter()
-                .map(|s| s.parse())
-                .collect::<Result<_, _>>()
-                .map_err(|e| StreamError::ConfigError(format!("Invalid server address: {}", e)))?;
+            let servers = parse_backend_endpoints(&upstream_config.servers)?;
 
             upstreams.insert(
                 upstream_config.name.clone(),
@@ -291,12 +350,7 @@ impl StreamProxy {
         let cooldown = Duration::from_secs(config.health_cooldown_secs);
         let mut upstreams = HashMap::new();
         for upstream_config in &config.upstreams {
-            let servers: Vec<SocketAddr> = upstream_config
-                .servers
-                .iter()
-                .map(|s| s.parse())
-                .collect::<Result<_, _>>()
-                .map_err(|e| StreamError::ConfigError(format!("Invalid server address: {}", e)))?;
+            let servers = parse_backend_endpoints(&upstream_config.servers)?;
 
             upstreams.insert(
                 upstream_config.name.clone(),
@@ -460,29 +514,31 @@ impl StreamProxy {
         // 3. Connect to backend (with optional source IP binding) — timed
         let connect_start = Instant::now();
         let mut backend =
-            match tokio::time::timeout(self.connect_timeout, self.connect_backend(backend_addr))
+            match tokio::time::timeout(self.connect_timeout, self.connect_backend(&backend_addr))
                 .await
             {
                 Ok(Ok(b)) => {
-                    upstream.report_success(backend_addr);
+                    upstream.report_success(&backend_addr);
                     b
                 }
                 Ok(Err(e)) => {
-                    upstream.report_failure(backend_addr);
+                    upstream.report_failure(&backend_addr);
                     STREAM_CONNECTION_ERRORS_TOTAL
                         .with_label_values(&["connect"])
                         .inc();
                     return Err(e);
                 }
                 Err(_elapsed) => {
-                    upstream.report_failure(backend_addr);
+                    upstream.report_failure(&backend_addr);
                     STREAM_CONNECTION_ERRORS_TOTAL
                         .with_label_values(&["connect_timeout"])
                         .inc();
                     return Err(StreamError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
-                            "Backend connect timed out after {}ms",
+                            "{} backend '{}' connect timed out after {}ms",
+                            backend_addr.transport(),
+                            backend_addr,
                             self.connect_timeout.as_millis()
                         ),
                     )));
@@ -508,8 +564,14 @@ impl StreamProxy {
         #[cfg(all(target_os = "linux", feature = "ebpf"))]
         if let Some(ref sockmap) = self.sockmap {
             use std::os::fd::AsRawFd;
+            let BackendConnection::Tcp(ref backend_tcp) = backend else {
+                STREAM_PROXY_PATH_TOTAL
+                    .with_label_values(&["userspace"])
+                    .inc();
+                return copy_userspace(&mut client, &mut backend).await;
+            };
             let client_fd = client.as_raw_fd();
-            let backend_fd = backend.as_raw_fd();
+            let backend_fd = backend_tcp.as_raw_fd();
 
             // Try to register for kernel-level proxying
             let registered = sockmap
@@ -529,7 +591,7 @@ impl StreamProxy {
                 // Bytes are not measurable in this path (kernel does the copy).
                 tokio::select! {
                     _ = client.readable() => {}
-                    _ = backend.readable() => {}
+                    _ = backend_tcp.readable() => {}
                 }
 
                 // Unregister on close
@@ -551,28 +613,30 @@ impl StreamProxy {
         STREAM_PROXY_PATH_TOTAL
             .with_label_values(&["userspace"])
             .inc();
-        match tokio::io::copy_bidirectional(&mut client, &mut backend).await {
-            Ok((client_to_backend, backend_to_client)) => {
-                STREAM_BYTES_TOTAL
-                    .with_label_values(&["rx"])
-                    .inc_by(client_to_backend);
-                STREAM_BYTES_TOTAL
-                    .with_label_values(&["tx"])
-                    .inc_by(backend_to_client);
-            }
-            Err(e) => {
-                STREAM_CONNECTION_ERRORS_TOTAL
-                    .with_label_values(&["transfer"])
-                    .inc();
-                tracing::debug!(error = %e, "Transfer error");
-            }
-        }
-
-        Ok(())
+        copy_userspace(&mut client, &mut backend).await
     }
 
     /// Connect to backend with optional source IP binding.
-    async fn connect_backend(&self, addr: SocketAddr) -> Result<TcpStream, StreamError> {
+    async fn connect_backend(
+        &self,
+        endpoint: &StreamBackendAddr,
+    ) -> Result<BackendConnection, StreamError> {
+        match endpoint {
+            StreamBackendAddr::Tcp(addr) => self
+                .connect_tcp_backend(*addr)
+                .await
+                .map(BackendConnection::Tcp)
+                .map_err(|e| {
+                    StreamError::ConnectionError(format!(
+                        "failed to connect TCP stream backend '{}': {}",
+                        endpoint, e
+                    ))
+                }),
+            StreamBackendAddr::Unix(path) => connect_unix_backend(endpoint, path).await,
+        }
+    }
+
+    async fn connect_tcp_backend(&self, addr: SocketAddr) -> Result<TcpStream, StreamError> {
         if let Some(ref pool) = self.source_ip_pool {
             let source_ip = pool.next_ip();
 
@@ -622,13 +686,80 @@ impl StreamProxy {
     }
 }
 
+#[cfg(unix)]
+async fn connect_unix_backend(
+    endpoint: &StreamBackendAddr,
+    path: &std::path::Path,
+) -> Result<BackendConnection, StreamError> {
+    UnixStream::connect(path)
+        .await
+        .map(BackendConnection::Unix)
+        .map_err(|e| {
+            StreamError::ConnectionError(format!(
+                "failed to connect Unix stream backend '{}': {}",
+                endpoint, e
+            ))
+        })
+}
+
+#[cfg(not(unix))]
+async fn connect_unix_backend(
+    endpoint: &StreamBackendAddr,
+    _path: &std::path::Path,
+) -> Result<BackendConnection, StreamError> {
+    Err(StreamError::ConnectionError(format!(
+        "Unix stream backend '{}' is not supported on this platform",
+        endpoint
+    )))
+}
+
+async fn copy_userspace(
+    client: &mut TcpStream,
+    backend: &mut BackendConnection,
+) -> Result<(), StreamError> {
+    match tokio::io::copy_bidirectional(client, backend).await {
+        Ok((client_to_backend, backend_to_client)) => {
+            STREAM_BYTES_TOTAL
+                .with_label_values(&["rx"])
+                .inc_by(client_to_backend);
+            STREAM_BYTES_TOTAL
+                .with_label_values(&["tx"])
+                .inc_by(backend_to_client);
+        }
+        Err(e) => {
+            STREAM_CONNECTION_ERRORS_TOTAL
+                .with_label_values(&["transfer"])
+                .inc();
+            tracing::debug!(error = %e, "Transfer error");
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_backend_endpoints(servers: &[String]) -> Result<Vec<StreamBackendAddr>, StreamError> {
+    servers
+        .iter()
+        .map(|server| StreamBackendAddr::parse(server))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
+
+    fn endpoint(port: u16) -> StreamBackendAddr {
+        StreamBackendAddr::Tcp(addr(port))
+    }
+
+    fn unix_endpoint(name: &str) -> StreamBackendAddr {
+        StreamBackendAddr::Unix(PathBuf::from(format!("/run/wicket/{name}.sock")))
     }
 
     // ============================================================================
@@ -637,39 +768,39 @@ mod tests {
 
     #[test]
     fn test_upstream_next_server_round_robin() {
-        let upstream = Upstream::new("test".into(), vec![addr(1), addr(2), addr(3)]);
-        assert_eq!(upstream.next_server(), addr(1));
-        assert_eq!(upstream.next_server(), addr(2));
-        assert_eq!(upstream.next_server(), addr(3));
+        let upstream = Upstream::new("test".into(), vec![endpoint(1), endpoint(2), endpoint(3)]);
+        assert_eq!(upstream.next_server(), endpoint(1));
+        assert_eq!(upstream.next_server(), endpoint(2));
+        assert_eq!(upstream.next_server(), endpoint(3));
     }
 
     #[test]
     fn test_upstream_next_server_wraps_around() {
-        let upstream = Upstream::new("test".into(), vec![addr(1), addr(2)]);
-        assert_eq!(upstream.next_server(), addr(1));
-        assert_eq!(upstream.next_server(), addr(2));
-        assert_eq!(upstream.next_server(), addr(1)); // wraps
-        assert_eq!(upstream.next_server(), addr(2));
+        let upstream = Upstream::new("test".into(), vec![endpoint(1), endpoint(2)]);
+        assert_eq!(upstream.next_server(), endpoint(1));
+        assert_eq!(upstream.next_server(), endpoint(2));
+        assert_eq!(upstream.next_server(), endpoint(1)); // wraps
+        assert_eq!(upstream.next_server(), endpoint(2));
     }
 
     #[test]
     fn test_upstream_single_server() {
-        let upstream = Upstream::new("test".into(), vec![addr(1)]);
-        assert_eq!(upstream.next_server(), addr(1));
-        assert_eq!(upstream.next_server(), addr(1));
-        assert_eq!(upstream.next_server(), addr(1));
+        let upstream = Upstream::new("test".into(), vec![endpoint(1)]);
+        assert_eq!(upstream.next_server(), endpoint(1));
+        assert_eq!(upstream.next_server(), endpoint(1));
+        assert_eq!(upstream.next_server(), endpoint(1));
     }
 
     #[test]
     fn test_upstream_many_servers() {
-        let servers: Vec<_> = (1..=100).map(addr).collect();
+        let servers: Vec<_> = (1..=100).map(endpoint).collect();
         let upstream = Upstream::new("test".into(), servers.clone());
 
         for (i, expected) in servers.iter().enumerate() {
             assert_eq!(upstream.next_server(), *expected, "iteration {}", i);
         }
         // Wraps around
-        assert_eq!(upstream.next_server(), addr(1));
+        assert_eq!(upstream.next_server(), endpoint(1));
     }
 
     #[test]
@@ -679,7 +810,7 @@ mod tests {
 
         let upstream = Arc::new(Upstream::new(
             "test".into(),
-            vec![addr(1), addr(2), addr(3)],
+            vec![endpoint(1), endpoint(2), endpoint(3)],
         ));
         let mut handles = vec![];
 
@@ -738,7 +869,7 @@ mod tests {
         assert!(proxy
             .unwrap_err()
             .to_string()
-            .contains("Invalid server address"));
+            .contains("invalid TCP stream backend endpoint"));
     }
 
     #[test]
@@ -918,13 +1049,13 @@ mod tests {
 
     #[test]
     fn test_upstream_name_preserved() {
-        let upstream = Upstream::new("my-upstream".into(), vec![addr(1), addr(2)]);
+        let upstream = Upstream::new("my-upstream".into(), vec![endpoint(1), endpoint(2)]);
         assert_eq!(upstream.name, "my-upstream");
     }
 
     #[test]
     fn test_upstream_servers_preserved() {
-        let servers = vec![addr(1), addr(2), addr(3)];
+        let servers = vec![endpoint(1), endpoint(2), endpoint(3)];
         let upstream = Upstream::new("test".into(), servers.clone());
         assert_eq!(upstream.servers, servers);
     }
@@ -937,7 +1068,7 @@ mod tests {
     fn test_upstream_skips_unhealthy_backend() {
         let upstream = Upstream::with_cooldown(
             "test".into(),
-            vec![addr(1), addr(2), addr(3)],
+            vec![endpoint(1), endpoint(2), endpoint(3)],
             Duration::from_secs(3600), // long cooldown
         );
         // Mark addr(1) unhealthy
@@ -945,14 +1076,14 @@ mod tests {
 
         // next_server should skip addr(1) and return addr(2) or addr(3)
         let selected = upstream.next_server();
-        assert_ne!(selected, addr(1), "should skip unhealthy backend");
+        assert_ne!(selected, endpoint(1), "should skip unhealthy backend");
     }
 
     #[test]
     fn test_upstream_fail_open_all_unhealthy() {
         let upstream = Upstream::with_cooldown(
             "test".into(),
-            vec![addr(1), addr(2)],
+            vec![endpoint(1), endpoint(2)],
             Duration::from_secs(3600), // long cooldown
         );
         // Mark all unhealthy
@@ -962,7 +1093,7 @@ mod tests {
         // Should still return a server (fail-open)
         let selected = upstream.next_server();
         assert!(
-            selected == addr(1) || selected == addr(2),
+            selected == endpoint(1) || selected == endpoint(2),
             "fail-open must return a server"
         );
     }
@@ -971,43 +1102,58 @@ mod tests {
     fn test_upstream_recovery_after_cooldown() {
         let upstream = Upstream::with_cooldown(
             "test".into(),
-            vec![addr(1)],
+            vec![endpoint(1)],
             Duration::from_secs(0), // zero cooldown — immediately eligible
         );
         upstream.health[0].record_failure();
         // With zero cooldown, backend is immediately eligible again
         assert!(upstream.health[0].is_eligible(Duration::from_secs(0)));
         let selected = upstream.next_server();
-        assert_eq!(selected, addr(1));
+        assert_eq!(selected, endpoint(1));
     }
 
     #[test]
     fn test_report_success_recovers_backend() {
-        let upstream = Upstream::new("test".into(), vec![addr(1)]);
+        let upstream = Upstream::new("test".into(), vec![endpoint(1)]);
         upstream.health[0].record_failure();
         assert!(!upstream.health[0].is_healthy());
 
-        upstream.report_success(addr(1));
+        upstream.report_success(&endpoint(1));
         assert!(upstream.health[0].is_healthy());
         assert_eq!(upstream.health[0].consecutive_failures(), 0);
     }
 
     #[test]
     fn test_report_failure_marks_unhealthy() {
-        let upstream = Upstream::new("test".into(), vec![addr(1)]);
+        let upstream = Upstream::new("test".into(), vec![endpoint(1)]);
         assert!(upstream.health[0].is_healthy());
 
-        upstream.report_failure(addr(1));
+        upstream.report_failure(&endpoint(1));
         assert!(!upstream.health[0].is_healthy());
         assert_eq!(upstream.health[0].consecutive_failures(), 1);
     }
 
     #[test]
+    fn test_unix_endpoint_health_tracking() {
+        let endpoint = unix_endpoint("backend");
+        let upstream = Upstream::new("test".into(), vec![endpoint.clone()]);
+
+        assert_eq!(upstream.next_server(), endpoint);
+
+        upstream.report_failure(&unix_endpoint("backend"));
+        assert!(!upstream.health[0].is_healthy());
+        assert_eq!(upstream.health[0].label(), "unix:/run/wicket/backend.sock");
+
+        upstream.report_success(&unix_endpoint("backend"));
+        assert!(upstream.health[0].is_healthy());
+    }
+
+    #[test]
     fn test_report_unknown_addr_is_noop() {
-        let upstream = Upstream::new("test".into(), vec![addr(1)]);
+        let upstream = Upstream::new("test".into(), vec![endpoint(1)]);
         // Reporting for an address not in the upstream should not panic
-        upstream.report_success(addr(9999));
-        upstream.report_failure(addr(9999));
+        upstream.report_success(&endpoint(9999));
+        upstream.report_failure(&endpoint(9999));
         // addr(1) health unchanged
         assert!(upstream.health[0].is_healthy());
     }
@@ -1016,7 +1162,7 @@ mod tests {
     fn test_upstream_with_cooldown_constructor() {
         let upstream = Upstream::with_cooldown(
             "test".into(),
-            vec![addr(1), addr(2)],
+            vec![endpoint(1), endpoint(2)],
             Duration::from_secs(60),
         );
         assert_eq!(upstream.servers.len(), 2);

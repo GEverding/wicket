@@ -461,6 +461,10 @@ servers = ["10.0.1.1:443"]
 [[stream.upstreams]]
 name = "fallback"
 servers = ["10.0.2.1:443"]
+
+[[stream.upstreams]]
+name = "local-app"
+servers = ["unix:/run/local-app/backend.sock"]
 ```
 
 ### Stream Fields
@@ -496,6 +500,26 @@ source_ips = ["10.0.0.10", "10.0.0.11", "10.0.0.12"]
 ```
 
 Each IP provides ~64k ephemeral ports. Three IPs give ~192k outbound connections per destination.
+
+`source_ips` applies only to TCP backends. Unix socket backends (`unix:/absolute/path.sock`) bypass source IP pooling because they do not create outbound TCP sockets.
+
+### Unix Socket Backends
+
+Stream upstream servers can be TCP socket addresses or Unix domain sockets:
+
+```toml
+[[stream.upstreams]]
+name = "local-app"
+servers = ["unix:/run/local-app/backend.sock"]
+```
+
+Unix backend paths must be absolute and use the `unix:/path/to/socket` form. They are useful for local high-connection-count backends because they avoid outbound TCP ephemeral port limits.
+
+TCP-only stream features behave as follows with Unix backends:
+
+- `source_ips` is ignored for Unix backends.
+- eBPF sockmap acceleration is not attempted for Unix backends.
+- `proxy_protocol = "v1"` or `"v2"` is allowed; the header carries the TCP client address and Wicket stream listener address before data is proxied over the Unix socket.
 
 ### PROXY Protocol
 

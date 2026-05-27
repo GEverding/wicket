@@ -294,6 +294,140 @@ async fn test_ebpf_stream_path_moves_bytes_and_keeps_connection_open() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
+async fn test_unix_backend_stream_path_moves_bytes() {
+    let proxy_port = common::free_port().await;
+    let socket_path = std::env::temp_dir().join(format!(
+        "wicket-stream-unix-{}-{proxy_port}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+
+    let backend_listener = tokio::net::UnixListener::bind(&socket_path).expect("bind unix backend");
+    let backend_handle = tokio::spawn(async move {
+        let (mut socket, _) = backend_listener
+            .accept()
+            .await
+            .expect("accept unix backend");
+        let mut first = [0; 4];
+        socket.read_exact(&mut first).await.expect("read first");
+        assert_eq!(&first, b"ping");
+        socket.write_all(b"pong").await.expect("write first");
+
+        let mut second = [0; 4];
+        socket.read_exact(&mut second).await.expect("read second");
+        assert_eq!(&second, b"next");
+        socket.write_all(b"done").await.expect("write second");
+    });
+
+    let upstream_name = "default".to_string();
+    let config = wicket_config::StreamConfig {
+        listen: format!("127.0.0.1:{proxy_port}"),
+        backlog: 128,
+        reuseport: false,
+        proxy_protocol: wicket_config::ProxyProtocolConfig::None,
+        source_ips: Vec::new(),
+        default_upstream: Some(upstream_name.clone()),
+        sni_routes: std::collections::HashMap::new(),
+        upstreams: vec![wicket_config::StreamUpstreamConfig {
+            name: upstream_name,
+            servers: vec![format!("unix:{}", socket_path.display())],
+        }],
+        health_cooldown_secs: 30,
+        connect_timeout_ms: 5000,
+        max_connections: 100,
+        drain_timeout_secs: 5,
+    };
+
+    let (_proxy, proxy_handle) = start_proxy(&config).await.expect("start proxy");
+
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    let mut client = TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    client.write_all(b"ping").await.expect("write first");
+    let mut response = [0; 4];
+    client.read_exact(&mut response).await.expect("read first");
+    assert_eq!(&response, b"pong");
+
+    client.write_all(b"next").await.expect("write second");
+    client.read_exact(&mut response).await.expect("read second");
+    assert_eq!(&response, b"done");
+
+    proxy_handle.abort();
+    backend_handle.await.expect("backend task");
+    std::fs::remove_file(&socket_path).expect("remove unix socket");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_unix_backend_proxy_protocol_v2_uses_tcp_listener_addresses() {
+    let proxy_port = common::free_port().await;
+    let socket_path = std::env::temp_dir().join(format!(
+        "wicket-stream-unix-proxy-protocol-{}-{proxy_port}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+
+    let backend_listener = tokio::net::UnixListener::bind(&socket_path).expect("bind unix backend");
+    let backend_handle = tokio::spawn(async move {
+        let (mut socket, _) = backend_listener
+            .accept()
+            .await
+            .expect("accept unix backend");
+
+        let mut header = [0; 28];
+        socket
+            .read_exact(&mut header)
+            .await
+            .expect("read proxy header");
+        let (parsed, consumed) = ParsedProxyProtocol::parse(&header).expect("parse proxy header");
+        assert_eq!(consumed, header.len());
+        assert_eq!(parsed.version, ProxyProtocolVersion::V2);
+        assert_eq!(parsed.src_addr.ip().to_string(), "127.0.0.1");
+        assert_eq!(parsed.dst_addr.ip().to_string(), "127.0.0.1");
+
+        let mut body = [0; 4];
+        socket.read_exact(&mut body).await.expect("read body");
+        assert_eq!(&body, b"ping");
+        socket.write_all(b"pong").await.expect("write response");
+    });
+
+    let upstream_name = "default".to_string();
+    let config = wicket_config::StreamConfig {
+        listen: format!("127.0.0.1:{proxy_port}"),
+        backlog: 128,
+        reuseport: false,
+        proxy_protocol: wicket_config::ProxyProtocolConfig::V2,
+        source_ips: Vec::new(),
+        default_upstream: Some(upstream_name.clone()),
+        sni_routes: std::collections::HashMap::new(),
+        upstreams: vec![wicket_config::StreamUpstreamConfig {
+            name: upstream_name,
+            servers: vec![format!("unix:{}", socket_path.display())],
+        }],
+        health_cooldown_secs: 30,
+        connect_timeout_ms: 5000,
+        max_connections: 100,
+        drain_timeout_secs: 5,
+    };
+
+    let (_proxy, proxy_handle) = start_proxy(&config).await.expect("start proxy");
+
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    let mut client = TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    client.write_all(b"ping").await.expect("write request");
+    let mut response = [0; 4];
+    client
+        .read_exact(&mut response)
+        .await
+        .expect("read response");
+    assert_eq!(&response, b"pong");
+
+    proxy_handle.abort();
+    backend_handle.await.expect("backend task");
+    std::fs::remove_file(&socket_path).expect("remove unix socket");
+}
+
+#[tokio::test]
 async fn test_sni_routing_exact_match() {
     // Start two mock backends
     let api_backend = Arc::new(

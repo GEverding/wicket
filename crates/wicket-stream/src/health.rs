@@ -3,14 +3,13 @@
 //! Tracks connect outcomes per backend using lock-free atomics.
 //! No active probes — state is updated from real connection attempts.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Per-backend health state, lock-free.
 #[derive(Debug)]
 pub struct BackendHealth {
-    addr: SocketAddr,
+    label: String,
     healthy: AtomicBool,
     /// Unix timestamp (millis) when marked unhealthy. 0 = never.
     unhealthy_since: AtomicU64,
@@ -19,21 +18,21 @@ pub struct BackendHealth {
 }
 
 impl BackendHealth {
-    /// Create a new health tracker for the given backend address.
+    /// Create a new health tracker for the given backend label.
     ///
     /// Starts in a healthy state with zero consecutive failures.
-    pub fn new(addr: SocketAddr) -> Self {
+    pub fn new(label: impl Into<String>) -> Self {
         Self {
-            addr,
+            label: label.into(),
             healthy: AtomicBool::new(true),
             unhealthy_since: AtomicU64::new(0),
             consecutive_failures: AtomicU64::new(0),
         }
     }
 
-    /// Return the backend socket address being tracked.
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+    /// Return the backend label being tracked.
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Return whether the backend is currently considered healthy.
@@ -64,7 +63,7 @@ impl BackendHealth {
         self.unhealthy_since.store(0, Ordering::Release);
         if !was_healthy {
             tracing::info!(
-                backend = %self.addr,
+                backend = %self.label,
                 "Backend recovered"
             );
         }
@@ -81,7 +80,7 @@ impl BackendHealth {
                 .as_millis() as u64;
             self.unhealthy_since.store(now_ms, Ordering::Release);
             tracing::warn!(
-                backend = %self.addr,
+                backend = %self.label,
                 "Backend marked unhealthy"
             );
         }
@@ -96,22 +95,21 @@ impl BackendHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
 
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    fn backend(port: u16) -> String {
+        format!("127.0.0.1:{port}")
     }
 
     #[test]
     fn test_new_backend_starts_healthy() {
-        let h = BackendHealth::new(addr(8080));
+        let h = BackendHealth::new(backend(8080));
         assert!(h.is_healthy());
         assert_eq!(h.consecutive_failures(), 0);
     }
 
     #[test]
     fn test_record_failure_marks_unhealthy() {
-        let h = BackendHealth::new(addr(8080));
+        let h = BackendHealth::new(backend(8080));
         h.record_failure();
         assert!(!h.is_healthy());
         assert_eq!(h.consecutive_failures(), 1);
@@ -119,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_record_failure_increments_consecutive() {
-        let h = BackendHealth::new(addr(8080));
+        let h = BackendHealth::new(backend(8080));
         h.record_failure();
         h.record_failure();
         h.record_failure();
@@ -128,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_record_success_recovers() {
-        let h = BackendHealth::new(addr(8080));
+        let h = BackendHealth::new(backend(8080));
         h.record_failure();
         h.record_failure();
         assert!(!h.is_healthy());
@@ -139,14 +137,14 @@ mod tests {
 
     #[test]
     fn test_is_eligible_healthy_always_true() {
-        let h = BackendHealth::new(addr(8080));
+        let h = BackendHealth::new(backend(8080));
         assert!(h.is_eligible(Duration::from_secs(30)));
         assert!(h.is_eligible(Duration::from_secs(0)));
     }
 
     #[test]
     fn test_is_eligible_false_during_cooldown() {
-        let h = BackendHealth::new(addr(8080));
+        let h = BackendHealth::new(backend(8080));
         h.record_failure();
         // Cooldown of 1 hour — should not be eligible yet
         assert!(!h.is_eligible(Duration::from_secs(3600)));
@@ -154,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_is_eligible_true_after_cooldown() {
-        let h = BackendHealth::new(addr(8080));
+        let h = BackendHealth::new(backend(8080));
         h.record_failure();
         // Cooldown of zero — immediately eligible
         assert!(h.is_eligible(Duration::from_secs(0)));
@@ -163,22 +161,22 @@ mod tests {
     #[test]
     fn test_is_eligible_zero_unhealthy_since() {
         // If unhealthy_since is 0 (never set), eligible regardless
-        let h = BackendHealth::new(addr(8080));
+        let h = BackendHealth::new(backend(8080));
         h.healthy.store(false, Ordering::Release);
         // unhealthy_since stays 0
         assert!(h.is_eligible(Duration::from_secs(3600)));
     }
 
     #[test]
-    fn test_addr_returns_correct_addr() {
-        let a = addr(9090);
-        let h = BackendHealth::new(a);
-        assert_eq!(h.addr(), a);
+    fn test_label_returns_backend_label() {
+        let label = backend(9090);
+        let h = BackendHealth::new(label.clone());
+        assert_eq!(h.label(), label);
     }
 
     #[test]
     fn test_consecutive_failures_resets_on_success() {
-        let h = BackendHealth::new(addr(8080));
+        let h = BackendHealth::new(backend(8080));
         for _ in 0..5 {
             h.record_failure();
         }

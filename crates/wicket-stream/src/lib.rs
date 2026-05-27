@@ -3,6 +3,7 @@
 //! This crate provides TCP stream proxying capabilities similar to nginx's stream block,
 //! including SNI-based routing, source IP pooling, and proxy protocol support.
 
+mod endpoint;
 pub mod health;
 mod listener;
 pub mod metrics;
@@ -12,6 +13,7 @@ mod proxy;
 mod router;
 mod sni;
 
+pub use endpoint::StreamBackendAddr;
 pub use listener::{create_listener, into_tokio_listener, ListenerConfig};
 pub use pool::SourceIpPool;
 pub use protocol::{ProxyProtocolEncoder, ProxyProtocolVersion};

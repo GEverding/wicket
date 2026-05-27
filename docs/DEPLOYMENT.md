@@ -281,6 +281,18 @@ For 400k+ concurrent connections:
 
 4. **System tuning**: Increase `ulimit -n` (file descriptors), tune `net.core.somaxconn`, and increase ephemeral port range.
 
+Use `source_ips` for remote TCP backends when a single Wicket source address would run out of outbound ephemeral ports. Use Unix socket backends for local services on the same host when possible; `unix:/run/app/backend.sock` avoids outbound TCP ephemeral port limits entirely.
+
+```toml
+[[stream.upstreams]]
+name = "local-app"
+servers = ["unix:/run/local-app/backend.sock"]
+```
+
+For Unix socket backends, make the socket path absolute, ensure the Wicket process user can read and write the socket, and coordinate socket ownership with systemd `RuntimeDirectory`, `User`, `Group`, or service-specific `UMask` settings. Keep `LimitNOFILE` high enough for client TCP sockets plus backend Unix sockets; Unix sockets remove ephemeral port pressure, not file descriptor usage.
+
+`source_ips` and eBPF sockmap acceleration are TCP-only and are skipped for Unix backends. PROXY protocol remains supported for Unix backends and carries the TCP client and Wicket listener addresses.
+
 ### eBPF Sockmap Acceleration
 
 On Linux, enable eBPF sockmap for kernel-level socket redirection on L4 passthrough traffic:
