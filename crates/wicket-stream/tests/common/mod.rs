@@ -45,6 +45,7 @@ pub fn test_stream_config(
     }
 
     wicket_config::StreamConfig {
+        name: format!("test-stream-{}", listen_port),
         listen: format!("127.0.0.1:{}", listen_port),
         backlog: 8000,
         reuseport: false,

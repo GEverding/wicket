@@ -249,6 +249,7 @@ async fn test_ebpf_stream_path_moves_bytes_and_keeps_connection_open() {
     let proxy_port = common::free_port().await;
     let upstream_name = "default".to_string();
     let config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{proxy_port}"),
         backlog: 128,
         reuseport: false,
@@ -322,6 +323,7 @@ async fn test_unix_backend_stream_path_moves_bytes() {
 
     let upstream_name = "default".to_string();
     let config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{proxy_port}"),
         backlog: 128,
         reuseport: false,
@@ -393,6 +395,7 @@ async fn test_unix_backend_proxy_protocol_v2_uses_tcp_listener_addresses() {
 
     let upstream_name = "default".to_string();
     let config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{proxy_port}"),
         backlog: 128,
         reuseport: false,
@@ -514,6 +517,7 @@ async fn test_sni_routing_wildcard_match() {
     // Create config with wildcard and exact routes
     let proxy_port = common::free_port().await;
     let mut config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{}", proxy_port),
         backlog: 128,
         reuseport: false,
@@ -642,6 +646,7 @@ async fn test_sni_routing_default_upstream() {
     // Create config with default upstream
     let proxy_port = common::free_port().await;
     let mut config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{}", proxy_port),
         backlog: 128,
         reuseport: false,
@@ -751,6 +756,7 @@ async fn test_sni_routing_no_match_no_default() {
     // Create config WITHOUT default upstream
     let proxy_port = common::free_port().await;
     let mut config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{}", proxy_port),
         backlog: 128,
         reuseport: false,
@@ -824,6 +830,7 @@ async fn test_sni_routing_non_tls_traffic() {
     // Create config with default upstream
     let proxy_port = common::free_port().await;
     let mut config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{}", proxy_port),
         backlog: 128,
         reuseport: false,
@@ -895,6 +902,7 @@ async fn test_proxy_basic_routing() {
     // Create config with default upstream (no SNI routes)
     let proxy_port = common::free_port().await;
     let config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{}", proxy_port),
         backlog: 128,
         reuseport: false,
@@ -1017,6 +1025,7 @@ async fn test_drain_completes_active_connections() {
 
     let proxy_port = common::free_port().await;
     let config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{}", proxy_port),
         backlog: 128,
         reuseport: false,
@@ -1073,6 +1082,7 @@ async fn test_drain_timeout_forces_shutdown() {
 
     let proxy_port = common::free_port().await;
     let config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{}", proxy_port),
         backlog: 128,
         reuseport: false,
@@ -1144,6 +1154,7 @@ async fn test_reload_updates_routing() {
     // Initial config routes to backend A
     let proxy_port = common::free_port().await;
     let mut config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{}", proxy_port),
         backlog: 128,
         reuseport: false,
@@ -1210,6 +1221,7 @@ async fn test_reload_does_not_disrupt_active_connections() {
 
     let proxy_port = common::free_port().await;
     let config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{}", proxy_port),
         backlog: 128,
         reuseport: false,
@@ -1240,6 +1252,7 @@ async fn test_reload_does_not_disrupt_active_connections() {
 
     // Reload config (pointing to a different backend that doesn't exist)
     let new_config = wicket_config::StreamConfig {
+        name: "test-stream".into(),
         listen: format!("127.0.0.1:{}", proxy_port),
         backlog: 128,
         reuseport: false,

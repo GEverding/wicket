@@ -544,6 +544,7 @@ impl GatewayState {
 
             if let Some((_, listener)) = tcp_listeners.first() {
                 stream_config = Some(StreamConfig {
+                    name: format!("stream-{}", listener.port),
                     listen: format!("0.0.0.0:{}", listener.port)
                         .parse()
                         .expect("generated stream listen address is valid"),
@@ -576,7 +577,7 @@ impl GatewayState {
 
         config.upstreams = upstreams;
         config.routes = routes;
-        config.stream = stream_config;
+        config.streams = stream_config.into_iter().collect();
 
         config
     }
@@ -1993,7 +1994,11 @@ mod tests {
 
         let config = state.generate_config();
 
-        let stream = config.stream.expect("stream config must be present");
+        let stream = config
+            .streams
+            .into_iter()
+            .next()
+            .expect("stream config must be present");
 
         // Only the accepted hostname must appear.
         assert!(
@@ -2040,7 +2045,11 @@ mod tests {
 
         let config = state.generate_config();
 
-        let stream = config.stream.expect("stream config must be present");
+        let stream = config
+            .streams
+            .into_iter()
+            .next()
+            .expect("stream config must be present");
 
         assert!(
             stream.sni_routes.is_empty(),
@@ -2079,12 +2088,12 @@ mod tests {
         let config = state.generate_config();
 
         // No stream config at all since no routes were rendered.
-        // (tcp_routes is also empty, so stream is None)
+        // (tcp_routes is also empty, so streams is empty)
         assert!(
-            config.stream.is_none()
+            config.streams.is_empty()
                 || config
-                    .stream
-                    .as_ref()
+                    .streams
+                    .first()
                     .map(|s| s.sni_routes.is_empty())
                     .unwrap_or(true),
             "route with no status must not be rendered"
@@ -2489,7 +2498,9 @@ mod tests {
         let config = state.generate_config();
         // TCPRoutes produce stream upstreams (no SNI routing).
         let stream = config
-            .stream
+            .streams
+            .into_iter()
+            .next()
             .expect("stream config must be present for TCPRoute");
         assert_eq!(
             stream.upstreams.len(),
@@ -2530,10 +2541,10 @@ mod tests {
         );
 
         let config = state.generate_config();
-        // No accepted routes → stream may be None or have empty upstreams.
+        // No accepted routes → streams may be empty or have empty upstreams.
         let no_upstreams = config
-            .stream
-            .as_ref()
+            .streams
+            .first()
             .map(|s| s.upstreams.is_empty())
             .unwrap_or(true);
         assert!(
@@ -2559,8 +2570,8 @@ mod tests {
 
         let config = state.generate_config();
         let no_upstreams = config
-            .stream
-            .as_ref()
+            .streams
+            .first()
             .map(|s| s.upstreams.is_empty())
             .unwrap_or(true);
         assert!(no_upstreams, "TCPRoute with no status must not be rendered");
@@ -2640,13 +2651,13 @@ mod tests {
         let cfg_unsorted = state.generate_config();
 
         let sorted_empty = cfg_sorted
-            .stream
-            .as_ref()
+            .streams
+            .first()
             .map(|s| s.sni_routes.is_empty() && s.upstreams.is_empty())
             .unwrap_or(true);
         let unsorted_empty = cfg_unsorted
-            .stream
-            .as_ref()
+            .streams
+            .first()
             .map(|s| s.sni_routes.is_empty() && s.upstreams.is_empty())
             .unwrap_or(true);
 
@@ -2698,7 +2709,11 @@ mod tests {
             .insert(GatewayState::key("default", "zzz-route"), second);
 
         let config = state.generate_config();
-        let stream = config.stream.expect("stream config must be present");
+        let stream = config
+            .streams
+            .into_iter()
+            .next()
+            .expect("stream config must be present");
 
         // The SNI must be present exactly once.
         assert_eq!(

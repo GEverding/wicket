@@ -633,7 +633,7 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         "Starting Wicket proxy"
     );
 
-    if args.upgrade && config.stream.is_some() {
+    if args.upgrade && !config.streams.is_empty() {
         anyhow::bail!(
             "graceful binary upgrade is HTTP-only in v1 and unsupported when stream listeners are configured"
         );
@@ -811,79 +811,81 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
     // Optionally start stream proxy
     let shutdown_token = CancellationToken::new();
 
-    let stream_proxy: Option<Arc<StreamProxy>> = if let Some(ref stream_config) = config.stream {
-        #[allow(unused_mut)]
-        let mut proxy_builder =
-            StreamProxy::from_config(stream_config).context("Failed to build stream proxy")?;
+    // TODO(wicket-79v.2): wire up all streams; for now use first entry only.
+    let stream_proxy: Option<Arc<StreamProxy>> =
+        if let Some(stream_config) = config.streams.into_iter().next() {
+            #[allow(unused_mut)]
+            let mut proxy_builder =
+                StreamProxy::from_config(&stream_config).context("Failed to build stream proxy")?;
 
-        #[cfg(all(target_os = "linux", feature = "ebpf"))]
-        {
-            use wicket_sockmap::{SocketMap, SocketMapConfig};
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            {
+                use wicket_sockmap::{SocketMap, SocketMapConfig};
 
-            let sockmap_config = SocketMapConfig {
-                bpf_object_path: None, // Use embedded BPF bytecode
-                max_connections: 500_000,
-                verbose: false,
-            };
+                let sockmap_config = SocketMapConfig {
+                    bpf_object_path: None, // Use embedded BPF bytecode
+                    max_connections: 500_000,
+                    verbose: false,
+                };
 
-            match SocketMap::load(sockmap_config) {
-                Ok(mut sockmap) => match sockmap.attach() {
-                    Ok(()) => {
-                        tracing::info!("eBPF sockmap loaded and attached");
-                        proxy_builder = proxy_builder.with_sockmap(sockmap);
-                    }
+                match SocketMap::load(sockmap_config) {
+                    Ok(mut sockmap) => match sockmap.attach() {
+                        Ok(()) => {
+                            tracing::info!("eBPF sockmap loaded and attached");
+                            proxy_builder = proxy_builder.with_sockmap(sockmap);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to attach eBPF sockmap, falling back to userspace proxying"
+                            );
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "Failed to attach eBPF sockmap, falling back to userspace proxying"
+                            "Failed to load eBPF sockmap, falling back to userspace proxying"
                         );
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to load eBPF sockmap, falling back to userspace proxying"
-                    );
                 }
             }
-        }
 
-        let proxy = Arc::new(proxy_builder);
+            let proxy = Arc::new(proxy_builder);
 
-        let listener_config = ListenerConfig {
-            addr: stream_config
-                .listen
-                .parse()
-                .context("Invalid stream listen address")?,
-            backlog: stream_config.backlog,
-            reuseport: stream_config.reuseport,
+            let listener_config = ListenerConfig {
+                addr: stream_config
+                    .listen
+                    .parse()
+                    .context("Invalid stream listen address")?,
+                backlog: stream_config.backlog,
+                reuseport: stream_config.reuseport,
+            };
+
+            let listener =
+                create_listener(&listener_config).context("Failed to create stream listener")?;
+            let listener = into_tokio_listener(listener)?;
+
+            info!(
+                listen = %stream_config.listen,
+                upstreams = stream_config.upstreams.len(),
+                routes = stream_config.sni_routes.len(),
+                proxy_protocol = ?stream_config.proxy_protocol,
+                source_ips = stream_config.source_ips.len(),
+                "Starting stream proxy"
+            );
+
+            let proxy_run = Arc::clone(&proxy);
+            let stream_shutdown = shutdown_token.clone();
+            tokio::spawn(async move {
+                if let Err(e) = proxy_run.run(listener, stream_shutdown).await {
+                    error!(error = %e, "Stream proxy error");
+                }
+            });
+
+            Some(proxy)
+        } else {
+            None
         };
-
-        let listener =
-            create_listener(&listener_config).context("Failed to create stream listener")?;
-        let listener = into_tokio_listener(listener)?;
-
-        info!(
-            listen = %stream_config.listen,
-            upstreams = stream_config.upstreams.len(),
-            routes = stream_config.sni_routes.len(),
-            proxy_protocol = ?stream_config.proxy_protocol,
-            source_ips = stream_config.source_ips.len(),
-            "Starting stream proxy"
-        );
-
-        let proxy_run = Arc::clone(&proxy);
-        let stream_shutdown = shutdown_token.clone();
-        tokio::spawn(async move {
-            if let Err(e) = proxy_run.run(listener, stream_shutdown).await {
-                error!(error = %e, "Stream proxy error");
-            }
-        });
-
-        Some(proxy)
-    } else {
-        None
-    };
 
     // Signal handler: cancel the shutdown token on SIGTERM or SIGINT.
     let signal_shutdown = shutdown_token.clone();
@@ -927,9 +929,10 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
                         }
 
                         // Reload stream (L4) proxy if configured.
+                        // TODO(wicket-79v.2): reload all streams; for now reload first only.
                         if let Some(ref proxy) = stream_reload {
-                            if let Some(ref stream_config) = new_config.stream {
-                                if let Err(e) = proxy.reload(stream_config) {
+                            if let Some(stream_config) = new_config.streams.into_iter().next() {
+                                if let Err(e) = proxy.reload(&stream_config) {
                                     error!(error = %e, "Failed to reload stream proxy config");
                                 }
                             }

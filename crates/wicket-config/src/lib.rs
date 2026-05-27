@@ -30,9 +30,9 @@ pub struct Config {
     #[serde(default)]
     pub tls: Option<TlsConfig>,
 
-    /// Stream (L4) proxy configuration (optional)
+    /// Stream (L4) proxy listeners (optional, multiple allowed)
     #[serde(default)]
-    pub stream: Option<StreamConfig>,
+    pub streams: Vec<StreamConfig>,
 
     /// Logging configuration
     #[serde(default)]
@@ -55,7 +55,7 @@ impl Default for Config {
             upstreams: BTreeMap::new(),
             routes: Vec::new(),
             tls: None,
-            stream: None,
+            streams: Vec::new(),
             logging: LoggingConfig::default(),
         }
     }
@@ -497,6 +497,9 @@ pub struct RouteMatch {
 /// Stream (L4) proxy configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct StreamConfig {
+    /// Unique name for this stream listener (required, non-empty)
+    pub name: String,
+
     /// Address to listen on (e.g., "0.0.0.0:443")
     pub listen: String,
 
@@ -723,10 +726,8 @@ impl Config {
             self.validate_route_tls(tls)?;
         }
 
-        // Validate stream config if present
-        if let Some(ref stream) = self.stream {
-            self.validate_stream(stream)?;
-        }
+        // Validate stream configs
+        self.validate_streams()?;
 
         Ok(())
     }
@@ -892,13 +893,45 @@ impl Config {
         Ok(())
     }
 
-    fn validate_stream(&self, stream: &StreamConfig) -> Result<()> {
-        // Validate listen address is parseable
-        stream
-            .listen
-            .parse::<SocketAddr>()
-            .with_context(|| format!("Invalid stream listen address: {}", stream.listen))?;
+    fn validate_streams(&self) -> Result<()> {
+        let mut seen_names: HashSet<&str> = HashSet::new();
+        let mut seen_addrs: HashSet<SocketAddr> = HashSet::new();
 
+        for stream in &self.streams {
+            // Validate name is non-empty
+            if stream.name.trim().is_empty() {
+                anyhow::bail!("Stream listener name must not be empty or whitespace");
+            }
+
+            // Validate name uniqueness
+            if !seen_names.insert(stream.name.as_str()) {
+                anyhow::bail!(
+                    "Duplicate stream listener name '{}'; each [[streams]] entry must have a unique name",
+                    stream.name
+                );
+            }
+
+            // Validate listen address is parseable
+            let addr = stream
+                .listen
+                .parse::<SocketAddr>()
+                .with_context(|| format!("Invalid stream listen address: {}", stream.listen))?;
+
+            // Validate listen address uniqueness
+            if !seen_addrs.insert(addr) {
+                anyhow::bail!(
+                    "Duplicate stream listen address '{}'; each [[streams]] entry must bind a unique address",
+                    stream.listen
+                );
+            }
+
+            self.validate_stream(stream)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_stream(&self, stream: &StreamConfig) -> Result<()> {
         // Build upstream name set
         let upstream_names: HashSet<&str> =
             stream.upstreams.iter().map(|u| u.name.as_str()).collect();
@@ -907,7 +940,8 @@ impl Config {
         if let Some(ref default) = stream.default_upstream {
             if !upstream_names.contains(default.as_str()) {
                 anyhow::bail!(
-                    "Stream default_upstream '{}' references undefined upstream",
+                    "Stream '{}' default_upstream '{}' references undefined upstream",
+                    stream.name,
                     default
                 );
             }
@@ -917,7 +951,8 @@ impl Config {
         for (sni, upstream) in &stream.sni_routes {
             if !upstream_names.contains(upstream.as_str()) {
                 anyhow::bail!(
-                    "Stream SNI route '{}' references undefined upstream '{}'",
+                    "Stream '{}' SNI route '{}' references undefined upstream '{}'",
+                    stream.name,
                     sni,
                     upstream
                 );
@@ -926,13 +961,17 @@ impl Config {
 
         // Validate at least one upstream is defined
         if stream.upstreams.is_empty() {
-            anyhow::bail!("Stream config requires at least one upstream");
+            anyhow::bail!("Stream '{}' requires at least one upstream", stream.name);
         }
 
         // Validate each upstream has at least one server
         for upstream in &stream.upstreams {
             if upstream.servers.is_empty() {
-                anyhow::bail!("Stream upstream '{}' has no servers defined", upstream.name);
+                anyhow::bail!(
+                    "Stream '{}' upstream '{}' has no servers defined",
+                    stream.name,
+                    upstream.name
+                );
             }
         }
 
@@ -1421,7 +1460,8 @@ path_prefix = "/"
 [server]
 listen = "127.0.0.1:8080"
 
-[stream]
+[[streams]]
+name = "tls-passthrough"
 listen = "0.0.0.0:443"
 backlog = 8000
 reuseport = true
@@ -1429,19 +1469,19 @@ proxy_protocol = "v2"
 source_ips = ["127.0.0.2", "127.0.0.3", "127.0.0.4"]
 default_upstream = "backend_3001"
 
-[stream.sni_routes]
+[streams.sni_routes]
 "api.example.com" = "backend_5443"
 "*.internal.com" = "backend_6443"
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "backend_3001"
 servers = ["127.0.0.2:3001", "127.0.0.3:3001", "127.0.0.4:3001"]
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "backend_5443"
 servers = ["127.0.0.2:5443", "127.0.0.3:5443", "127.0.0.4:5443"]
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "backend_6443"
 servers = ["127.0.0.2:6443"]
 
@@ -1455,9 +1495,10 @@ path_prefix = "/"
 "#;
 
         let config = Config::parse(config).unwrap();
-        assert!(config.stream.is_some());
+        assert_eq!(config.streams.len(), 1);
 
-        let stream = config.stream.unwrap();
+        let stream = &config.streams[0];
+        assert_eq!(stream.name, "tls-passthrough");
         assert_eq!(stream.listen, "0.0.0.0:443");
         assert_eq!(stream.backlog, 8000);
         assert!(stream.reuseport);
@@ -1469,15 +1510,53 @@ path_prefix = "/"
     }
 
     #[test]
+    fn test_parse_multiple_streams() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[[streams]]
+name = "tls-443"
+listen = "0.0.0.0:443"
+
+[[streams.upstreams]]
+name = "backend-a"
+servers = ["127.0.0.1:3001"]
+
+[[streams]]
+name = "tls-8443"
+listen = "0.0.0.0:8443"
+
+[[streams.upstreams]]
+name = "backend-b"
+servers = ["127.0.0.1:3002"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let config = Config::parse(config).unwrap();
+        assert_eq!(config.streams.len(), 2);
+        assert_eq!(config.streams[0].name, "tls-443");
+        assert_eq!(config.streams[1].name, "tls-8443");
+    }
+
+    #[test]
     fn test_stream_config_defaults() {
         let config = r#"
 [server]
 listen = "127.0.0.1:8080"
 
-[stream]
+[[streams]]
+name = "default-stream"
 listen = "0.0.0.0:443"
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "backend"
 servers = ["127.0.0.1:3001"]
 
@@ -1491,7 +1570,7 @@ path_prefix = "/"
 "#;
 
         let config = Config::parse(config).unwrap();
-        let stream = config.stream.unwrap();
+        let stream = &config.streams[0];
         assert_eq!(stream.backlog, 8000);
         assert!(stream.reuseport);
         assert_eq!(stream.proxy_protocol, ProxyProtocolConfig::None);
@@ -1506,10 +1585,11 @@ path_prefix = "/"
 [server]
 listen = "127.0.0.1:8080"
 
-[stream]
+[[streams]]
+name = "bad-stream"
 listen = "invalid:address"
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "backend"
 servers = ["127.0.0.1:3001"]
 
@@ -1536,11 +1616,12 @@ path_prefix = "/"
 [server]
 listen = "127.0.0.1:8080"
 
-[stream]
+[[streams]]
+name = "my-stream"
 listen = "0.0.0.0:443"
 default_upstream = "nonexistent"
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "backend"
 servers = ["127.0.0.1:3001"]
 
@@ -1564,13 +1645,14 @@ path_prefix = "/"
 [server]
 listen = "127.0.0.1:8080"
 
-[stream]
+[[streams]]
+name = "my-stream"
 listen = "0.0.0.0:443"
 
-[stream.sni_routes]
+[streams.sni_routes]
 "api.example.com" = "nonexistent"
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "backend"
 servers = ["127.0.0.1:3001"]
 
@@ -1594,7 +1676,8 @@ path_prefix = "/"
 [server]
 listen = "127.0.0.1:8080"
 
-[stream]
+[[streams]]
+name = "my-stream"
 listen = "0.0.0.0:443"
 
 [upstreams.backend]
@@ -1620,10 +1703,11 @@ path_prefix = "/"
 [server]
 listen = "127.0.0.1:8080"
 
-[stream]
+[[streams]]
+name = "my-stream"
 listen = "0.0.0.0:443"
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "backend"
 servers = []
 
@@ -1642,6 +1726,121 @@ path_prefix = "/"
     }
 
     #[test]
+    fn test_stream_duplicate_name_rejected() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[[streams]]
+name = "my-stream"
+listen = "0.0.0.0:443"
+
+[[streams.upstreams]]
+name = "backend"
+servers = ["127.0.0.1:3001"]
+
+[[streams]]
+name = "my-stream"
+listen = "0.0.0.0:8443"
+
+[[streams.upstreams]]
+name = "backend"
+servers = ["127.0.0.1:3002"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Duplicate stream listener name"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_stream_duplicate_listen_address_rejected() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[[streams]]
+name = "stream-a"
+listen = "0.0.0.0:443"
+
+[[streams.upstreams]]
+name = "backend"
+servers = ["127.0.0.1:3001"]
+
+[[streams]]
+name = "stream-b"
+listen = "0.0.0.0:443"
+
+[[streams.upstreams]]
+name = "backend"
+servers = ["127.0.0.1:3002"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Duplicate stream listen address"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_stream_empty_name_rejected() {
+        let config = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[[streams]]
+name = "   "
+listen = "0.0.0.0:443"
+
+[[streams.upstreams]]
+name = "backend"
+servers = ["127.0.0.1:3001"]
+
+[upstreams.backend]
+backends = ["127.0.0.1:3000"]
+
+[[routes]]
+upstream = "backend"
+[routes.match]
+path_prefix = "/"
+"#;
+
+        let result = Config::parse(config);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("must not be empty"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
     fn test_stream_proxy_protocol_variants() {
         let configs = vec![
             (r#"proxy_protocol = "none""#, ProxyProtocolConfig::None),
@@ -1655,11 +1854,12 @@ path_prefix = "/"
 [server]
 listen = "127.0.0.1:8080"
 
-[stream]
+[[streams]]
+name = "my-stream"
 listen = "0.0.0.0:443"
 {}
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "backend"
 servers = ["127.0.0.1:3001"]
 
@@ -1675,7 +1875,7 @@ path_prefix = "/"
             );
 
             let parsed = Config::parse(&config).unwrap();
-            assert_eq!(parsed.stream.unwrap().proxy_protocol, expected);
+            assert_eq!(parsed.streams[0].proxy_protocol, expected);
         }
     }
 

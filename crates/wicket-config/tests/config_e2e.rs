@@ -44,7 +44,7 @@ path_prefix = "/"
         Some("/")
     );
     assert!(config.tls.is_none());
-    assert!(config.stream.is_none());
+    assert!(config.streams.is_empty());
 }
 
 #[test]
@@ -125,32 +125,35 @@ upstream = "backend"
 [routes.match]
 path_prefix = "/"
 
-[stream]
+[[streams]]
+name = "tls-passthrough"
 listen = "0.0.0.0:8443"
 backlog = 4096
 proxy_protocol = "v2"
 default_upstream = "echo"
 
-[stream.sni_routes]
+[streams.sni_routes]
 "api.example.com" = "api-back"
 "*.internal.com" = "internal-back"
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "echo"
 servers = ["127.0.0.1:3001"]
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "api-back"
 servers = ["127.0.0.1:5443"]
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "internal-back"
 servers = ["127.0.0.1:6443"]
 "#,
     )
     .expect("stream config should parse");
 
-    let stream = config.stream.as_ref().expect("stream should be present");
+    assert_eq!(config.streams.len(), 1);
+    let stream = &config.streams[0];
+    assert_eq!(stream.name, "tls-passthrough");
     assert_eq!(stream.listen, "0.0.0.0:8443");
     assert_eq!(stream.backlog, 4096);
     assert_eq!(

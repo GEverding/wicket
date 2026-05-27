@@ -835,6 +835,7 @@ mod tests {
 
     fn test_stream_config() -> wicket_config::StreamConfig {
         wicket_config::StreamConfig {
+            name: "test-stream".into(),
             listen: "127.0.0.1:0".into(),
             backlog: 128,
             reuseport: false,
