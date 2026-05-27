@@ -233,7 +233,8 @@ workers = 4
 For L4 stream proxying with high connection counts, consider enabling `SO_REUSEPORT`:
 
 ```toml
-[stream]
+[[streams]]
+name = "public-tls"
 reuseport = true
 ```
 
@@ -251,7 +252,8 @@ Configure the timeout:
 [server]
 shutdown_timeout = 30  # seconds
 
-[stream]
+[[streams]]
+name = "public-tls"
 drain_timeout_secs = 30  # L4 proxy drain timeout
 ```
 
@@ -263,19 +265,22 @@ For 400k+ concurrent connections, see the [performance tuning guide](PERFORMANCE
 
 1. **Source IP pooling**: Configure multiple source IPs to multiply available ephemeral ports
    ```toml
-   [stream]
+   [[streams]]
+   name = "public-tls"
    source_ips = ["10.0.0.10", "10.0.0.11", "10.0.0.12", "10.0.0.13"]
    ```
 
 2. **Connection limits**: Set appropriate limits to prevent resource exhaustion
    ```toml
-   [stream]
+   [[streams]]
+   name = "public-tls"
    max_connections = 500000
    ```
 
 3. **TCP backlog**: Increase for burst handling
    ```toml
-   [stream]
+   [[streams]]
+   name = "public-tls"
    backlog = 16000
    ```
 
@@ -284,7 +289,7 @@ For 400k+ concurrent connections, see the [performance tuning guide](PERFORMANCE
 Use `source_ips` for remote TCP backends when a single Wicket source address would run out of outbound ephemeral ports. Use Unix socket backends for local services on the same host when possible; `unix:/run/app/backend.sock` avoids outbound TCP ephemeral port limits entirely.
 
 ```toml
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "local-app"
 servers = ["unix:/run/local-app/backend.sock"]
 ```

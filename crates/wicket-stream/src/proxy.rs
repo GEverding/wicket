@@ -219,6 +219,8 @@ impl Upstream {
 /// Main L4 stream proxy.
 #[derive(Debug)]
 pub struct StreamProxy {
+    /// Listener name from configuration (used in log fields).
+    pub(crate) name: String,
     pub(crate) router: ArcSwap<SniRouter>,
     pub(crate) upstreams: ArcSwap<HashMap<String, Arc<Upstream>>>,
     pub(crate) source_ip_pool: Option<SourceIpPool>,
@@ -237,7 +239,9 @@ pub struct StreamProxy {
 
 impl StreamProxy {
     /// Create a new stream proxy.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        name: String,
         router: SniRouter,
         upstreams: HashMap<String, Arc<Upstream>>,
         source_ip_pool: Option<SourceIpPool>,
@@ -254,6 +258,7 @@ impl StreamProxy {
             None
         };
         Self {
+            name,
             router: ArcSwap::new(Arc::new(router)),
             upstreams: ArcSwap::new(Arc::new(upstreams)),
             source_ip_pool,
@@ -265,6 +270,11 @@ impl StreamProxy {
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             sockmap: None,
         }
+    }
+
+    /// Returns the listener name from configuration.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Set the eBPF sockmap for kernel-level proxying.
@@ -337,6 +347,7 @@ impl StreamProxy {
         };
 
         Ok(Self {
+            name: config.name.clone(),
             router: ArcSwap::new(Arc::new(router)),
             upstreams: ArcSwap::new(Arc::new(upstreams)),
             source_ip_pool,
@@ -378,7 +389,11 @@ impl StreamProxy {
         self.upstreams.store(Arc::new(upstreams));
 
         STREAM_CONFIG_RELOADS_TOTAL.inc();
-        tracing::info!("Stream proxy configuration reloaded");
+        tracing::info!(
+            name = %self.name,
+            listen = %self.local_addr,
+            "Stream proxy configuration reloaded"
+        );
         Ok(())
     }
 
@@ -429,7 +444,11 @@ impl StreamProxy {
                     });
                 }
                 _ = shutdown.cancelled() => {
-                    tracing::info!("Stream proxy shutting down, draining active connections...");
+                    tracing::info!(
+                        name = %self.name,
+                        listen = %self.local_addr,
+                        "Stream proxy shutting down, draining active connections..."
+                    );
                     break;
                 }
             }
@@ -440,11 +459,17 @@ impl StreamProxy {
         loop {
             let remaining = active_tasks.load(Ordering::Relaxed);
             if remaining == 0 {
-                tracing::info!("Stream proxy: all connections drained");
+                tracing::info!(
+                    name = %self.name,
+                    listen = %self.local_addr,
+                    "Stream proxy: all connections drained"
+                );
                 break;
             }
             if drain_start.elapsed() >= self.drain_timeout {
                 tracing::warn!(
+                    name = %self.name,
+                    listen = %self.local_addr,
                     remaining = remaining,
                     "Stream proxy: drain timeout reached, forcing shutdown"
                 );

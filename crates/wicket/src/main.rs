@@ -43,7 +43,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, warn, Instrument};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use wicket_config::Config;
@@ -889,12 +889,19 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
 
         let proxy_run = Arc::clone(&proxy);
         let stream_shutdown = shutdown_token.clone();
-        let stream_name = stream_config.name.clone();
-        tokio::spawn(async move {
-            if let Err(e) = proxy_run.run(listener, stream_shutdown).await {
-                error!(name = %stream_name, error = %e, "Stream proxy error");
+        let span = info_span!(
+            "stream_listener",
+            name = %stream_config.name,
+            listen = %stream_config.listen,
+        );
+        tokio::spawn(
+            async move {
+                if let Err(e) = proxy_run.run(listener, stream_shutdown).await {
+                    error!(error = %e, "Stream proxy error");
+                }
             }
-        });
+            .instrument(span),
+        );
 
         stream_proxies.insert(stream_config.name.clone(), proxy);
     }
@@ -947,7 +954,12 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
                         // stream config and emit a clear warning so operators know what
                         // to do.  HTTP reload is independent and always proceeds above.
                         if listener_set_changed(&stream_reload, &new_config.streams) {
+                            let running_listeners: Vec<String> = stream_reload
+                                .iter()
+                                .map(|(name, proxy)| format!("{}={}", name, proxy.local_addr()))
+                                .collect();
                             warn!(
+                                running_listeners = ?running_listeners,
                                 "Stream listener set changed (added/removed/renamed/rebound \
                                  listener); stream proxies NOT reloaded — restart required to \
                                  apply stream listener changes"

@@ -15,7 +15,8 @@ The numbers below are starting points, not universal limits. Validate with your 
 Use Unix socket stream backends for local services on the same host. This avoids outbound TCP ephemeral port exhaustion between Wicket and the backend.
 
 ```toml
-[stream]
+[[streams]]
+name = "public-tls"
 listen = "0.0.0.0:443"
 backlog = 65535
 reuseport = true
@@ -26,7 +27,7 @@ max_connections = 0
 drain_timeout_secs = 30
 health_cooldown_secs = 1
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "local-app"
 servers = ["unix:/run/local-app/backend.sock"]
 ```
@@ -34,7 +35,8 @@ servers = ["unix:/run/local-app/backend.sock"]
 For remote TCP backends, keep `source_ips` available to multiply outbound ephemeral ports:
 
 ```toml
-[stream]
+[[streams]]
+name = "public-tls"
 source_ips = ["10.0.0.10", "10.0.0.11", "10.0.0.12", "10.0.0.13"]
 ```
 
@@ -45,7 +47,8 @@ Do not use `source_ips` for Unix socket backends. It is TCP-only and is skipped 
 Wicket stream listener default backlog is `8000`. Pingora's HTTP listener backlog is `65535`. For high-rate stream accepts, set Wicket stream backlog explicitly:
 
 ```toml
-[stream]
+[[streams]]
+name = "public-tls"
 backlog = 65535
 ```
 

@@ -431,10 +431,11 @@ For detailed TLS configuration, see the [TLS Guide](../crates/wicket-tls/README.
 
 ## Stream (L4) Proxy
 
-The `[stream]` section enables L4 TCP/TLS proxying with SNI-based routing. TLS connections are passed through to backends without termination.
+Use `[[streams]]` for L4 TCP/TLS proxying with SNI-based routing. TLS connections are passed through to backends without termination. The legacy singleton `[stream]` section was removed.
 
 ```toml
-[stream]
+[[streams]]
+name = "public-tls"
 listen = "0.0.0.0:8443"
 backlog = 8000
 reuseport = true
@@ -446,31 +447,41 @@ max_connections = 10000
 drain_timeout_secs = 30
 health_cooldown_secs = 30
 
-[stream.sni_routes]
+[streams.sni_routes]
 "api.example.com" = "api-backend"
 "*.internal.com" = "internal-backend"
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "api-backend"
 servers = ["10.0.0.1:443", "10.0.0.2:443"]
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "internal-backend"
 servers = ["10.0.1.1:443"]
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "fallback"
 servers = ["10.0.2.1:443"]
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "local-app"
 servers = ["unix:/run/local-app/backend.sock"]
 ```
+
+### Stream Listener Uniqueness
+
+Each `[[streams]]` entry must have:
+
+- A unique `name`
+- A unique `listen` address
+
+Multiple stream listeners in one process are supported.
 
 ### Stream Fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `name` | string | **required** | Listener name (must be unique across `[[streams]]`) |
 | `listen` | string | **required** | Address and port for the stream listener |
 | `backlog` | integer | `8000` | TCP listen backlog (pending connections queue) |
 | `reuseport` | boolean | `true` | Enable `SO_REUSEPORT` for kernel-level load balancing |
@@ -508,10 +519,18 @@ Each IP provides ~64k ephemeral ports. Three IPs give ~192k outbound connections
 Stream upstream servers can be TCP socket addresses or Unix domain sockets:
 
 ```toml
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "local-app"
 servers = ["unix:/run/local-app/backend.sock"]
 ```
+
+### Stream Reload Behavior
+
+Hot reload supports route/upstream/timeout updates for unchanged listeners. Any listener set change requires a restart:
+
+- add/remove a `[[streams]]` entry
+- change `name`
+- change `listen`
 
 Unix backend paths must be absolute and use the `unix:/path/to/socket` form. They are useful for local high-connection-count backends because they avoid outbound TCP ephemeral port limits.
 

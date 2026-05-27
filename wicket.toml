@@ -255,27 +255,38 @@ path_prefix = "/"
 # (400k+ concurrent connections) where you need to preserve the original
 # TLS connection to the backend.
 #
-# Example: Stream proxy with SNI routing
-# [stream]
-# listen = "0.0.0.0:8443"
+# Example: Multiple stream listeners (name and listen must be unique)
+#
+# [[streams]]
+# name = "public-http"
+# listen = "PUBLIC_TCP_IP:80"
+# default_upstream = "http-passthrough"
+#
+# [[streams.upstreams]]
+# name = "http-passthrough"
+# servers = ["127.0.0.1:3001"]
+#
+# [[streams]]
+# name = "public-tls"
+# listen = "PUBLIC_TCP_IP:443"
 # backlog = 8000
 # reuseport = true
 # proxy_protocol = "v2"
 # source_ips = ["127.0.0.2", "127.0.0.3"]
 # default_upstream = "echo-backend"
 #
-# [stream.sni_routes]
+# [streams.sni_routes]
 # "api.example.com" = "api-backend"
 # "*.internal.com" = "internal-backend"
 #
-# [[stream.upstreams]]
+# [[streams.upstreams]]
 # name = "echo-backend"
 # servers = ["127.0.0.1:3001"]
 #
-# [[stream.upstreams]]
+# [[streams.upstreams]]
 # name = "api-backend"
 # servers = ["127.0.0.1:5443"]
 #
-# [[stream.upstreams]]
+# [[streams.upstreams]]
 # name = "internal-backend"
 # servers = ["127.0.0.1:6443"]

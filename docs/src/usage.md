@@ -77,19 +77,31 @@ Wicket listens for HTTP on `server.listen` (default `127.0.0.1:8080`) and forwar
 
 #### L4 TCP/TLS Stream Proxy
 
-When a `[stream]` section is present in the config, Wicket also starts a TCP stream proxy that routes TLS connections based on SNI (Server Name Indication) without terminating TLS.
+When one or more `[[streams]]` entries are present in the config, Wicket also starts TCP stream listeners that route connections based on SNI (Server Name Indication) without terminating TLS.
 
 ```toml
-[stream]
-listen = "0.0.0.0:8443"
+[[streams]]
+name = "public-http"
+listen = "PUBLIC_TCP_IP:80"
+default_upstream = "http-passthrough"
 
-[stream.sni_routes]
+[[streams.upstreams]]
+name = "http-passthrough"
+servers = ["10.0.0.10:80"]
+
+[[streams]]
+name = "public-tls"
+listen = "PUBLIC_TCP_IP:443"
+
+[streams.sni_routes]
 "api.example.com" = "api-backend"
 
-[[stream.upstreams]]
+[[streams.upstreams]]
 name = "api-backend"
 servers = ["10.0.0.1:443"]
 ```
+
+`name` and `listen` must be unique across `[[streams]]`.
 
 #### Kubernetes Gateway API Controller
 
@@ -122,6 +134,8 @@ Unsupported features (unsupported filter types, timeouts, path regex) are reject
 
 Wicket watches the config file for changes and automatically reloads routes and upstreams without restarting. The reload is atomic -- if the new config is invalid, the running config is preserved.
 
+For stream proxying: listener set changes require restart (add/remove a `[[streams]]` entry, or change `name`/`listen`). Unchanged listeners can hot-reload routes/upstreams/timeouts.
+
 The config file is polled every 2 seconds. Active connections continue with the previous configuration; new connections use the updated config.
 
 ## Logging
@@ -136,7 +150,7 @@ Wicket uses structured logging via [Cloudflare Foundations](https://github.com/c
 ./target/release/wicket --json-logs -l info
 ```
 
-Each request logs: request ID, method, path, host, status code, duration, route name, and upstream name.
+Each request logs: request ID, method, path, host, status code, duration, route name, and upstream name. Stream logs include listener `name` and `listen`.
 
 ## Metrics
 
@@ -147,7 +161,7 @@ Prometheus metrics are exposed at the address specified by `--metrics-addr` (def
 curl http://localhost:9090/metrics
 ```
 
-Key metrics follow the RED pattern (Rate, Errors, Duration):
+Key metrics follow the RED pattern (Rate, Errors, Duration). Stream metrics are currently aggregate across listeners:
 
 | Metric | Type | Description |
 |--------|------|-------------|
