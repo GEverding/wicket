@@ -259,7 +259,7 @@ In Kubernetes, ensure `terminationGracePeriodSeconds` >= `shutdown_timeout`.
 
 ### High Connection Counts (L4 Proxy)
 
-For 400k+ concurrent connections:
+For 400k+ concurrent connections, see the [performance tuning guide](PERFORMANCE_TUNING.md) for a concrete 64-core EPYC/64GB host profile. The short version:
 
 1. **Source IP pooling**: Configure multiple source IPs to multiply available ephemeral ports
    ```toml

@@ -9,6 +9,7 @@
 - [Usage](./usage.md)
 - [Configuration Reference](./configuration.md)
 - [Deployment](./deployment.md)
+- [Performance Tuning](./performance-tuning.md)
 - [TLS Management](./tls.md)
 
 ---
