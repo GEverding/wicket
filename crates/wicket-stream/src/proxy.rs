@@ -274,6 +274,18 @@ impl StreamProxy {
         self
     }
 
+    /// Share an already-wrapped eBPF sockmap Arc across multiple stream proxies.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub fn with_sockmap_arc(mut self, sockmap: Arc<Mutex<SocketMap>>) -> Self {
+        self.sockmap = Some(sockmap);
+        self
+    }
+
+    /// Returns the local address this proxy is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
     /// Build from config.
     pub fn from_config(config: &wicket_config::StreamConfig) -> Result<Self, StreamError> {
         // Build router

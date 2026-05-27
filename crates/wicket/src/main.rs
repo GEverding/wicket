@@ -24,6 +24,7 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::services::listening::Service as ListeningService;
 use pingora_core::services::Service;
 use pingora_proxy::{http_proxy, http_proxy_service, HttpProxy};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -808,86 +809,97 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         server.add_service(https_service);
     }
 
-    // Optionally start stream proxy
+    // Shared cancellation token — cancelled on SIGTERM/SIGINT to drain all listeners.
     let shutdown_token = CancellationToken::new();
 
-    // TODO(wicket-79v.2): wire up all streams; for now use first entry only.
-    let stream_proxy: Option<Arc<StreamProxy>> =
-        if let Some(stream_config) = config.streams.into_iter().next() {
-            #[allow(unused_mut)]
-            let mut proxy_builder =
-                StreamProxy::from_config(&stream_config).context("Failed to build stream proxy")?;
+    // Load eBPF sockmap once (process-wide) and share the Arc across all stream proxies.
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let shared_sockmap: Option<Arc<std::sync::Mutex<wicket_sockmap::SocketMap>>> = {
+        use wicket_sockmap::{SocketMap, SocketMapConfig};
 
-            #[cfg(all(target_os = "linux", feature = "ebpf"))]
-            {
-                use wicket_sockmap::{SocketMap, SocketMapConfig};
-
-                let sockmap_config = SocketMapConfig {
-                    bpf_object_path: None, // Use embedded BPF bytecode
-                    max_connections: 500_000,
-                    verbose: false,
-                };
-
-                match SocketMap::load(sockmap_config) {
-                    Ok(mut sockmap) => match sockmap.attach() {
-                        Ok(()) => {
-                            tracing::info!("eBPF sockmap loaded and attached");
-                            proxy_builder = proxy_builder.with_sockmap(sockmap);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "Failed to attach eBPF sockmap, falling back to userspace proxying"
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to load eBPF sockmap, falling back to userspace proxying"
-                        );
-                    }
-                }
-            }
-
-            let proxy = Arc::new(proxy_builder);
-
-            let listener_config = ListenerConfig {
-                addr: stream_config
-                    .listen
-                    .parse()
-                    .context("Invalid stream listen address")?,
-                backlog: stream_config.backlog,
-                reuseport: stream_config.reuseport,
-            };
-
-            let listener =
-                create_listener(&listener_config).context("Failed to create stream listener")?;
-            let listener = into_tokio_listener(listener)?;
-
-            info!(
-                listen = %stream_config.listen,
-                upstreams = stream_config.upstreams.len(),
-                routes = stream_config.sni_routes.len(),
-                proxy_protocol = ?stream_config.proxy_protocol,
-                source_ips = stream_config.source_ips.len(),
-                "Starting stream proxy"
-            );
-
-            let proxy_run = Arc::clone(&proxy);
-            let stream_shutdown = shutdown_token.clone();
-            tokio::spawn(async move {
-                if let Err(e) = proxy_run.run(listener, stream_shutdown).await {
-                    error!(error = %e, "Stream proxy error");
-                }
-            });
-
-            Some(proxy)
-        } else {
-            None
+        let sockmap_config = SocketMapConfig {
+            bpf_object_path: None,
+            max_connections: 500_000,
+            verbose: false,
         };
 
-    // Signal handler: cancel the shutdown token on SIGTERM or SIGINT.
+        match SocketMap::load(sockmap_config) {
+            Ok(mut sockmap) => match sockmap.attach() {
+                Ok(()) => {
+                    info!("eBPF sockmap loaded and attached");
+                    Some(Arc::new(std::sync::Mutex::new(sockmap)))
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to attach eBPF sockmap, falling back to userspace proxying");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "Failed to load eBPF sockmap, falling back to userspace proxying");
+                None
+            }
+        }
+    };
+
+    // Start one listener task per [[streams]] entry.
+    // Keyed by stream name for the reload path (wicket-79v.3).
+    let mut stream_proxies: HashMap<String, Arc<StreamProxy>> =
+        HashMap::with_capacity(config.streams.len());
+
+    for stream_config in &config.streams {
+        #[allow(unused_mut)]
+        let mut proxy_builder = StreamProxy::from_config(stream_config)
+            .with_context(|| format!("Failed to build stream proxy '{}'", stream_config.name))?;
+
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        if let Some(ref sockmap_arc) = shared_sockmap {
+            proxy_builder = proxy_builder.with_sockmap_arc(Arc::clone(sockmap_arc));
+        }
+
+        let proxy = Arc::new(proxy_builder);
+
+        let listener_config = ListenerConfig {
+            addr: stream_config.listen.parse().with_context(|| {
+                format!(
+                    "Invalid listen address for stream '{}': {}",
+                    stream_config.name, stream_config.listen
+                )
+            })?,
+            backlog: stream_config.backlog,
+            reuseport: stream_config.reuseport,
+        };
+
+        let listener = create_listener(&listener_config).with_context(|| {
+            format!(
+                "Failed to bind stream listener '{}' on {}",
+                stream_config.name, stream_config.listen
+            )
+        })?;
+        let listener = into_tokio_listener(listener)?;
+
+        info!(
+            name = %stream_config.name,
+            listen = %stream_config.listen,
+            upstreams = stream_config.upstreams.len(),
+            routes = stream_config.sni_routes.len(),
+            proxy_protocol = ?stream_config.proxy_protocol,
+            source_ips = stream_config.source_ips.len(),
+            "Starting stream listener"
+        );
+
+        let proxy_run = Arc::clone(&proxy);
+        let stream_shutdown = shutdown_token.clone();
+        let stream_name = stream_config.name.clone();
+        tokio::spawn(async move {
+            if let Err(e) = proxy_run.run(listener, stream_shutdown).await {
+                error!(name = %stream_name, error = %e, "Stream proxy error");
+            }
+        });
+
+        stream_proxies.insert(stream_config.name.clone(), proxy);
+    }
+
+    // Signal handler: cancel the shared shutdown token on SIGTERM or SIGINT.
     let signal_shutdown = shutdown_token.clone();
     tokio::spawn(async move {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -902,9 +914,9 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
         signal_shutdown.cancel();
     });
 
-    // Config file watcher: poll every 2s, reload both HTTP and stream proxies on mtime change.
+    // Config file watcher: poll every 2s, reload HTTP and all stream proxies on mtime change.
     let config_path = args.config.clone();
-    let stream_reload = stream_proxy.clone();
+    let stream_reload = stream_proxies.clone();
     tokio::spawn(async move {
         let mut last_modified = tokio::fs::metadata(&config_path)
             .await
@@ -928,15 +940,32 @@ fn run_server(config: Config, args: &Args) -> Result<()> {
                             error!(error = %e, "Failed to reload HTTP proxy config");
                         }
 
-                        // Reload stream (L4) proxy if configured.
-                        // TODO(wicket-79v.2): reload all streams; for now reload first only.
-                        if let Some(ref proxy) = stream_reload {
-                            if let Some(stream_config) = new_config.streams.into_iter().next() {
-                                if let Err(e) = proxy.reload(&stream_config) {
-                                    error!(error = %e, "Failed to reload stream proxy config");
+                        // Reload stream proxies only when the listener set is unchanged.
+                        //
+                        // Adding, removing, renaming, or rebinding a listener requires
+                        // a full restart.  If the set changed we preserve the running
+                        // stream config and emit a clear warning so operators know what
+                        // to do.  HTTP reload is independent and always proceeds above.
+                        if listener_set_changed(&stream_reload, &new_config.streams) {
+                            warn!(
+                                "Stream listener set changed (added/removed/renamed/rebound \
+                                 listener); stream proxies NOT reloaded — restart required to \
+                                 apply stream listener changes"
+                            );
+                        } else {
+                            for stream_config in &new_config.streams {
+                                if let Some(proxy) = stream_reload.get(&stream_config.name) {
+                                    if let Err(e) = proxy.reload(stream_config) {
+                                        error!(
+                                            name = %stream_config.name,
+                                            error = %e,
+                                            "Failed to reload stream proxy config"
+                                        );
+                                    }
                                 }
                             }
                         }
+
                         last_modified = current_modified;
                     }
                     Err(e) => {
@@ -1127,6 +1156,42 @@ fn systemd_notify_abstract(socket: &OsStr, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Returns `true` when the new stream config has a different listener set than
+/// the currently-running proxies.
+///
+/// A "listener set change" is any of:
+/// - a listener name present in `running` but absent from `new_streams`
+/// - a listener name present in `new_streams` but absent from `running`
+/// - a listener name present in both but with a different `listen` address
+///
+/// When this returns `true` the caller should preserve the running stream
+/// proxies and log that a restart is required.
+fn listener_set_changed(
+    running: &HashMap<String, Arc<StreamProxy>>,
+    new_streams: &[wicket_config::StreamConfig],
+) -> bool {
+    // Quick length check: different count → definitely changed.
+    if running.len() != new_streams.len() {
+        return true;
+    }
+
+    for stream in new_streams {
+        match running.get(&stream.name) {
+            // Name not found in running set → added listener.
+            None => return true,
+            // Name found but listen address differs → rebound listener.
+            Some(proxy) => {
+                if proxy.local_addr().to_string() != stream.listen {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // All names matched and all listen addresses matched.
+    false
+}
+
 /// Compute the HTTPS listen address from the HTTP listen address.
 ///
 /// Port mapping: 80 → 443, anything else → port + 363 (e.g. 8080 → 8443).
@@ -1273,5 +1338,134 @@ mod tests {
         let candidates = acme.all_certs_with_providers(&auto_domains);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].domains[0], "explicit.example.com");
+    }
+
+    // ── listener_set_changed ──────────────────────────────────────────────────
+
+    use wicket_config::{ProxyProtocolConfig, StreamConfig, StreamUpstreamConfig};
+
+    /// Build a minimal StreamProxy bound to the given listen address.
+    fn make_stream_proxy(listen: &str) -> Arc<StreamProxy> {
+        let config = StreamConfig {
+            name: "test".into(),
+            listen: listen.into(),
+            backlog: 128,
+            reuseport: false,
+            proxy_protocol: ProxyProtocolConfig::None,
+            source_ips: vec![],
+            default_upstream: Some("default".into()),
+            sni_routes: std::collections::HashMap::new(),
+            upstreams: vec![StreamUpstreamConfig {
+                name: "default".into(),
+                servers: vec!["127.0.0.1:8080".into()],
+            }],
+            health_cooldown_secs: 30,
+            connect_timeout_ms: 5000,
+            max_connections: 0,
+            drain_timeout_secs: 30,
+        };
+        Arc::new(StreamProxy::from_config(&config).expect("valid config"))
+    }
+
+    /// Build a minimal StreamConfig with the given name and listen address.
+    fn make_stream_config(name: &str, listen: &str) -> StreamConfig {
+        StreamConfig {
+            name: name.into(),
+            listen: listen.into(),
+            backlog: 128,
+            reuseport: false,
+            proxy_protocol: ProxyProtocolConfig::None,
+            source_ips: vec![],
+            default_upstream: Some("default".into()),
+            sni_routes: std::collections::HashMap::new(),
+            upstreams: vec![StreamUpstreamConfig {
+                name: "default".into(),
+                servers: vec!["127.0.0.1:8080".into()],
+            }],
+            health_cooldown_secs: 30,
+            connect_timeout_ms: 5000,
+            max_connections: 0,
+            drain_timeout_secs: 30,
+        }
+    }
+
+    #[test]
+    fn test_listener_set_unchanged_empty() {
+        let running: HashMap<String, Arc<StreamProxy>> = HashMap::new();
+        assert!(!listener_set_changed(&running, &[]));
+    }
+
+    #[test]
+    fn test_listener_set_unchanged_single() {
+        let mut running = HashMap::new();
+        running.insert("tcp".into(), make_stream_proxy("127.0.0.1:4000"));
+        let new = vec![make_stream_config("tcp", "127.0.0.1:4000")];
+        assert!(!listener_set_changed(&running, &new));
+    }
+
+    #[test]
+    fn test_listener_set_unchanged_multiple() {
+        let mut running = HashMap::new();
+        running.insert("a".into(), make_stream_proxy("127.0.0.1:4001"));
+        running.insert("b".into(), make_stream_proxy("127.0.0.1:4002"));
+        let new = vec![
+            make_stream_config("a", "127.0.0.1:4001"),
+            make_stream_config("b", "127.0.0.1:4002"),
+        ];
+        assert!(!listener_set_changed(&running, &new));
+    }
+
+    #[test]
+    fn test_listener_set_added_listener() {
+        let mut running = HashMap::new();
+        running.insert("a".into(), make_stream_proxy("127.0.0.1:4001"));
+        // new config has an extra listener "b"
+        let new = vec![
+            make_stream_config("a", "127.0.0.1:4001"),
+            make_stream_config("b", "127.0.0.1:4002"),
+        ];
+        assert!(listener_set_changed(&running, &new));
+    }
+
+    #[test]
+    fn test_listener_set_removed_listener() {
+        let mut running = HashMap::new();
+        running.insert("a".into(), make_stream_proxy("127.0.0.1:4001"));
+        running.insert("b".into(), make_stream_proxy("127.0.0.1:4002"));
+        // new config drops "b"
+        let new = vec![make_stream_config("a", "127.0.0.1:4001")];
+        assert!(listener_set_changed(&running, &new));
+    }
+
+    #[test]
+    fn test_listener_set_renamed_listener() {
+        let mut running = HashMap::new();
+        running.insert("old-name".into(), make_stream_proxy("127.0.0.1:4001"));
+        // same address but different name
+        let new = vec![make_stream_config("new-name", "127.0.0.1:4001")];
+        assert!(listener_set_changed(&running, &new));
+    }
+
+    #[test]
+    fn test_listener_set_changed_listen_addr() {
+        let mut running = HashMap::new();
+        running.insert("tcp".into(), make_stream_proxy("127.0.0.1:4000"));
+        // same name but different listen address
+        let new = vec![make_stream_config("tcp", "127.0.0.1:5000")];
+        assert!(listener_set_changed(&running, &new));
+    }
+
+    #[test]
+    fn test_listener_set_empty_running_nonempty_new() {
+        let running: HashMap<String, Arc<StreamProxy>> = HashMap::new();
+        let new = vec![make_stream_config("tcp", "127.0.0.1:4000")];
+        assert!(listener_set_changed(&running, &new));
+    }
+
+    #[test]
+    fn test_listener_set_nonempty_running_empty_new() {
+        let mut running = HashMap::new();
+        running.insert("tcp".into(), make_stream_proxy("127.0.0.1:4000"));
+        assert!(listener_set_changed(&running, &[]));
     }
 }
