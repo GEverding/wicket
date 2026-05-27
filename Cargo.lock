@@ -4969,7 +4969,7 @@ dependencies = [
 
 [[package]]
 name = "wicket"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4999,7 +4999,7 @@ dependencies = [
 
 [[package]]
 name = "wicket-config"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "schemars 0.8.22",
@@ -5011,7 +5011,7 @@ dependencies = [
 
 [[package]]
 name = "wicket-controller"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -5045,7 +5045,7 @@ dependencies = [
 
 [[package]]
 name = "wicket-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5069,7 +5069,7 @@ dependencies = [
 
 [[package]]
 name = "wicket-sockmap"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "libbpf-cargo",
  "libbpf-rs",
@@ -5080,7 +5080,7 @@ dependencies = [
 
 [[package]]
 name = "wicket-stream"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -5099,7 +5099,7 @@ dependencies = [
 
 [[package]]
 name = "wicket-tls"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "arc-swap",
